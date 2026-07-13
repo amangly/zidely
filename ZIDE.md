@@ -170,9 +170,11 @@ minimal reference), `scripts/` (GhosttyKit build),
   to undo it — otherwise the worktree stays permanently "dirty" and
   merge refuses forever.
 - **Attach replay bursts are not small**: the state replay that opens
-  every attachment starts with a full OSC 4 palette dump (~6 KiB) and
-  includes all scrollback content — test buffers and readers must not
-  assume the first read is pane output, or that it fits in 4 KiB.
+  every attachment includes all scrollback content as escape sequences
+  — test buffers and readers must not assume the first read is pane
+  output, or that it fits in 4 KiB. The replay deliberately skips the
+  palette (OSC 4): indexes must resolve against the *renderer's* theme,
+  and a palette override would outlive detach in a real terminal.
 - **Never set DEVELOPER_DIR globally for zig**: Zig 0.15.2 cannot link
   under the macOS 26+ SDKs a new Xcode activates (missing-libSystem
   errors; same failure as `macos-latest` CI). GhosttyKit needs full

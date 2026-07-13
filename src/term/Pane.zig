@@ -152,15 +152,22 @@ pub fn snapshot(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
 }
 
 /// VT byte stream that reconstructs the pane's current terminal state
-/// (content, colors, palette, cursor, modes) on a fresh terminal — the
+/// (content, colors, cursor, modes) on a fresh terminal — the
 /// tmux-attach repaint a newly attached renderer needs. Starts from
 /// home+clear so it composes onto any terminal. Caller owns the memory.
+///
+/// Deliberately does NOT replay the palette: colors are emitted as
+/// palette *indexes*, and which RGB an index maps to belongs to the
+/// attaching renderer's theme — an OSC 4 dump of the daemon-side
+/// defaults would clobber it (and outlive the attachment in a real
+/// terminal, since nothing resets it on detach).
 pub fn replayBytes(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
     try builder.writer.writeAll("\x1b[H\x1b[2J");
     var formatter: ghostty.formatter.TerminalFormatter = .init(self.terminal, .vt);
     formatter.extra = .all;
+    formatter.extra.palette = false;
     formatter.format(&builder.writer) catch return error.OutOfMemory;
     return builder.toOwnedSlice();
 }

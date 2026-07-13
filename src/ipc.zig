@@ -1108,8 +1108,8 @@ const AttachTestClient = struct {
         // size the resize command set.
         try writeAllSocket(raw.fd, "\n");
 
-        // Sized for the replay burst: the full-palette dump alone is
-        // ~6 KiB of OSC 4 sequences.
+        // Sized for the replay burst, which carries the whole screen
+        // (and scrollback) as escape sequences.
         var collected: [32768]u8 = undefined;
         var len: usize = 0;
         // Bytes that raced the ok reply are already pane output.
