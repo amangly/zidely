@@ -371,6 +371,14 @@ pub const Server = struct {
             // connections), so everything after it is pane bytes.
             client.attached = pane;
             self.reply(client, .{ .id = req.id, .ok = true });
+            // A pane that already finished will never emit the pane_exit
+            // that half-closes attachments — it fired before this
+            // connection existed. EOF immediately or the client waits
+            // forever on a dead pane. (A merely-exited pane still
+            // draining gets the regular pane_exit half-close.)
+            if (ss.paneFinished(pane)) {
+                posix.shutdown(client.fd, .both) catch {};
+            }
         } else if (eql(u8, req.cmd, "save")) {
             const path = req.path orelse return error.MissingPath;
             try self.saveState(path);
@@ -1052,6 +1060,7 @@ const AttachTestClient = struct {
     err: ?anyerror = null,
     resized_output_ok: bool = false,
     saw_eof: bool = false,
+    late_attach_eof: bool = false,
 
     fn run(self: *AttachTestClient) void {
         self.runInner() catch |err| {
@@ -1103,6 +1112,19 @@ const AttachTestClient = struct {
         self.saw_eof = true;
         self.resized_output_ok = std.mem.indexOf(u8, collected[0..len], "33 111") != null;
 
+        // Attaching to the now-exited pane must EOF immediately, not
+        // hang waiting for a pane_exit that already happened.
+        var late = try Client.connect(self.socket_path);
+        defer late.close();
+        try late.sendLine("{\"id\":1,\"cmd\":\"attach\",\"pane\":1}");
+        _ = try waitFor(&late, "\"id\":1");
+        var scratch: [256]u8 = undefined;
+        while (true) {
+            const n = posix.read(late.fd, &scratch) catch 0;
+            if (n == 0) break;
+        }
+        self.late_attach_eof = true;
+
         try control.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
         _ = try waitFor(&control, "\"id\":9");
     }
@@ -1130,6 +1152,7 @@ test "attach: raw passthrough, live resize, exit EOF" {
     try std.testing.expectEqual(@as(?anyerror, null), tc.err);
     try std.testing.expect(tc.saw_eof);
     try std.testing.expect(tc.resized_output_ok);
+    try std.testing.expect(tc.late_attach_eof);
 }
 
 /// Drives the agent-task protocol end to end: create a task (fake

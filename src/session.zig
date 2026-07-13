@@ -386,6 +386,13 @@ pub const Server = struct {
         return h.exited;
     }
 
+    /// Exited AND drained — i.e. the pane_exit event already fired and
+    /// no more output will ever arrive.
+    pub fn paneFinished(self: *Server, id: PaneId) bool {
+        const h = self.panes.get(id) orelse return false;
+        return h.exited and h.eof;
+    }
+
     /// Resize a pane's PTY and terminal grid (an attached client's
     /// window changed). The new size joins the persisted spawn recipe.
     pub fn paneResize(self: *Server, id: PaneId, rows: u16, cols: u16) !void {
