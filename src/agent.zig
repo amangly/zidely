@@ -183,6 +183,24 @@ pub const Manager = struct {
         return task.*;
     }
 
+    /// What the task changed so far: full diff vs its base plus commit
+    /// count and dirtiness. Works mid-run too (peeking at a working
+    /// agent is legitimate review).
+    pub fn reviewTask(self: *Manager, id: TaskId, alloc: std.mem.Allocator) !gitx.Review {
+        const task = self.tasks.get(id) orelse return error.NoSuchTask;
+        return gitx.reviewTaskWorktree(alloc, task.worktree);
+    }
+
+    /// Merge a finished task's branch into the repo's current branch,
+    /// then remove its worktree and branch. Refuses while the agent is
+    /// running or the worktree has uncommitted work.
+    pub fn mergeTask(self: *Manager, id: TaskId) !void {
+        const task = self.tasks.get(id) orelse return error.NoSuchTask;
+        if (task.status != .finished) return error.TaskStillRunning;
+        try gitx.mergeTaskBranch(self.alloc, self.repo, task.worktree);
+        try self.cleanupTask(id, .{ .delete_branch = true });
+    }
+
     pub const CleanupOptions = struct {
         /// Delete the task branch too (forced); keep it for merging
         /// when false.
@@ -201,6 +219,11 @@ pub const Manager = struct {
             .delete_branch = opts.delete_branch,
             .force = opts.force,
         });
+
+        // The agent's pane is exited (status is finished); drop it from
+        // its session rather than leaving a dead pane behind. Best
+        // effort: a still-draining PTY keeps the pane until later.
+        self.server.removePane(task.pane) catch {};
 
         _ = self.tasks.remove(id);
         _ = self.by_pane.remove(task.pane);
@@ -331,6 +354,15 @@ test "agent task runs in its own worktree and reports finish" {
     try std.testing.expect(std.mem.indexOf(u8, snap, "zide/add-feature-x") != null);
     try std.testing.expect(std.mem.indexOf(u8, snap, "agent-finished") != null);
 
+    // Review sees the agent's committed work.
+    {
+        var review = try manager.reviewTask(task_id, alloc);
+        defer review.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 1), review.commits);
+        try std.testing.expect(!review.dirty);
+        try std.testing.expect(std.mem.indexOf(u8, review.diff, "done.txt") != null);
+    }
+
     // The agent's commit landed on the task branch, not on main.
     try manager.cleanupTask(task_id, .{ .delete_branch = false });
     var count_out = std.ArrayList(u8).empty;
@@ -342,6 +374,48 @@ test "agent task runs in its own worktree and reports finish" {
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
     try std.testing.expectEqualStrings("2", std.mem.trim(u8, res.stdout, " \n"));
+}
+
+test "merge lands agent work on the base branch and forgets the task" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try gitx.setupTestRepo(alloc, repo);
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
+    defer alloc.free(wt_dir);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    const sid = try server.createSession("agents");
+    var manager = try Manager.create(alloc, &server, sid, .{
+        .repo = repo,
+        .worktrees_dir = wt_dir,
+        .attention_after_ms = 60_000,
+    });
+    defer manager.destroy();
+
+    const task_id = try manager.startTask(.{
+        .description = "merge me",
+        .argv = &.{ "/bin/sh", "-c", "echo merged-content > merged.txt && git add . && " ++
+            "git -c user.name=t -c user.email=t@t.invalid commit -qm work" },
+    });
+
+    try std.testing.expectError(error.TaskStillRunning, manager.mergeTask(task_id));
+    try server.run();
+    try manager.mergeTask(task_id);
+
+    try std.testing.expectEqual(@as(?Task, null), manager.get(task_id));
+    const res = try std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", repo, "show", "main:merged.txt" },
+    });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expectEqualStrings("merged-content\n", res.stdout);
 }
 
 test "cleanup refuses while the agent is still running" {

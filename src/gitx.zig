@@ -23,10 +23,14 @@ pub const Worktree = struct {
     branch: []const u8,
     /// Absolute path of the worktree directory.
     path: []const u8,
+    /// Commit the branch started from — the fixed point reviews diff
+    /// against (a base *ref* could move under a long-running task).
+    base: []const u8,
 
     pub fn deinit(self: *Worktree, alloc: std.mem.Allocator) void {
         alloc.free(self.branch);
         alloc.free(self.path);
+        alloc.free(self.base);
         self.* = undefined;
     }
 };
@@ -117,15 +121,17 @@ pub fn createTaskWorktree(
     });
     errdefer alloc.free(path);
 
+    const base_sha = try git(alloc, repo, &.{ "rev-parse", opts.base_ref orelse "HEAD" });
+    errdefer alloc.free(base_sha);
+
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(alloc);
-    try args.appendSlice(alloc, &.{ "worktree", "add", "-b", branch, path });
-    if (opts.base_ref) |ref| try args.append(alloc, ref);
+    try args.appendSlice(alloc, &.{ "worktree", "add", "-b", branch, path, base_sha });
 
     const out = try git(alloc, repo, args.items);
     alloc.free(out);
 
-    return .{ .branch = branch, .path = path };
+    return .{ .branch = branch, .path = path, .base = base_sha };
 }
 
 pub const RemoveOptions = struct {
@@ -156,6 +162,81 @@ pub fn removeTaskWorktree(
     if (opts.delete_branch) {
         const bout = try git(alloc, repo, &.{ "branch", "-D", wt.branch });
         alloc.free(bout);
+    }
+}
+
+/// True when the worktree has uncommitted changes — staged, unstaged,
+/// or untracked files.
+pub fn worktreeDirty(alloc: std.mem.Allocator, worktree_path: []const u8) !bool {
+    const out = try git(alloc, worktree_path, &.{ "status", "--porcelain" });
+    defer alloc.free(out);
+    return out.len != 0;
+}
+
+pub const Review = struct {
+    /// Unified diff of everything the task changed vs its base:
+    /// committed work plus uncommitted changes. Owned by the allocator.
+    diff: []const u8,
+    /// Commits on the task branch since its base.
+    commits: u32,
+    /// Uncommitted changes present (merge will refuse).
+    dirty: bool,
+
+    pub fn deinit(self: *Review, alloc: std.mem.Allocator) void {
+        alloc.free(self.diff);
+        self.* = undefined;
+    }
+};
+
+/// Everything a task changed, for review before merging. Untracked
+/// files are included via intent-to-add so agent-created files that
+/// were never committed still show up.
+pub fn reviewTaskWorktree(alloc: std.mem.Allocator, wt: Worktree) !Review {
+    // `git diff` is blind to untracked files; register them with
+    // intent-to-add for the diff, then reset the index — leaving the
+    // entries would keep the worktree permanently "dirty". Cost: any
+    // agent-staged-but-uncommitted files end up unstaged, which changes
+    // nothing that matters here (the content survives; merge refuses
+    // dirty worktrees either way).
+    if (git(alloc, wt.path, &.{ "add", "--intent-to-add", "--all" })) |out| {
+        alloc.free(out);
+    } else |_| {}
+    const diff = git(alloc, wt.path, &.{ "diff", wt.base });
+    if (git(alloc, wt.path, &.{ "reset", "-q" })) |out| {
+        alloc.free(out);
+    } else |_| {}
+    const owned_diff = try diff;
+    errdefer alloc.free(owned_diff);
+
+    const range = try std.fmt.allocPrint(alloc, "{s}..HEAD", .{wt.base});
+    defer alloc.free(range);
+    const count_out = try git(alloc, wt.path, &.{ "rev-list", "--count", range });
+    defer alloc.free(count_out);
+    const commits = std.fmt.parseInt(u32, count_out, 10) catch 0;
+
+    return .{
+        .diff = owned_diff,
+        .commits = commits,
+        .dirty = try worktreeDirty(alloc, wt.path),
+    };
+}
+
+pub const MergeError = error{ DirtyWorktree, MergeFailed } || Error || std.mem.Allocator.Error;
+
+/// Merge the task branch into the repository's current branch. Refuses
+/// while the task worktree has uncommitted work (it would be silently
+/// left behind). On failure (conflicts, dirty main checkout) any
+/// half-applied merge is aborted so the repo stays clean.
+pub fn mergeTaskBranch(alloc: std.mem.Allocator, repo: []const u8, wt: Worktree) MergeError!void {
+    if (try worktreeDirty(alloc, wt.path)) return error.DirtyWorktree;
+
+    if (git(alloc, repo, &.{ "merge", "--no-edit", wt.branch })) |out| {
+        alloc.free(out);
+    } else |_| {
+        if (git(alloc, repo, &.{ "merge", "--abort" })) |out| {
+            alloc.free(out);
+        } else |_| {} // no merge was in progress
+        return error.MergeFailed;
     }
 }
 
@@ -208,6 +289,108 @@ pub fn setupTestRepo(alloc: std.mem.Allocator, path: []const u8) !void {
         const out = try git(alloc, path, &args);
         alloc.free(out);
     }
+}
+
+test "review sees commits and uncommitted files; merge lands and refuses dirty" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try setupTestRepo(alloc, repo);
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
+    defer alloc.free(wt_dir);
+
+    var wt = try createTaskWorktree(alloc, repo, "add feature", .{ .worktrees_dir = wt_dir });
+    defer wt.deinit(alloc);
+
+    // The "agent": one committed file, one file it forgot to commit.
+    {
+        const f = try std.fs.createFileAbsolute(
+            try std.fmt.bufPrint(&path_buf, "{s}/committed.txt", .{wt.path}),
+            .{},
+        );
+        try f.writeAll("committed-content\n");
+        f.close();
+        inline for (.{
+            .{ "add", "committed.txt" },
+            .{ "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-qm", "agent work" },
+        }) |args| {
+            const out = try git(alloc, wt.path, &args);
+            alloc.free(out);
+        }
+        const g = try std.fs.createFileAbsolute(
+            try std.fmt.bufPrint(&path_buf, "{s}/forgotten.txt", .{wt.path}),
+            .{},
+        );
+        try g.writeAll("forgotten-content\n");
+        g.close();
+    }
+
+    var review = try reviewTaskWorktree(alloc, wt);
+    defer review.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), review.commits);
+    try std.testing.expect(review.dirty);
+    try std.testing.expect(std.mem.indexOf(u8, review.diff, "+committed-content") != null);
+    try std.testing.expect(std.mem.indexOf(u8, review.diff, "+forgotten-content") != null);
+
+    // Dirty refusal, then clean up the stray file and merge for real.
+    try std.testing.expectError(error.DirtyWorktree, mergeTaskBranch(alloc, repo, wt));
+    try std.fs.deleteFileAbsolute(try std.fmt.bufPrint(&path_buf, "{s}/forgotten.txt", .{wt.path}));
+    try mergeTaskBranch(alloc, repo, wt);
+
+    // The agent's work is on main now.
+    const shown = try git(alloc, repo, &.{ "show", "main:committed.txt" });
+    defer alloc.free(shown);
+    try std.testing.expectEqualStrings("committed-content", shown);
+}
+
+var path_buf: [512]u8 = undefined;
+
+test "merge failure aborts cleanly" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try setupTestRepo(alloc, repo);
+    // Outside the repo: this test asserts on the repo's own status.
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const wt_dir = try std.fs.path.join(alloc, &.{ dir, "wt" });
+    defer alloc.free(wt_dir);
+
+    var wt = try createTaskWorktree(alloc, repo, "conflicting", .{ .worktrees_dir = wt_dir });
+    defer wt.deinit(alloc);
+
+    // Same file, different content, committed on both sides.
+    var buf: [512]u8 = undefined;
+    inline for (.{ .{ repo, "main-side" }, .{ wt.path, "task-side" } }) |side| {
+        const f = try std.fs.createFileAbsolute(
+            try std.fmt.bufPrint(&buf, "{s}/clash.txt", .{side[0]}),
+            .{},
+        );
+        try f.writeAll(side[1]);
+        f.close();
+        inline for (.{
+            .{ "add", "clash.txt" },
+            .{ "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-qm", "clash" },
+        }) |args| {
+            const out = try git(alloc, side[0], &args);
+            alloc.free(out);
+        }
+    }
+
+    try std.testing.expectError(error.MergeFailed, mergeTaskBranch(alloc, repo, wt));
+
+    // The abort left the repo clean: no merge in progress, no changes.
+    const status = try git(alloc, repo, &.{ "status", "--porcelain" });
+    defer alloc.free(status);
+    try std.testing.expectEqualStrings("", status);
 }
 
 test "worktree lifecycle: create, collide, remove" {

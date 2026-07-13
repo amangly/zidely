@@ -508,6 +508,33 @@ pub const Server = struct {
             });
             self.reply(client, .{ .id = req.id, .ok = true });
             self.broadcast(.{ .event = "task_removed", .task = tid });
+        } else if (eql(u8, req.cmd, "task-diff")) {
+            const tid = req.task orelse return error.MissingTask;
+            const mgr = for (self.managers.items) |rm| {
+                if (rm.manager.get(tid) != null) break rm.manager;
+            } else return error.NoSuchTask;
+            var review = try mgr.reviewTask(tid, self.alloc);
+            defer review.deinit(self.alloc);
+            // One diff line must fit the synchronous client's buffer
+            // (with JSON-escaping overhead on top).
+            const cap = 400 * 1024;
+            const diff = if (review.diff.len <= cap) review.diff else review.diff[0..cap];
+            self.reply(client, .{
+                .id = req.id,
+                .ok = true,
+                .diff = diff,
+                .truncated = review.diff.len > cap,
+                .commits = review.commits,
+                .dirty = review.dirty,
+            });
+        } else if (eql(u8, req.cmd, "task-merge")) {
+            const tid = req.task orelse return error.MissingTask;
+            const mgr = for (self.managers.items) |rm| {
+                if (rm.manager.get(tid) != null) break rm.manager;
+            } else return error.NoSuchTask;
+            try mgr.mergeTask(tid);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "task_removed", .task = tid, .merged = true });
         } else if (eql(u8, req.cmd, "shutdown")) {
             self.reply(client, .{ .id = req.id, .ok = true });
             self.beginShutdown(client);
@@ -646,7 +673,9 @@ pub const Server = struct {
 /// lines interleave with responses and are surfaced by readLine too.
 pub const Client = struct {
     fd: posix.socket_t,
-    buf: [65536]u8 = undefined,
+    /// Sized for a whole task-diff response on one JSON line (the
+    /// server caps diffs at 400 KiB before escaping).
+    buf: [1024 * 1024]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
 
@@ -976,6 +1005,9 @@ const TaskTestClient = struct {
     listed_ok: bool = false,
     finished_ok: bool = false,
     removed_ok: bool = false,
+    diff_ok: bool = false,
+    merged_ok: bool = false,
+    panes_gone: bool = false,
 
     fn run(self: *TaskTestClient) void {
         self.runInner() catch |err| {
@@ -1018,6 +1050,35 @@ const TaskTestClient = struct {
         const r4 = try waitFor(&client, "\"id\":4");
         self.removed_ok = std.mem.indexOf(u8, r4, "prove the harness") == null;
 
+        // Second task commits work; review it and merge it over the socket.
+        const create2 = try std.fmt.bufPrint(&buf, "{{\"id\":5,\"cmd\":\"task-create\"," ++
+            "\"repo\":\"{s}\",\"description\":\"commit some work\"," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"echo diffable-content > agent.txt && git add . && " ++
+            "git -c user.name=t -c user.email=t@t.invalid commit -qm work\"]}}", .{self.repo});
+        try client.sendLine(create2);
+        _ = try waitFor(&client, "\"id\":5");
+        while (true) {
+            const line = try client.readLine();
+            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
+            if (std.mem.indexOf(u8, line, "\"finished\"") != null) break;
+        }
+
+        try client.sendLine("{\"id\":6,\"cmd\":\"task-diff\",\"task\":2}");
+        const r6 = try waitFor(&client, "\"id\":6");
+        self.diff_ok = std.mem.indexOf(u8, r6, "diffable-content") != null and
+            std.mem.indexOf(u8, r6, "\"commits\":1") != null and
+            std.mem.indexOf(u8, r6, "\"dirty\":false") != null;
+
+        try client.sendLine("{\"id\":7,\"cmd\":\"task-merge\",\"task\":2}");
+        const r7 = try waitFor(&client, "\"id\":7");
+        self.merged_ok = std.mem.indexOf(u8, r7, "\"ok\":true") != null;
+        _ = try waitFor(&client, "\"task_removed\"");
+
+        // Cleanup removed the dead agent panes from their session too.
+        try client.sendLine("{\"id\":8,\"cmd\":\"list-sessions\"}");
+        const r8 = try waitFor(&client, "\"id\":8");
+        self.panes_gone = std.mem.indexOf(u8, r8, "\"panes\":[]") != null;
+
         try client.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
         _ = try waitFor(&client, "\"id\":9");
     }
@@ -1052,6 +1113,18 @@ test "agent tasks over the socket: create, list, status stream, cleanup" {
     try std.testing.expect(tc.listed_ok);
     try std.testing.expect(tc.finished_ok);
     try std.testing.expect(tc.removed_ok);
+    try std.testing.expect(tc.diff_ok);
+    try std.testing.expect(tc.merged_ok);
+    try std.testing.expect(tc.panes_gone);
+
+    // The merged task's work is on the repo's branch.
+    const res = try std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", repo, "show", "main:agent.txt" },
+    });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expectEqualStrings("diffable-content\n", res.stdout);
 }
 
 test "socket api: commands, events, save, shutdown" {

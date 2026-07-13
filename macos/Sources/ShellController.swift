@@ -35,6 +35,17 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
     let statusLabel = NSTextField(labelWithString: "")
     let placeholder = NSTextField(labelWithString: "no pane selected — ⌘T opens a terminal")
 
+    // Review bar: shown while a task pane is selected.
+    let reviewBar = NSView()
+    let reviewLabel = NSTextField(labelWithString: "")
+    let diffButton = NSButton(title: "Diff", target: nil, action: nil)
+    let mergeButton = NSButton(title: "Merge & Remove", target: nil, action: nil)
+    let discardButton = NSButton(title: "Discard…", target: nil, action: nil)
+    let diffScroll = NSScrollView()
+    let diffText = NSTextView()
+    var reviewTaskId: UInt64?
+    var showingDiff = false
+
     var rows: [SidebarRow] = []
     var exited: Set<UInt64> = []
     var bells: Set<UInt64> = []
@@ -147,8 +158,163 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         placeholder.autoresizingMask = [.width, .height]
         content.addSubview(placeholder)
 
+        buildReviewBar()
+
         window.center()
         window.makeKeyAndOrderFront(nil)
+    }
+
+    static let reviewBarHeight: CGFloat = 32
+
+    func buildReviewBar() {
+        reviewBar.wantsLayer = true
+        reviewBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1).cgColor
+
+        reviewLabel.font = .systemFont(ofSize: 11)
+        reviewLabel.textColor = .secondaryLabelColor
+        reviewLabel.lineBreakMode = .byTruncatingTail
+
+        for (button, action) in [
+            (diffButton, #selector(toggleDiff)),
+            (mergeButton, #selector(mergeSelectedTask)),
+            (discardButton, #selector(discardSelectedTask)),
+        ] {
+            button.target = self
+            button.action = action
+            button.bezelStyle = .accessoryBarAction
+            button.controlSize = .small
+            button.font = .systemFont(ofSize: 11)
+        }
+
+        let stack = NSStackView(views: [reviewLabel, NSView(), diffButton, mergeButton, discardButton])
+        stack.orientation = .horizontal
+        stack.spacing = 8
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        stack.frame = reviewBar.bounds
+        stack.autoresizingMask = [.width, .height]
+        reviewBar.addSubview(stack)
+
+        diffText.isEditable = false
+        diffText.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        diffText.backgroundColor = NSColor(calibratedRed: 0.09, green: 0.09, blue: 0.11, alpha: 1)
+        diffText.autoresizingMask = [.width]
+        diffScroll.documentView = diffText
+        diffScroll.hasVerticalScroller = true
+    }
+
+    /// Frame for the hosted pane view, leaving room for the review bar.
+    func hostFrame() -> NSRect {
+        var f = content.bounds
+        if reviewBar.superview != nil {
+            f.size.height -= Self.reviewBarHeight
+        }
+        return f
+    }
+
+    func taskFor(pane: UInt64) -> TaskInfo? {
+        tasks.values.first { $0.pane == pane }
+    }
+
+    /// Show or hide the review bar for the current selection and keep
+    /// its label/buttons in sync with the task's status.
+    func syncReviewBar() {
+        guard let pane = selectedPane, let task = taskFor(pane: pane) else {
+            reviewBar.removeFromSuperview()
+            reviewTaskId = nil
+            return
+        }
+        reviewTaskId = task.id
+        let finished = task.status == "finished"
+        reviewLabel.stringValue = task.description + (finished ? " — finished, review below" : " — \(task.status)")
+        mergeButton.isEnabled = finished
+        if reviewBar.superview == nil {
+            reviewBar.frame = NSRect(
+                x: 0, y: content.bounds.height - Self.reviewBarHeight,
+                width: content.bounds.width, height: Self.reviewBarHeight)
+            reviewBar.autoresizingMask = [.width, .minYMargin]
+            content.addSubview(reviewBar)
+        }
+    }
+
+    @objc func toggleDiff() {
+        guard let taskId = reviewTaskId else { return }
+        if showingDiff {
+            showingDiff = false
+            diffButton.title = "Diff"
+            if let pane = selectedPane { select(terminal: pane) }
+            return
+        }
+        client.send(["cmd": "task-diff", "task": taskId]) { [weak self] resp in
+            guard let self, resp["ok"] as? Bool == true else { return }
+            var header = "# \(resp["commits"] as? Int ?? 0) commit(s)"
+            if resp["dirty"] as? Bool == true { header += ", uncommitted changes" }
+            if resp["truncated"] as? Bool == true { header += ", truncated" }
+            let diff = resp["diff"] as? String ?? ""
+            self.diffText.textStorage?.setAttributedString(
+                Self.attributedDiff(header + "\n\n" + (diff.isEmpty ? "(no changes)" : diff)))
+            for v in self.content.subviews where v !== self.placeholder && v !== self.reviewBar {
+                v.removeFromSuperview()
+            }
+            self.placeholder.isHidden = true
+            self.diffScroll.frame = self.hostFrame()
+            self.diffScroll.autoresizingMask = [.width, .height]
+            self.content.addSubview(self.diffScroll)
+            self.showingDiff = true
+            self.diffButton.title = "Terminal"
+        }
+    }
+
+    @objc func mergeSelectedTask() {
+        guard let taskId = reviewTaskId, let task = tasks[taskId] else { return }
+        let alert = NSAlert()
+        alert.messageText = "Merge task?"
+        alert.informativeText = "Merges the task branch for “\(task.description)” into the repo's current branch, then removes its worktree and branch."
+        alert.addButton(withTitle: "Merge & Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        client.send(["cmd": "task-merge", "task": taskId]) { [weak self] resp in
+            guard let self else { return }
+            if resp["ok"] as? Bool == true {
+                self.statusLabel.stringValue = "task merged: \(task.description)"
+            } else {
+                self.statusLabel.stringValue = "merge failed: \(resp["error"] as? String ?? "?")"
+            }
+        }
+    }
+
+    @objc func discardSelectedTask() {
+        guard let taskId = reviewTaskId, let task = tasks[taskId] else { return }
+        let alert = NSAlert()
+        alert.messageText = "Discard task?"
+        alert.informativeText = "Deletes the worktree AND branch for “\(task.description)” — the agent's work is lost."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Discard")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        client.send(["cmd": "task-cleanup", "task": taskId,
+                     "delete_branch": true, "force": true]) { [weak self] resp in
+            guard let self else { return }
+            if resp["ok"] as? Bool != true {
+                self.statusLabel.stringValue = "discard failed: \(resp["error"] as? String ?? "?")"
+            }
+        }
+    }
+
+    static func attributedDiff(_ diff: String) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
+            let color: NSColor =
+                line.hasPrefix("+++") || line.hasPrefix("---") ? .systemTeal :
+                line.hasPrefix("+") ? .systemGreen :
+                line.hasPrefix("-") ? .systemRed :
+                line.hasPrefix("@@") ? .systemCyan :
+                line.hasPrefix("#") ? .secondaryLabelColor : .labelColor
+            out.append(NSAttributedString(
+                string: String(line) + "\n",
+                attributes: [.font: mono, .foregroundColor: color]))
+        }
+        return out
     }
 
     func buildMenu() {
@@ -363,6 +529,9 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         selectedPane = pane
         bells.remove(pane)
         clearContent()
+        showingDiff = false
+        diffButton.title = "Diff"
+        syncReviewBar()
 
         let view: TerminalSurfaceView
         if let cached = surfaces[pane] {
@@ -380,7 +549,7 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
             }
             surfaces[pane] = view
         }
-        view.frame = content.bounds
+        view.frame = hostFrame()
         view.autoresizingMask = [.width, .height]
         content.addSubview(view)
         window.makeFirstResponder(view)
@@ -391,11 +560,13 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
     func select(browser pane: UInt64) {
         selectedPane = pane
         clearContent()
+        showingDiff = false
+        syncReviewBar()
         guard let web = webviews[pane] else {
             placeholder.isHidden = false
             return
         }
-        web.frame = content.bounds
+        web.frame = hostFrame()
         web.autoresizingMask = [.width, .height]
         content.addSubview(web)
         window.makeFirstResponder(web)
@@ -437,6 +608,7 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
                 if let idx = rowIndex(of: t.pane) {
                     table.reloadData(forRowIndexes: [idx], columnIndexes: [0])
                 }
+                if id == reviewTaskId { syncReviewBar() }
             } else {
                 // A task we don't know yet (created from the CLI).
                 refresh()
@@ -447,7 +619,17 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
             }
         case "task_removed":
             let id = (obj["task"] as? NSNumber)?.uint64Value ?? 0
+            let removedPane = tasks[id]?.pane
             tasks.removeValue(forKey: id)
+            if id == reviewTaskId {
+                // Its pane is gone from the daemon too.
+                if let p = removedPane { surfaces.removeValue(forKey: p) }
+                selectedPane = nil
+                reviewTaskId = nil
+                clearContent()
+                reviewBar.removeFromSuperview()
+                placeholder.isHidden = false
+            }
             refresh()
         case "browser_open":
             ensureWebView(pane: pane, url: obj["url"] as? String ?? "about:blank")

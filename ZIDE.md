@@ -46,7 +46,7 @@ shells will consume it as a library and stay thin.
 | `src/term/Pane.zig` | PTY-attached child process feeding a ghostty-vt Terminal (queryable screen state, no rendering) |
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
-| `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
+| `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), review (diff vs the recorded base *commit*, including uncommitted work via intent-to-add) and merge (refuses dirty worktrees; aborts on conflict). Shells out to `git` |
 | `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing), the `attach` command (raw PTY passthrough for terminal renderers, plus `resize`), and the agent-task surface: `task-create`/`task-list`/`task-cleanup` with `task_status`/`task_removed` events — one lazily created `agent.Manager` (+ its `agents: <repo>` session) per repo, task ids kept globally unique by the socket layer |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
@@ -151,6 +151,17 @@ minimal reference), `scripts/` (GhosttyKit build),
 - **The app finds `zide` by walking up from the bundle**: running
   `macos/out/Zide.app` from the dev tree works; a copy elsewhere (e.g.
   /Applications) needs `ZIDE_BIN` until there's a real install layout.
+- **`zig build test` does not install the binary**: the daemon the app
+  auto-starts is `zig-out/bin/zide`, so run plain `zig build` before
+  manual testing or you will debug a stale daemon (an auto-started one
+  outlives the app, too — `zide shutdown` between runs).
+- **Diffing untracked files dirties the index**: `git diff` ignores
+  untracked files, so review intent-to-adds everything, then `git reset`
+  to undo it — otherwise the worktree stays permanently "dirty" and
+  merge refuses forever.
+- **`--agent` splits on spaces**: quoted sub-commands don't survive
+  (`--agent "sh -c 'a && b'"` breaks). Point it at a script instead;
+  proper quoting is unfinished business.
 - **Never set DEVELOPER_DIR globally for zig**: Zig 0.15.2 cannot link
   under the macOS 26+ SDKs a new Xcode activates (missing-libSystem
   errors; same failure as `macos-latest` CI). GhosttyKit needs full

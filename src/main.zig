@@ -31,7 +31,11 @@ const usage =
     \\                           agent pane in this repo, then attach
     \\                           (--repo PATH, --agent CMD; default: claude)
     \\  tasks                    list agent tasks and their status
-    \\  task-rm <id>             remove a finished task's worktree
+    \\  task-diff <id>           show everything a task changed (works
+    \\                           mid-run; pipe it to a pager)
+    \\  task-merge <id>          merge a finished task into the repo's
+    \\                           current branch, then clean it up
+    \\  task-rm <id>             discard a finished task's worktree
     \\                           (--branch deletes its branch, --force)
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
@@ -228,6 +232,36 @@ pub fn main() !void {
                 t.id, t.status, t.description, t.pane, t.branch, t.repo,
             });
         }
+    } else if (std.mem.eql(u8, cmd, "task-diff")) {
+        if (pos.items.len != 1) return fail("usage: zide task-diff <id>\n", .{});
+        const tid = try std.fmt.parseInt(u64, pos.items[0], 10);
+        try client.sendLine(try std.fmt.allocPrint(
+            arena,
+            "{{\"id\":1,\"cmd\":\"task-diff\",\"task\":{d}}}",
+            .{tid},
+        ));
+        const Diff = struct {
+            ok: bool = false,
+            @"error": ?[]const u8 = null,
+            diff: []const u8 = "",
+            commits: u32 = 0,
+            dirty: bool = false,
+            truncated: bool = false,
+        };
+        const parsed = try client.readResponse(Diff, arena);
+        if (!parsed.value.ok) return fail("error: {s}\n", .{parsed.value.@"error" orelse "unknown"});
+        try stdout("# task {d}: {d} commit(s){s}{s}\n", .{
+            tid,
+            parsed.value.commits,
+            if (parsed.value.dirty) ", uncommitted changes" else "",
+            if (parsed.value.truncated) ", diff truncated" else "",
+        });
+        try stdout("{s}\n", .{parsed.value.diff});
+    } else if (std.mem.eql(u8, cmd, "task-merge")) {
+        if (pos.items.len != 1) return fail("usage: zide task-merge <id>\n", .{});
+        const tid = try std.fmt.parseInt(u64, pos.items[0], 10);
+        _ = try roundtrip(arena, &client, .{ .id = 1, .cmd = "task-merge", .task = tid });
+        try stdout("task {d} merged and cleaned up\n", .{tid});
     } else if (std.mem.eql(u8, cmd, "task-rm")) {
         if (pos.items.len != 1)
             return fail("usage: zide task-rm <id> [--branch] [--force]\n", .{});

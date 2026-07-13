@@ -22,8 +22,13 @@ foundation first, pixels when the core deserves them.
         `task_status` stream), `zide task/tasks/task-rm` CLI, sidebar
         AGENT TASKS section with attention rings (verified with a real
         Claude Code agent in a worktree)
+  - [x] task review → merge → cleanup: `task-diff`/`task-merge` on the
+        socket, `zide task-diff`/`task-merge` CLI, and a review bar in
+        the app (colored diff, Merge & Remove, Discard) — merge refuses
+        dirty worktrees and aborts cleanly on conflicts
   - [ ] splits, vertical tabs per workspace, IME/preedit
-  - [ ] task review → merge → cleanup flow in the UI
+  - [ ] persist agent tasks across daemon restarts (today only their
+        panes are restored, orphaned from the task)
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

@@ -395,6 +395,30 @@ pub const Server = struct {
         h.cols = cols;
     }
 
+    /// Remove an exited-and-drained pane: destroy its handle and forget
+    /// it (agent-task cleanup, closing dead panes). Refuses on a live
+    /// child — its kernel completions may still be armed.
+    pub fn removePane(self: *Server, id: PaneId) !void {
+        const h = self.panes.get(id) orelse return error.NoSuchPane;
+        if (!(h.exited and h.eof)) return error.PaneStillRunning;
+
+        if (self.sessions.getPtr(h.session)) |sess| {
+            for (sess.panes.items, 0..) |p, i| {
+                if (p == id) {
+                    _ = sess.panes.orderedRemove(i);
+                    break;
+                }
+            }
+        }
+        _ = self.panes.remove(id);
+
+        h.process.deinit();
+        h.pane.destroy();
+        freeArgv(self.alloc, h.argv);
+        if (h.cwd) |c| self.alloc.free(c);
+        self.alloc.destroy(h);
+    }
+
     /// Run the event loop until no registered work remains (i.e. every
     /// spawned pane has exited and drained).
     pub fn run(self: *Server) !void {
