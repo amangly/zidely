@@ -9,7 +9,9 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        # macos-15, not -latest: since 2026-06 "latest" is macOS 26 beta,
+        # whose SDK Zig 0.15.2 cannot link against (missing libSystem).
+        os: [macos-15, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
