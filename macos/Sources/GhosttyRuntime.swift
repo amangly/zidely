@@ -26,11 +26,23 @@ final class GhosttyRuntime {
         runtime.wakeup_cb = { _ in
             DispatchQueue.main.async { GhosttyRuntime.shared?.tick() }
         }
-        runtime.action_cb = { _, _, _ in
+        runtime.action_cb = { _, target, action in
             // Window/tab/split management actions are the shell's job in
-            // ghostty proper; zide's layout is daemon state, so nothing
-            // to do yet. Returning false marks them unhandled.
-            false
+            // ghostty proper; zide's layout is daemon state. The one we
+            // consume is the terminal title (OSC 0/2) — it names pane
+            // tabs, cmux-style.
+            if action.tag == GHOSTTY_ACTION_SET_TITLE,
+               target.tag == GHOSTTY_TARGET_SURFACE,
+               let surface = target.target.surface,
+               let ctitle = action.action.set_title.title {
+                let title = String(cString: ctitle)
+                if let ud = ghostty_surface_userdata(surface) {
+                    let view = Unmanaged<TerminalSurfaceView>.fromOpaque(ud).takeUnretainedValue()
+                    DispatchQueue.main.async { view.onTitleChange?(title) }
+                }
+                return true
+            }
+            return false
         }
         runtime.read_clipboard_cb = { userdata, location, state in
             GhosttyRuntime.readClipboard(userdata, location: location, state: state)

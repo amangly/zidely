@@ -14,6 +14,9 @@ final class TerminalSurfaceView: NSView {
     /// Called on the main queue when ghostty asks to close the surface
     /// (child exited and was dismissed).
     var onClose: (() -> Void)?
+    /// OSC 0/2 terminal title, delivered via the app runtime's action
+    /// callback — names this surface's tab, cmux-style.
+    var onTitleChange: ((String) -> Void)?
 
     init(app: ghostty_app_t, command: String) {
         super.init(frame: .zero)
@@ -119,15 +122,15 @@ final class TerminalSurfaceView: NSView {
     /// Shortcuts the shell owns are refused outright: ghostty binds some
     /// of them itself (cmd+t is its new_tab) and would swallow them —
     /// but zide's layout is daemon state, so the menu must win.
-    static let shellShortcuts: Set<String> = ["t", "n", "b", "k", "q", "h"]
+    static let shellShortcuts: Set<String> = ["t", "n", "b", "k", "q", "h", "i", "u", "d", "p", "r", "g", "w", ".", "[", "]", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown, window?.firstResponder === self else { return false }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if mods == .command,
-           let chars = event.charactersIgnoringModifiers,
+        if let chars = event.charactersIgnoringModifiers,
            Self.shellShortcuts.contains(chars) {
-            return false
+            // Let the menu own cmd / cmd-shift / ctrl-cmd chords for shell chrome.
+            if mods.contains(.command) { return false }
         }
         return keyAction(GHOSTTY_ACTION_PRESS, event: event, text: ghosttyText(of: event))
     }

@@ -74,11 +74,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         GhosttyRuntime.shared = runtime
         self.runtime = runtime
 
+        let demo = ProcessInfo.processInfo.environment["ZIDE_UI_DEMO"] == "1"
         controller = ShellController(
             client: client,
             runtime: runtime,
             zideBin: zideBin,
-            socketPath: socketPath)
+            socketPath: socketPath,
+            demoMode: demo)
         NSApp.activate(ignoringOtherApps: true)
     }
 

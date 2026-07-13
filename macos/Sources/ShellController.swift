@@ -1,67 +1,76 @@
-// The zide window: cmux-style chrome. A dark vertical sidebar lists
-// sessions and their panes with attention state; the rest of the window
-// is the selected pane — a live libghostty terminal surface or a
-// WKWebView browser pane. Panes are daemon state; this controller is a
-// view onto the socket protocol and nothing more.
+// The zide window: native AppKit chrome styled like cmux vertical tabs.
+// Sidebar + host are view-model driven; socket wiring fills the model
+// (or ZIDE_UI_DEMO=1 serves fixtures). Panes still live in the daemon.
 
 import AppKit
 import WebKit
 import GhosttyKit
 
-enum SidebarRow {
-    case tasksHeader
-    case task(id: UInt64)
-    case session(id: UInt64, title: String)
-    case term(pane: UInt64)
-    case browser(pane: UInt64)
-}
-
-struct TaskInfo {
-    var id: UInt64
-    var pane: UInt64
-    var description: String
-    var status: String // working | needs_attention | finished
-}
-
-final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSWindowDelegate {
+final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDelegate, NotificationPanelDelegate, WorkspaceSwitcherDelegate, CommandPaletteDelegate, WKNavigationDelegate, NSWindowDelegate {
     let client: SocketClient
     let runtime: GhosttyRuntime
     let zideBin: String
     let socketPath: String
+    let demoMode: Bool
 
     let window: NSWindow
-    let table = NSTableView()
-    let content = NSView()
+    let sidebar = SidebarView(frame: .zero)
+    let rightSidebar = RightSidebarView(frame: .zero)
+    let host = WorkspaceHostView(frame: .zero)
+    let notifPanel = NotificationPanelView(frame: .zero)
+    let switcher = WorkspaceSwitcherView(frame: .zero)
+    let palette = CommandPaletteView(frame: .zero)
     let statusLabel = NSTextField(labelWithString: "")
-    let placeholder = NSTextField(labelWithString: "no pane selected — ⌘T opens a terminal")
+    let viewModel: ShellViewModel
+    var notifPanelVisible = false
 
-    // Review bar: shown while a task pane is selected.
-    let reviewBar = NSView()
-    let reviewLabel = NSTextField(labelWithString: "")
-    let diffButton = NSButton(title: "Diff", target: nil, action: nil)
-    let mergeButton = NSButton(title: "Merge & Remove", target: nil, action: nil)
-    let discardButton = NSButton(title: "Discard…", target: nil, action: nil)
-    let diffScroll = NSScrollView()
-    let diffText = NSTextView()
-    var reviewTaskId: UInt64?
-    var showingDiff = false
-
-    var rows: [SidebarRow] = []
     var exited: Set<UInt64> = []
     var bells: Set<UInt64> = []
-    var tasks: [UInt64: TaskInfo] = [:]
     var surfaces: [UInt64: TerminalSurfaceView] = [:]
     var webviews: [UInt64: WKWebView] = [:]
+    /// Live browser page titles for sidebar rows (pane id → title).
+    var browserTitles: [UInt64: String] = [:]
     var paneOfWebView: [ObjectIdentifier: UInt64] = [:]
     var selectedPane: UInt64?
+    /// Last live session list, for spawn-into-current-session.
+    var sessionIds: [UInt64] = []
+    /// Which session each daemon pane lives in — splits and extra tabs
+    /// spawn their pane into the same session as the workspace.
+    var paneSession: [UInt64: UInt64] = [:]
+    /// Panes we asked the daemon to kill: their pane_exit triggers the
+    /// remove-pane that drops them from the session for good.
+    var pendingKill: Set<UInt64> = []
+    /// Live OSC terminal titles per pane (shell prompts, running
+    /// command) — what pane tabs display, cmux-style.
+    var paneTitles: [UInt64: String] = [:]
+    /// Panes whose title came from OSC 0/2 — authoritative, never
+    /// overwritten by the meta-derived fallback.
+    var oscTitled: Set<UInt64> = []
+    /// Panes whose foreground process is a known AI agent — their rows
+    /// light up and their bells read as "agent needs you".
+    var agentPanes: Set<UInt64> = []
+    /// Live activity line per agent pane (the pane's last screen line),
+    /// so every applyLive rebuild keeps the cmux row treatment.
+    var agentActivity: [UInt64: String?] = [:]
+    static let agentNames: Set<String> = [
+        "claude", "codex", "aider", "gemini", "goose", "amp", "opencode", "cursor-agent",
+    ]
+    var metaTimer: Timer?
+    // Titlebar chrome (cmux-style: the titlebar is the toolbar).
+    let bellButton = NSButton()
+    let titlebarTitle = NSTextField(labelWithString: "")
+    /// The daemon's notice history is seeded into the panel exactly
+    /// once per launch, after the first refresh.
+    var noticesSeeded = false
+    static let noticeSeqKey = "zide.noticeSeq"
 
-    static let sidebarWidth: CGFloat = 240
-
-    init(client: SocketClient, runtime: GhosttyRuntime, zideBin: String, socketPath: String) {
+    init(client: SocketClient, runtime: GhosttyRuntime, zideBin: String, socketPath: String, demoMode: Bool = false) {
         self.client = client
         self.runtime = runtime
         self.zideBin = zideBin
         self.socketPath = socketPath
+        self.demoMode = demoMode
+        self.viewModel = demoMode ? .demo() : ShellViewModel()
         window = NSWindow(
             contentRect: NSRect(x: 120, y: 120, width: 1280, height: 800),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -71,250 +80,387 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         buildMenu()
         window.delegate = self
         client.onEvent = { [weak self] in self?.handleEvent($0) }
-        client.send(["cmd": "host-register"])
-        refresh(selectFirst: true)
+        if !demoMode {
+            client.send(["cmd": "host-register"])
+            refresh(selectFirst: true)
+            // cwd/branch/ports drift without events (cd, servers starting);
+            // panes-meta is poll-based by design.
+            metaTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+                self?.refreshPaneMeta()
+            }
+        } else {
+            reloadChrome()
+            statusLabel.stringValue = "UI demo — ZIDE_UI_DEMO=1  ·  chrome only, not wired"
+        }
     }
 
     // MARK: UI
 
     func buildUI() {
+        // Title kept for Mission Control / app switcher but hidden from
+        // the titlebar — cmux chrome has no title text.
         window.title = "zide"
+        window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
-        window.minSize = NSSize(width: 700, height: 400)
+        buildTitlebar()
+        window.minSize = NSSize(width: 860, height: 520)
         let root = window.contentView!
         let W = root.bounds.width
         let H = root.bounds.height
-        let sw = Self.sidebarWidth
+        let sw = ShellTheme.sidebarWidth
 
-        // Sidebar: translucent dark, cmux-style.
-        let sidebar = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: sw, height: H))
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .behindWindow
-        sidebar.state = .active
+        sidebar.frame = NSRect(x: 0, y: 0, width: sw, height: H)
         sidebar.autoresizingMask = [.height]
+        sidebar.delegate = self
         root.addSubview(sidebar)
 
-        // Below the traffic lights (the titlebar is transparent and the
-        // sidebar spans it).
-        let titlebar: CGFloat = 28
-        let buttons = NSStackView(frame: NSRect(x: 10, y: H - titlebar - 30, width: sw - 20, height: 24))
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        buttons.autoresizingMask = [.minYMargin]
-        // Icon buttons (new-session lives in the menu, ⌘N).
-        for (symbol, tip, action) in [
-            ("sparkles", "New agent task (⌘K)", #selector(addTask)),
-            ("apple.terminal", "New terminal (⌘T)", #selector(addTerm)),
-            ("globe", "New browser pane (⌘B)", #selector(addWeb)),
-        ] {
-            let b = NSButton(
-                image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!,
-                target: self, action: action)
-            b.bezelStyle = .accessoryBarAction
-            b.controlSize = .small
-            b.isBordered = true
-            b.toolTip = tip
-            buttons.addArrangedSubview(b)
-        }
-        sidebar.addSubview(buttons)
+        let top = ShellTheme.titlebarClearance
+        let statusH = ShellTheme.statusHeight
 
-        let sideScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: sw, height: H - titlebar - 38))
-        sideScroll.autoresizingMask = [.height]
-        sideScroll.hasVerticalScroller = true
-        sideScroll.drawsBackground = false
-        let col = NSTableColumn(identifier: .init("main"))
-        col.width = sw - 16
-        table.addTableColumn(col)
-        table.headerView = nil
-        table.backgroundColor = .clear
-        table.style = .sourceList
-        table.rowHeight = 24
-        table.dataSource = self
-        table.delegate = self
-        sideScroll.documentView = table
-        sidebar.addSubview(sideScroll)
+        host.frame = NSRect(x: sw + 1, y: statusH, width: W - sw - 1, height: H - statusH - top)
+        host.autoresizingMask = [.width, .height]
+        host.delegate = self
+        root.addSubview(host)
 
-        // Content area: the selected pane fills it, with a thin status
-        // strip at the bottom. It stops BELOW the titlebar: the strip
-        // above must stay clickable as a real titlebar (drag,
-        // double-click to zoom) and the window title must not overlap
-        // pane content.
-        content.frame = NSRect(x: sw + 1, y: 22, width: W - sw - 1, height: H - 22 - titlebar)
-        content.autoresizingMask = [.width, .height]
-        content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor(calibratedRed: 0.09, green: 0.09, blue: 0.11, alpha: 1).cgColor
-        root.addSubview(content)
+        rightSidebar.frame = NSRect(x: W - ShellTheme.rightSidebarWidth, y: 0, width: ShellTheme.rightSidebarWidth, height: H)
+        rightSidebar.autoresizingMask = [.height, .minXMargin]
+        rightSidebar.isHidden = true
+        root.addSubview(rightSidebar)
 
-        statusLabel.frame = NSRect(x: sw + 11, y: 3, width: W - sw - 20, height: 16)
+        notifPanel.frame = NSRect(
+            x: W - ShellTheme.notifPanelWidth - 20,
+            y: H - ShellTheme.notifPanelHeight - 40,
+            width: ShellTheme.notifPanelWidth,
+            height: ShellTheme.notifPanelHeight)
+        notifPanel.autoresizingMask = [.minXMargin, .minYMargin]
+        notifPanel.delegate = self
+        notifPanel.isHidden = true
+        root.addSubview(notifPanel)
+
+        switcher.frame = root.bounds
+        switcher.autoresizingMask = [.width, .height]
+        switcher.delegate = self
+        switcher.isHidden = true
+        root.addSubview(switcher)
+
+        palette.frame = root.bounds
+        palette.autoresizingMask = [.width, .height]
+        palette.delegate = self
+        palette.isHidden = true
+        root.addSubview(palette)
+
+        statusLabel.frame = NSRect(x: sw + 12, y: 5, width: W - sw - 24, height: 18)
         statusLabel.autoresizingMask = [.width, .maxYMargin]
-        statusLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        statusLabel.font = ShellTheme.statusFont
         statusLabel.textColor = .tertiaryLabelColor
         root.addSubview(statusLabel)
-
-        placeholder.frame = content.bounds
-        placeholder.alignment = .center
-        placeholder.font = .systemFont(ofSize: 13)
-        placeholder.textColor = .secondaryLabelColor
-        placeholder.autoresizingMask = [.width, .height]
-        content.addSubview(placeholder)
-
-        buildReviewBar()
 
         window.center()
         window.makeKeyAndOrderFront(nil)
     }
 
-    static let reviewBarHeight: CGFloat = 32
+    /// cmux-style titlebar toolbar: right of the traffic lights sit
+    /// sidebar toggle, notifications bell, a new-pane menu, workspace
+    /// back/forward, then the selected workspace's title. All default
+    /// AppKit (titlebar accessory + borderless template buttons).
+    func buildTitlebar() {
+        let bar = NSStackView()
+        bar.orientation = .horizontal
+        bar.spacing = 10
+        bar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
 
-    func buildReviewBar() {
-        reviewBar.wantsLayer = true
-        reviewBar.layer?.backgroundColor = NSColor(calibratedWhite: 0.16, alpha: 1).cgColor
-
-        reviewLabel.font = .systemFont(ofSize: 11)
-        reviewLabel.textColor = .secondaryLabelColor
-        reviewLabel.lineBreakMode = .byTruncatingTail
-
-        for (button, action) in [
-            (diffButton, #selector(toggleDiff)),
-            (mergeButton, #selector(mergeSelectedTask)),
-            (discardButton, #selector(discardSelectedTask)),
-        ] {
-            button.target = self
-            button.action = action
-            button.bezelStyle = .accessoryBarAction
-            button.controlSize = .small
-            button.font = .systemFont(ofSize: 11)
+        func glyph(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
+            let img = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!
+            img.isTemplate = true
+            let b = NSButton(image: img, target: self, action: action)
+            b.isBordered = false
+            b.bezelStyle = .accessoryBarAction
+            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .medium)
+            b.contentTintColor = .secondaryLabelColor
+            b.toolTip = tip
+            return b
         }
 
-        let stack = NSStackView(views: [reviewLabel, NSView(), diffButton, mergeButton, discardButton])
-        stack.orientation = .horizontal
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
-        stack.frame = reviewBar.bounds
-        stack.autoresizingMask = [.width, .height]
-        reviewBar.addSubview(stack)
+        bar.addArrangedSubview(glyph("sidebar.left", "Toggle sidebar (⌘⇧S)", #selector(toggleSidebar)))
+        bellButton.image = NSImage(systemSymbolName: "bell", accessibilityDescription: "Notifications")
+        bellButton.isBordered = false
+        bellButton.bezelStyle = .accessoryBarAction
+        bellButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .medium)
+        bellButton.contentTintColor = .secondaryLabelColor
+        bellButton.target = self
+        bellButton.action = #selector(toggleNotifications)
+        bellButton.toolTip = "Notifications (⌘⇧I)"
+        bar.addArrangedSubview(bellButton)
+        bar.addArrangedSubview(glyph("plus", "New terminal · browser", #selector(showNewMenu(_:))))
+        bar.addArrangedSubview(glyph("chevron.left", "Previous workspace", #selector(prevWorkspace)))
+        bar.addArrangedSubview(glyph("chevron.right", "Next workspace", #selector(nextWorkspace)))
 
-        diffText.isEditable = false
-        diffText.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
-        diffText.backgroundColor = NSColor(calibratedRed: 0.09, green: 0.09, blue: 0.11, alpha: 1)
-        diffText.autoresizingMask = [.width]
-        diffScroll.documentView = diffText
-        diffScroll.hasVerticalScroller = true
+        let folder = NSImageView(image: NSImage(
+            systemSymbolName: "folder.fill", accessibilityDescription: nil)!)
+        folder.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .regular)
+        folder.contentTintColor = .tertiaryLabelColor
+        bar.addArrangedSubview(folder)
+        titlebarTitle.font = ShellTheme.uiFontBold
+        titlebarTitle.textColor = .labelColor
+        titlebarTitle.lineBreakMode = .byTruncatingTail
+        titlebarTitle.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        bar.addArrangedSubview(titlebarTitle)
+
+        bar.frame = NSRect(x: 0, y: 0, width: 600, height: 28)
+        let vc = NSTitlebarAccessoryViewController()
+        vc.view = bar
+        vc.layoutAttribute = .leading
+        window.addTitlebarAccessoryViewController(vc)
     }
 
-    /// Frame for the hosted pane view, leaving room for the review bar.
-    func hostFrame() -> NSRect {
-        var f = content.bounds
-        if reviewBar.superview != nil {
-            f.size.height -= Self.reviewBarHeight
+    @objc func showNewMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "New Terminal", action: #selector(addTerm), keyEquivalent: "")
+        menu.addItem(withTitle: "New Browser Pane…", action: #selector(addWeb), keyEquivalent: "")
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 6), in: sender)
+    }
+
+    /// Titlebar state that follows the view model: bell badge when
+    /// anything is unread, selected workspace title next to it.
+    func updateTitlebar() {
+        let unread = !viewModel.unreadNotifications.isEmpty
+        bellButton.image = NSImage(
+            systemSymbolName: unread ? "bell.badge" : "bell",
+            accessibilityDescription: "Notifications")
+        bellButton.contentTintColor = unread ? ShellTheme.accent : .secondaryLabelColor
+        titlebarTitle.stringValue = viewModel.selectedWorkspace?.title ?? ""
+    }
+
+    func reloadChrome() {
+        sidebar.isHidden = !viewModel.sidebarVisible
+        sidebar.apply(
+            items: viewModel.items,
+            selectedWorkspaceId: viewModel.selectedWorkspaceId,
+            collapsedGroups: viewModel.collapsedGroups)
+        showSelectedWorkspace()
+        layoutHost()
+        updateTitlebar()
+    }
+
+    func showSelectedWorkspace() {
+        let ws = viewModel.selectedWorkspace
+        layoutHost()
+        host.show(workspace: ws, focusedPaneId: viewModel.focusedPaneId)
+        if let ws {
+            selectedPane = primaryPaneId(of: ws)
+            let unread = viewModel.unreadNotifications.count
+            var line = statusLine(for: ws)
+            if unread > 0 { line += "  ·  \(unread) unread" }
+            statusLabel.stringValue = line
+        } else {
+            selectedPane = nil
+            statusLabel.stringValue = demoMode
+                ? "UI demo — no workspace selected"
+                : "no workspace selected — ⌘T opens a terminal  ·  \(socketPath)"
         }
-        return f
     }
 
-    func taskFor(pane: UInt64) -> TaskInfo? {
-        tasks.values.first { $0.pane == pane }
+    func layoutHost() {
+        let root = window.contentView!
+        let left = viewModel.sidebarVisible ? ShellTheme.sidebarWidth : 0
+        let right = viewModel.rightSidebarVisible ? ShellTheme.rightSidebarWidth : 0
+        let top = ShellTheme.titlebarClearance
+        let statusH = ShellTheme.statusHeight
+        sidebar.isHidden = !viewModel.sidebarVisible
+        rightSidebar.isHidden = !viewModel.rightSidebarVisible
+        sidebar.frame = NSRect(x: 0, y: 0, width: ShellTheme.sidebarWidth, height: root.bounds.height)
+        rightSidebar.frame = NSRect(
+            x: root.bounds.width - ShellTheme.rightSidebarWidth, y: 0,
+            width: ShellTheme.rightSidebarWidth, height: root.bounds.height)
+        var frame = NSRect(
+            x: left + (left > 0 ? 1 : 0), y: statusH,
+            width: root.bounds.width - left - right - (left > 0 ? 1 : 0) - (right > 0 ? 1 : 0),
+            height: root.bounds.height - statusH - top)
+        host.frame = frame
+        statusLabel.frame = NSRect(x: frame.origin.x + 12, y: 5, width: frame.width - 24, height: 18)
+        notifPanel.frame = NSRect(
+            x: root.bounds.width - ShellTheme.notifPanelWidth - 20
+                - (viewModel.rightSidebarVisible ? ShellTheme.rightSidebarWidth : 0),
+            y: root.bounds.height - ShellTheme.notifPanelHeight - 40,
+            width: ShellTheme.notifPanelWidth,
+            height: ShellTheme.notifPanelHeight)
+        switcher.frame = root.bounds
+        palette.frame = root.bounds
     }
 
-    /// Show or hide the review bar for the current selection and keep
-    /// its label/buttons in sync with the task's status.
-    func syncReviewBar() {
-        guard let pane = selectedPane, let task = taskFor(pane: pane) else {
-            reviewBar.removeFromSuperview()
-            reviewTaskId = nil
+    func primaryPaneId(of ws: ShellWorkspace) -> UInt64? {
+        switch ws.layout {
+        case let .single(p):
+            return p.surfaces.first { $0.id == p.selectedSurfaceId }?.paneId
+                ?? p.surfaces.first?.paneId
+        case let .split(_, first, _, _):
+            return first.surfaces.first { $0.id == first.selectedSurfaceId }?.paneId
+                ?? first.surfaces.first?.paneId
+        }
+    }
+
+    func statusLine(for ws: ShellWorkspace) -> String {
+        var parts = [ws.title]
+        if let cwd = ws.cwd { parts.append(cwd) }
+        if let branch = ws.branch {
+            parts.append(ws.branchDirty ? "\(branch)*" : branch)
+        }
+        if !ws.ports.isEmpty {
+            parts.append(":" + ws.ports.map(String.init).joined(separator: ","))
+        }
+        if demoMode {
+            parts.append("demo")
+        } else {
+            parts.append(socketPath)
+        }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    func sidebarDidSelectWorkspace(_ id: String) {
+        viewModel.selectWorkspace(id)
+        reloadChrome()
+        if let pane = selectedPane, let view = surfaces[pane] {
+            window.makeFirstResponder(view)
+        }
+    }
+
+    func sidebarDidToggleGroup(_ id: String) {
+        viewModel.toggleGroup(id)
+        reloadChrome()
+    }
+
+    func sidebarDidRequestNewInGroup(_ id: String) {
+        if demoMode {
+            viewModel.addWorkspace(inGroup: id)
+            reloadChrome()
+            statusLabel.stringValue = "demo — added workspace in \(id)"
             return
         }
-        reviewTaskId = task.id
-        let finished = task.status == "finished"
-        reviewLabel.stringValue = task.description + (finished ? " — finished, review below" : " — \(task.status)")
-        mergeButton.isEnabled = finished
-        if reviewBar.superview == nil {
-            reviewBar.frame = NSRect(
-                x: 0, y: content.bounds.height - Self.reviewBarHeight,
-                width: content.bounds.width, height: Self.reviewBarHeight)
-            reviewBar.autoresizingMask = [.width, .minYMargin]
-            content.addSubview(reviewBar)
-        }
+        // Live: new terminal in the default session for now.
+        addTerm()
     }
 
-    @objc func toggleDiff() {
-        guard let taskId = reviewTaskId else { return }
-        if showingDiff {
-            showingDiff = false
-            diffButton.title = "Diff"
-            if let pane = selectedPane { select(terminal: pane) }
+    func sidebarDidTogglePin(_ id: String) {
+        viewModel.togglePin(id)
+        reloadChrome()
+    }
+
+    func sidebarDidRename(_ id: String) {
+        let alert = NSAlert()
+        alert.messageText = "Rename workspace"
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: ShellTheme.alertFieldHeight))
+        field.stringValue = viewModel.workspace(id: id)?.title ?? ""
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        viewModel.renameWorkspace(id, title: field.stringValue)
+        reloadChrome()
+    }
+
+    func sidebarDidNavigateWorkspaces(delta: Int) {
+        viewModel.selectAdjacentWorkspace(delta: delta)
+        reloadChrome()
+    }
+
+    func workspaceHost(_ host: WorkspaceHostView, installPanel surface: ShellSurface, into slot: NSView) {
+        if demoMode || surface.paneId == nil {
             return
         }
-        client.send(["cmd": "task-diff", "task": taskId]) { [weak self] resp in
-            guard let self, resp["ok"] as? Bool == true else { return }
-            var header = "# \(resp["commits"] as? Int ?? 0) commit(s)"
-            if resp["dirty"] as? Bool == true { header += ", uncommitted changes" }
-            if resp["truncated"] as? Bool == true { header += ", truncated" }
-            let diff = resp["diff"] as? String ?? ""
-            self.diffText.textStorage?.setAttributedString(
-                Self.attributedDiff(header + "\n\n" + (diff.isEmpty ? "(no changes)" : diff)))
-            for v in self.content.subviews where v !== self.placeholder && v !== self.reviewBar {
-                v.removeFromSuperview()
+        switch surface.kind {
+        case .terminal:
+            // A pane known to be dead EOFs the attach instantly, which
+            // ghostty renders as a scary "failed to launch" banner —
+            // the placeholder is the honest UI.
+            if exited.contains(surface.paneId!) { return }
+            installTerminal(pane: surface.paneId!, into: slot, host: host)
+        case .browser:
+            if let web = webviews[surface.paneId!] {
+                host.setLiveView(web, in: slot)
+                window.makeFirstResponder(web)
             }
-            self.placeholder.isHidden = true
-            self.diffScroll.frame = self.hostFrame()
-            self.diffScroll.autoresizingMask = [.width, .height]
-            self.content.addSubview(self.diffScroll)
-            self.showingDiff = true
-            self.diffButton.title = "Terminal"
+        case .placeholder:
+            break
         }
     }
 
-    @objc func mergeSelectedTask() {
-        guard let taskId = reviewTaskId, let task = tasks[taskId] else { return }
-        let alert = NSAlert()
-        alert.messageText = "Merge task?"
-        alert.informativeText = "Merges the task branch for “\(task.description)” into the repo's current branch, then removes its worktree and branch."
-        alert.addButton(withTitle: "Merge & Remove")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        client.send(["cmd": "task-merge", "task": taskId]) { [weak self] resp in
-            guard let self else { return }
-            if resp["ok"] as? Bool == true {
-                self.statusLabel.stringValue = "task merged: \(task.description)"
-            } else {
-                self.statusLabel.stringValue = "merge failed: \(resp["error"] as? String ?? "?")"
-            }
+    func workspaceHost(_ host: WorkspaceHostView, didChangeSplitRatio ratio: CGFloat) {
+        guard let wsId = viewModel.selectedWorkspaceId else { return }
+        viewModel.setSplitRatio(workspaceId: wsId, ratio: ratio)
+        host.updateSplitRatio(ratio)
+    }
+
+    func workspaceHost(_ host: WorkspaceHostView, didFocusPane paneId: String) {
+        viewModel.focusPane(paneId)
+        // Move keyboard focus to the live view of that pane's selected
+        // surface, so clicking a panel means typing goes there.
+        guard let ws = viewModel.selectedWorkspace else { return }
+        let nodes: [ShellPaneNode]
+        switch ws.layout {
+        case let .single(p): nodes = [p]
+        case let .split(_, a, b, _): nodes = [a, b]
+        }
+        guard let node = nodes.first(where: { $0.id == paneId }),
+              let surface = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
+                  ?? node.surfaces.first,
+              let paneId = surface.paneId else { return }
+        if surface.kind == .terminal, let view = surfaces[paneId] {
+            window.makeFirstResponder(view)
+        } else if surface.kind == .browser, let web = webviews[paneId] {
+            window.makeFirstResponder(web)
         }
     }
 
-    @objc func discardSelectedTask() {
-        guard let taskId = reviewTaskId, let task = tasks[taskId] else { return }
-        let alert = NSAlert()
-        alert.messageText = "Discard task?"
-        alert.informativeText = "Deletes the worktree AND branch for “\(task.description)” — the agent's work is lost."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Discard")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        client.send(["cmd": "task-cleanup", "task": taskId,
-                     "delete_branch": true, "force": true]) { [weak self] resp in
-            guard let self else { return }
-            if resp["ok"] as? Bool != true {
-                self.statusLabel.stringValue = "discard failed: \(resp["error"] as? String ?? "?")"
-            }
-        }
+    func workspaceHost(_ host: WorkspaceHostView, browserURLForPane paneId: UInt64) -> String? {
+        webviews[paneId]?.url?.absoluteString
     }
 
-    static func attributedDiff(_ diff: String) -> NSAttributedString {
-        let out = NSMutableAttributedString()
-        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        for line in diff.split(separator: "\n", omittingEmptySubsequences: false) {
-            let color: NSColor =
-                line.hasPrefix("+++") || line.hasPrefix("---") ? .systemTeal :
-                line.hasPrefix("+") ? .systemGreen :
-                line.hasPrefix("-") ? .systemRed :
-                line.hasPrefix("@@") ? .systemCyan :
-                line.hasPrefix("#") ? .secondaryLabelColor : .labelColor
-            out.append(NSAttributedString(
-                string: String(line) + "\n",
-                attributes: [.font: mono, .foregroundColor: color]))
+    func workspaceHost(_ host: WorkspaceHostView, navigateBrowser paneId: UInt64, to url: String) {
+        guard let u = URL(string: url) else { return }
+        if let web = webviews[paneId] {
+            web.load(URLRequest(url: u))
+        } else if !demoMode {
+            ensureWebView(pane: paneId, url: url)
+            reloadChrome()
         }
-        return out
+        if !demoMode {
+            client.send(["cmd": "browser-update", "pane": paneId, "url": url, "title": "", "loading": true])
+        }
+        statusLabel.stringValue = "web \(paneId) → \(url)"
+    }
+
+    func workspaceHost(_ host: WorkspaceHostView, browserWebViewForPane paneId: UInt64) -> WKWebView? {
+        webviews[paneId]
+    }
+
+    func installTerminal(pane: UInt64, into slot: NSView, host: WorkspaceHostView) {
+        let view: TerminalSurfaceView
+        if let cached = surfaces[pane] {
+            view = cached
+        } else {
+            guard let app = runtime.app else { return }
+            let command = "\(zideBin) attach \(pane) --socket \(socketPath)"
+            view = TerminalSurfaceView(app: app, command: command)
+            view.onClose = { [weak self, weak view] in
+                guard let self else { return }
+                self.surfaces[pane] = nil
+                view?.removeFromSuperview()
+                self.refresh()
+            }
+            view.onTitleChange = { [weak self] title in
+                self?.paneTitleChanged(pane, title: title)
+            }
+            surfaces[pane] = view
+        }
+        bells.remove(pane)
+        host.setLiveView(view, in: slot)
+        // installPanel fires while the pane host is still detached (the
+        // host view is added to the window after makePaneHost returns),
+        // so focusing now silently fails — defer one runloop tick.
+        DispatchQueue.main.async { [weak self, weak view] in
+            guard let self, let view, view.window != nil else { return }
+            self.window.makeFirstResponder(view)
+        }
     }
 
     func buildMenu() {
@@ -331,15 +477,68 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         let shellItem = NSMenuItem()
         menu.addItem(shellItem)
         let shellMenu = NSMenu(title: "Shell")
-        shellMenu.addItem(withTitle: "New Agent Task", action: #selector(addTask), keyEquivalent: "k")
         shellMenu.addItem(withTitle: "New Terminal", action: #selector(addTerm), keyEquivalent: "t")
         shellMenu.addItem(withTitle: "New Session", action: #selector(addSession), keyEquivalent: "n")
-        shellMenu.addItem(withTitle: "New Browser Pane", action: #selector(addWeb), keyEquivalent: "b")
+        let browserItem = NSMenuItem(title: "New Browser Pane", action: #selector(addWeb), keyEquivalent: "b")
+        browserItem.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(browserItem)
+        shellMenu.addItem(NSMenuItem.separator())
+        shellMenu.addItem(withTitle: "Split Right", action: #selector(splitRight), keyEquivalent: "d")
+        let splitDown = NSMenuItem(title: "Split Down", action: #selector(splitDown), keyEquivalent: "d")
+        splitDown.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(splitDown)
+        shellMenu.addItem(NSMenuItem.separator())
+        shellMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(toggleSidebar), keyEquivalent: "b")
+        let rightSide = NSMenuItem(title: "Toggle Right Sidebar", action: #selector(toggleRightSidebar), keyEquivalent: "b")
+        rightSide.keyEquivalentModifierMask = [.command, .option]
+        shellMenu.addItem(rightSide)
+        shellMenu.addItem(withTitle: "Go to Workspace…", action: #selector(showSwitcher), keyEquivalent: "p")
+        let paletteItem = NSMenuItem(title: "Command Palette…", action: #selector(showPalette), keyEquivalent: "p")
+        paletteItem.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(paletteItem)
+        let renameItem = NSMenuItem(title: "Rename Workspace…", action: #selector(renameSelected), keyEquivalent: "r")
+        renameItem.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(renameItem)
+        let closeWs = NSMenuItem(title: "Close Workspace", action: #selector(closeWorkspace), keyEquivalent: "w")
+        closeWs.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(closeWs)
+        shellMenu.addItem(withTitle: "Close Surface", action: #selector(closeSurface), keyEquivalent: "w")
+        let focusNext = NSMenuItem(title: "Focus Next Pane", action: #selector(focusNextPane), keyEquivalent: "]")
+        focusNext.keyEquivalentModifierMask = [.command, .option]
+        shellMenu.addItem(focusNext)
+        let focusPrev = NSMenuItem(title: "Focus Previous Pane", action: #selector(focusPrevPane), keyEquivalent: "[")
+        focusPrev.keyEquivalentModifierMask = [.command, .option]
+        shellMenu.addItem(focusPrev)
+        let newGroup = NSMenuItem(title: "New Empty Group", action: #selector(newEmptyGroup), keyEquivalent: "g")
+        newGroup.keyEquivalentModifierMask = [.command, .control]
+        shellMenu.addItem(newGroup)
+        let collapse = NSMenuItem(title: "Collapse Focused Group", action: #selector(collapseFocusedGroup), keyEquivalent: ".")
+        collapse.keyEquivalentModifierMask = [.command, .control]
+        shellMenu.addItem(collapse)
+        let notifItem = NSMenuItem(title: "Show Notifications", action: #selector(toggleNotifications), keyEquivalent: "i")
+        notifItem.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(notifItem)
+        let unreadItem = NSMenuItem(title: "Jump to Unread", action: #selector(jumpUnread), keyEquivalent: "u")
+        unreadItem.keyEquivalentModifierMask = [.command, .shift]
+        shellMenu.addItem(unreadItem)
+        shellMenu.addItem(NSMenuItem.separator())
+        let prev = NSMenuItem(title: "Previous Workspace", action: #selector(prevWorkspace), keyEquivalent: "[")
+        prev.keyEquivalentModifierMask = [.command, .control]
+        shellMenu.addItem(prev)
+        let next = NSMenuItem(title: "Next Workspace", action: #selector(nextWorkspace), keyEquivalent: "]")
+        next.keyEquivalentModifierMask = [.command, .control]
+        shellMenu.addItem(next)
+        for i in 1...9 {
+            let item = NSMenuItem(
+                title: "Workspace \(i)",
+                action: #selector(jumpWorkspace(_:)),
+                keyEquivalent: "\(i)")
+            item.tag = i - 1
+            shellMenu.addItem(item)
+        }
         shellMenu.items.forEach { $0.target = self }
         shellItem.submenu = shellMenu
 
-        // Edit menu so field editors work; ghostty surfaces handle
-        // copy/paste through their own super+c/v bindings.
         let editItem = NSMenuItem()
         menu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
@@ -350,286 +549,480 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         NSApp.mainMenu = menu
     }
 
-    // MARK: Sidebar data
+    @objc func toggleSidebar() {
+        viewModel.sidebarVisible.toggle()
+        reloadChrome()
+    }
+
+    @objc func toggleRightSidebar() {
+        viewModel.rightSidebarVisible.toggle()
+        layoutHost()
+    }
+
+    @objc func showSwitcher() {
+        let list = viewModel.workspaces(matching: "")
+        switcher.present(workspaces: list)
+        window.contentView?.addSubview(switcher, positioned: .above, relativeTo: nil)
+    }
+
+    @objc func showPalette() {
+        palette.present([
+            .init(id: "toggle-sidebar", title: "Toggle Sidebar", shortcut: "⌘B"),
+            .init(id: "toggle-right", title: "Toggle Right Sidebar", shortcut: "⌘⌥B"),
+            .init(id: "goto", title: "Go to Workspace…", shortcut: "⌘P"),
+            .init(id: "split-right", title: "Split Right", shortcut: "⌘D"),
+            .init(id: "split-down", title: "Split Down", shortcut: "⌘⇧D"),
+            .init(id: "close-surface", title: "Close Surface", shortcut: "⌘W"),
+            .init(id: "close-workspace", title: "Close Workspace", shortcut: "⌘⇧W"),
+            .init(id: "notifications", title: "Show Notifications", shortcut: "⌘⇧I"),
+            .init(id: "jump-unread", title: "Jump to Unread", shortcut: "⌘⇧U"),
+            .init(id: "new-group", title: "New Empty Group", shortcut: "⌃⌘G"),
+            .init(id: "rename", title: "Rename Workspace…", shortcut: "⌘⇧R"),
+            .init(id: "new-term", title: "New Terminal", shortcut: "⌘T"),
+        ])
+        window.contentView?.addSubview(palette, positioned: .above, relativeTo: nil)
+    }
+
+    @objc func closeWorkspace() {
+        if !demoMode, let ws = viewModel.selectedWorkspace {
+            // Kill the daemon panes behind the workspace's terminals or
+            // they resurrect as rows. Browser panes are core daemon
+            // state and stay (they re-list until closed daemon-side).
+            for pane in terminalPaneIds(of: ws.layout) {
+                killPane(pane)
+            }
+        }
+        if viewModel.closeSelectedWorkspace() {
+            reloadChrome()
+        } else {
+            statusLabel.stringValue = "no workspace to close"
+        }
+    }
+
+    @objc func closeSurface() {
+        if !demoMode, let ws = viewModel.selectedWorkspace {
+            let nodes: [ShellPaneNode]
+            switch ws.layout {
+            case let .single(p): nodes = [p]
+            case let .split(_, a, b, _): nodes = [a, b]
+            }
+            let node = nodes.first { $0.id == viewModel.focusedPaneId } ?? nodes.first
+            if let node,
+               let surf = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
+                   ?? node.surfaces.first,
+               surf.kind == .terminal, let pane = surf.paneId {
+                killPane(pane)
+            }
+        }
+        if viewModel.closeSelectedSurface() {
+            reloadChrome()
+        } else {
+            statusLabel.stringValue = "no surface to close"
+        }
+    }
+
+    /// Daemon panes behind a layout's terminal surfaces.
+    private func terminalPaneIds(of layout: ShellLayout) -> [UInt64] {
+        let nodes: [ShellPaneNode]
+        switch layout {
+        case let .single(p): nodes = [p]
+        case let .split(_, a, b, _): nodes = [a, b]
+        }
+        return nodes.flatMap { node in
+            node.surfaces.filter { $0.kind == .terminal }.compactMap(\.paneId)
+        }
+    }
+
+    @objc func focusNextPane() {
+        viewModel.focusAdjacentPane(delta: 1)
+        reloadChrome()
+    }
+
+    @objc func focusPrevPane() {
+        viewModel.focusAdjacentPane(delta: -1)
+        reloadChrome()
+    }
+
+    @objc func renameSelected() {
+        guard let id = viewModel.selectedWorkspaceId else { return }
+        sidebarDidRename(id)
+    }
+
+    @objc func newEmptyGroup() {
+        viewModel.createEmptyGroup()
+        reloadChrome()
+    }
+
+    @objc func collapseFocusedGroup() {
+        viewModel.collapseFocusedGroup()
+        reloadChrome()
+    }
+
+    @objc func splitRight() { spawnIntoSelected { self.viewModel.graftSplit(workspaceId: $0, orientation: .horizontal, paneId: $1) } }
+
+    @objc func splitDown() { spawnIntoSelected { self.viewModel.graftSplit(workspaceId: $0, orientation: .vertical, paneId: $1) } }
+
+    /// Splits and extra tabs are real daemon panes: spawn one into the
+    /// selected workspace's session, then graft it into the layout.
+    /// applyLive excludes grafted panes from standalone rows.
+    private func spawnIntoSelected(graft: @escaping (String, UInt64) -> Void) {
+        if demoMode {
+            viewModel.splitSelected(orientation: .horizontal)
+            reloadChrome()
+            return
+        }
+        guard let ws = viewModel.selectedWorkspace else {
+            statusLabel.stringValue = "no workspace selected"
+            return
+        }
+        let wsId = ws.id
+        let sid = viewModel.daemonPaneIds(of: ws.layout).first.flatMap { paneSession[$0] }
+            ?? currentSession
+        let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        client.send(["cmd": "spawn-pane", "session": sid,
+                     "argv": [shellPath, "-i"], "cwd": NSHomeDirectory()]) { [weak self] resp in
+            guard let self, let pane = (resp["pane"] as? NSNumber)?.uint64Value else { return }
+            self.paneSession[pane] = sid
+            graft(wsId, pane)
+            self.reloadChrome()
+        }
+    }
+
+    @objc func toggleNotifications() {
+        if notifPanelVisible {
+            notifPanel.isHidden = true
+            notifPanelVisible = false
+            return
+        }
+        notifPanel.show(viewModel.notifications)
+        notifPanelVisible = true
+        window.contentView?.addSubview(notifPanel, positioned: .above, relativeTo: nil)
+    }
+
+    @objc func jumpUnread() {
+        if viewModel.jumpToLatestUnread() != nil {
+            reloadChrome()
+        } else {
+            statusLabel.stringValue = "no unread notifications"
+        }
+    }
+
+    @objc func prevWorkspace() {
+        viewModel.selectAdjacentWorkspace(delta: -1)
+        reloadChrome()
+    }
+
+    @objc func nextWorkspace() {
+        viewModel.selectAdjacentWorkspace(delta: 1)
+        reloadChrome()
+    }
+
+    @objc func jumpWorkspace(_ sender: NSMenuItem) {
+        viewModel.selectWorkspaceIndex(sender.tag)
+        reloadChrome()
+    }
+
+    // MARK: Notification panel
+
+    func notificationPanelDidSelect(_ notification: ShellNotification) {
+        viewModel.markNotificationRead(notification.id)
+        viewModel.selectWorkspace(notification.workspaceId)
+        notifPanel.isHidden = true
+        notifPanelVisible = false
+        reloadChrome()
+    }
+
+    func notificationPanelDidClose() {
+        notifPanelVisible = false
+    }
+
+    // MARK: Workspace switcher
+
+    func workspaceSwitcherDidPick(_ id: String) {
+        viewModel.selectWorkspace(id)
+        reloadChrome()
+    }
+
+    func workspaceSwitcherDidCancel() {}
+
+    // MARK: Command palette
+
+    func commandPaletteDidRun(_ id: String) {
+        switch id {
+        case "toggle-sidebar": toggleSidebar()
+        case "toggle-right": toggleRightSidebar()
+        case "goto": showSwitcher()
+        case "split-right": splitRight()
+        case "split-down": splitDown()
+        case "close-surface": closeSurface()
+        case "close-workspace": closeWorkspace()
+        case "notifications": toggleNotifications()
+        case "jump-unread": jumpUnread()
+        case "new-group": newEmptyGroup()
+        case "rename": renameSelected()
+        case "new-term": addTerm()
+        default: break
+        }
+    }
+
+    func commandPaletteDidCancel() {}
+
+    // MARK: Live data
 
     func refresh(selectFirst: Bool = false) {
-        // Tasks first: session rendering hides panes that belong to tasks.
-        client.send(["cmd": "task-list"]) { [weak self] resp in
-            guard let self else { return }
-            self.tasks.removeAll()
-            for t in resp["tasks"] as? [[String: Any]] ?? [] {
-                let info = TaskInfo(
-                    id: (t["id"] as? NSNumber)?.uint64Value ?? 0,
-                    pane: (t["pane"] as? NSNumber)?.uint64Value ?? 0,
-                    description: t["description"] as? String ?? "",
-                    status: t["status"] as? String ?? "working")
-                self.tasks[info.id] = info
-            }
-            self.refreshSessions(selectFirst: selectFirst)
-        }
+        if demoMode { return }
+        refreshSessions(selectFirst: selectFirst)
     }
 
     private func refreshSessions(selectFirst: Bool) {
         client.send(["cmd": "list-sessions"]) { [weak self] resp in
             guard let self, let sessions = resp["sessions"] as? [[String: Any]] else { return }
-            let taskPanes = Set(self.tasks.values.map(\.pane))
-
-            var new: [SidebarRow] = []
-            if !self.tasks.isEmpty {
-                new.append(.tasksHeader)
-                for t in self.tasks.values.sorted(by: { $0.id < $1.id }) {
-                    new.append(.task(id: t.id))
-                }
-            }
+            var parsed: [(id: UInt64, title: String, panes: [UInt64], browsers: [UInt64], exited: [UInt64])] = []
+            self.sessionIds = []
+            self.paneSession.removeAll()
             for s in sessions {
                 let sid = (s["id"] as? NSNumber)?.uint64Value ?? 0
+                self.sessionIds.append(sid)
                 let panes = (s["panes"] as? [NSNumber] ?? []).map(\.uint64Value)
                 let browsers = (s["browsers"] as? [NSNumber] ?? []).map(\.uint64Value)
-                let visible = panes.filter { !taskPanes.contains($0) }
-                // Agent-task host sessions with nothing else to show are
-                // pure duplication of the tasks section.
-                if visible.isEmpty && browsers.isEmpty { continue }
-                new.append(.session(id: sid, title: s["title"] as? String ?? ""))
-                for p in visible { new.append(.term(pane: p)) }
-                for b in browsers { new.append(.browser(pane: b)) }
-                for e in s["exited"] as? [NSNumber] ?? [] {
-                    self.exited.insert(e.uint64Value)
+                let ex = (s["exited"] as? [NSNumber] ?? []).map(\.uint64Value)
+                for e in ex { self.exited.insert(e) }
+                for p in panes + browsers { self.paneSession[p] = sid }
+                parsed.append((sid, s["title"] as? String ?? "", panes, browsers, ex))
+            }
+            // Sweep panes that exited while nobody was watching (their
+            // pane_exit predates this client) — close-on-exit semantics.
+            for s in parsed {
+                for e in s.exited {
+                    self.client.send(["cmd": "remove-pane", "pane": e])
                 }
             }
-            let selected = self.selectedPane
-            self.rows = new
-            self.table.reloadData()
-            if let selected, let idx = self.rowIndex(of: selected) {
-                self.table.selectRowIndexes([idx], byExtendingSelection: false)
-            } else if selectFirst {
-                for (i, r) in new.enumerated() {
-                    if case .term = r {
-                        self.table.selectRowIndexes([i], byExtendingSelection: false)
-                        break
-                    }
+            self.viewModel.applyLive(
+                sessions: parsed, bells: self.bells, exited: self.exited,
+                browserTitles: self.browserTitles, paneTitles: self.paneTitles,
+                agentActivity: self.agentActivity)
+            // Viewing is reading: the selected workspace never shows an
+            // unread badge for events that happened in front of you.
+            if let sid = self.viewModel.selectedWorkspaceId {
+                self.viewModel.markWorkspaceRead(sid)
+            }
+            if selectFirst, self.viewModel.selectedWorkspaceId == nil {
+                self.viewModel.selectedWorkspaceId = self.viewModel.items.compactMap {
+                    if case let .workspace(w) = $0 { return w.id }
+                    return nil
+                }.first
+            }
+            self.reloadChrome()
+            self.refreshPaneMeta()
+            if !self.noticesSeeded {
+                self.noticesSeeded = true
+                self.fetchNoticeHistory()
+            }
+        }
+    }
+
+    // MARK: Notice history
+
+    /// Rebuild the notification panel from the daemon's notice history
+    /// (`notices` command) so a relaunch shows what happened while the
+    /// app was closed. Entries newer than the persisted watermark come
+    /// in unread; everything shown moves the watermark forward. Mirrors
+    /// the live rules: bells notify, exits stay silent.
+    private func fetchNoticeHistory() {
+        let seen = UInt64(max(0, UserDefaults.standard.integer(forKey: Self.noticeSeqKey)))
+        client.send(["cmd": "notices", "seq": 0]) { [weak self] resp in
+            guard let self, let notices = resp["notices"] as? [[String: Any]] else { return }
+            let timeFmt = DateFormatter()
+            timeFmt.dateStyle = .short
+            timeFmt.timeStyle = .short
+            timeFmt.doesRelativeDateFormatting = true
+            var maxSeq = seen
+            for n in notices {
+                let seq = (n["seq"] as? NSNumber)?.uint64Value ?? 0
+                maxSeq = max(maxSeq, seq)
+                let isRead = seq <= seen
+                let ts = (n["ts"] as? NSNumber)?.doubleValue ?? 0
+                let when = ts > 0
+                    ? timeFmt.string(from: Date(timeIntervalSince1970: ts / 1000)) : ""
+                switch n["kind"] as? String ?? "" {
+                case "pane_bell":
+                    guard let pane = (n["pane"] as? NSNumber)?.uint64Value
+                    else { break }
+                    self.appendHistoryNotification(
+                        seq: seq, workspaceId: "term-\(pane)", title: "pane \(pane)",
+                        subtitle: "bell",
+                        body: "the terminal rang the bell · \(when)", isRead: isRead)
+                default:
+                    // pane_exit is history-only context; the live path
+                    // never notifies for it either.
+                    break
                 }
             }
+            if maxSeq > seen {
+                UserDefaults.standard.set(Int(maxSeq), forKey: Self.noticeSeqKey)
+            }
+            if self.viewModel.notifications.count > 50 {
+                self.viewModel.notifications.removeFirst(self.viewModel.notifications.count - 50)
+            }
+            if self.notifPanelVisible { self.notifPanel.show(self.viewModel.notifications) }
+            // Rows carry the newest notification as their snippet line;
+            // they were built before history existed, so rebuild once.
+            self.refresh()
         }
     }
 
-    func rowIndex(of pane: UInt64) -> Int? {
-        for (i, r) in rows.enumerated() {
-            switch r {
-            case let .term(p) where p == pane: return i
-            case let .browser(p) where p == pane: return i
-            case let .task(id) where tasks[id]?.pane == pane: return i
-            default: continue
+    /// History entries take deterministic zero-padded ids so the panel's
+    /// id-descending sort keeps them chronological (live "n-…" ids sort
+    /// above "h-…" within the same read group).
+    private func appendHistoryNotification(
+        seq: UInt64, workspaceId: String, title: String,
+        subtitle: String, body: String, isRead: Bool
+    ) {
+        // Same collapse rule as pushNotification: consecutive identical
+        // states for one workspace (bells especially) are one entry.
+        if let last = viewModel.notifications.last(where: { $0.workspaceId == workspaceId }),
+           last.subtitle == subtitle { return }
+        viewModel.notifications.append(ShellNotification(
+            id: String(format: "h-%010llu", seq),
+            workspaceId: workspaceId,
+            title: title,
+            subtitle: subtitle,
+            body: body,
+            isRead: isRead))
+    }
+
+    /// A live notification just displayed means everything the daemon
+    /// has recorded so far has been seen in this run — advance the
+    /// watermark so the next launch only re-flags what fires after quit.
+    private func bumpNoticeWatermark() {
+        let seen = UInt64(max(0, UserDefaults.standard.integer(forKey: Self.noticeSeqKey)))
+        client.send(["cmd": "notices", "seq": seen]) { resp in
+            let maxSeq = (resp["notices"] as? [[String: Any]] ?? [])
+                .compactMap { ($0["seq"] as? NSNumber)?.uint64Value }
+                .max()
+            if let maxSeq, maxSeq > seen {
+                UserDefaults.standard.set(Int(maxSeq), forKey: Self.noticeSeqKey)
             }
         }
-        return nil
     }
 
-    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
-
-    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        let cell = NSTableCellView()
-        let text = NSTextField(labelWithAttributedString: label(for: rows[row]))
-        text.frame = NSRect(x: 4, y: 3, width: Self.sidebarWidth - 24, height: 18)
-        text.autoresizingMask = [.width]
-        cell.addSubview(text)
-        cell.textField = text
-        return cell
-    }
-
-    func label(for row: SidebarRow) -> NSAttributedString {
-        switch row {
-        case .tasksHeader:
-            return NSAttributedString(
-                string: "AGENT TASKS",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
-                    .foregroundColor: NSColor.tertiaryLabelColor,
-                ])
-        case let .task(id):
-            let t = tasks[id]
-            let status = t?.status ?? "working"
-            let dotColor: NSColor = switch status {
-            case "needs_attention": .systemOrange
-            case "finished": .systemGray
-            default: .systemGreen
+    private func refreshPaneMeta() {
+        client.send(["cmd": "panes-meta"]) { [weak self] resp in
+            guard let self else { return }
+            var metas: [UInt64: (cwd: String?, branch: String?, dirty: Bool, ports: [Int],
+                                 agent: String?, activity: String?)] = [:]
+            var fgTitles: [UInt64: String?] = [:]
+            self.agentPanes.removeAll()
+            self.agentActivity.removeAll()
+            for p in resp["panes"] as? [[String: Any]] ?? [] {
+                let id = (p["pane"] as? NSNumber)?.uint64Value ?? 0
+                guard id != 0 else { continue }
+                let ports = (p["ports"] as? [NSNumber] ?? []).map(\.intValue)
+                let fg = p["title"] as? String
+                let agent = fg.flatMap { Self.agentNames.contains($0) ? $0 : nil }
+                if agent != nil {
+                    self.agentPanes.insert(id)
+                    self.agentActivity[id] = p["last_line"] as? String
+                }
+                metas[id] = (
+                    cwd: p["cwd"] as? String,
+                    branch: p["branch"] as? String,
+                    dirty: p["dirty"] as? Bool ?? false,
+                    ports: ports,
+                    agent: agent,
+                    activity: p["last_line"] as? String)
+                fgTitles[id] = fg
             }
-            let s = NSMutableAttributedString(
-                string: status == "needs_attention" ? "◉ " : "● ",
-                attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: dotColor])
-            s.append(NSAttributedString(
-                string: t?.description ?? "task \(id)",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12),
-                    .foregroundColor: status == "finished"
-                        ? NSColor.secondaryLabelColor : NSColor.labelColor,
-                ]))
-            return s
-        case let .session(id, title):
-            return NSAttributedString(
-                string: "SESSION \(id)  \(title.uppercased())",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
-                    .foregroundColor: NSColor.tertiaryLabelColor,
-                ])
-        case let .term(pane):
-            let dotColor: NSColor =
-                exited.contains(pane) ? .systemGray :
-                bells.contains(pane) ? .systemOrange : .systemGreen
-            let s = NSMutableAttributedString(
-                string: "● ",
-                attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: dotColor])
-            s.append(NSAttributedString(
-                string: "pane \(pane)\(exited.contains(pane) ? "  exited" : "")",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 12),
-                    .foregroundColor: exited.contains(pane) ? NSColor.secondaryLabelColor : NSColor.labelColor,
-                ]))
-            return s
-        case let .browser(pane):
-            let s = NSMutableAttributedString(
-                string: "◉ ",
-                attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: NSColor.systemBlue])
-            s.append(NSAttributedString(
-                string: "web \(pane)",
-                attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.labelColor]))
-            return s
-        }
-    }
-
-    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        switch rows[row] {
-        case .session, .tasksHeader: return false
-        default: return true
-        }
-    }
-
-    func tableViewSelectionDidChange(_ notification: Notification) {
-        let idx = table.selectedRow
-        guard idx >= 0, idx < rows.count else { return }
-        switch rows[idx] {
-        case .session, .tasksHeader:
-            break
-        case let .task(id):
-            if let pane = tasks[id]?.pane { select(terminal: pane) }
-        case let .term(pane):
-            select(terminal: pane)
-        case let .browser(pane):
-            select(browser: pane)
-        }
-    }
-
-    // MARK: Pane hosting
-
-    func clearContent() {
-        for v in content.subviews where v !== placeholder { v.removeFromSuperview() }
-        placeholder.isHidden = true
-    }
-
-    func select(terminal pane: UInt64) {
-        selectedPane = pane
-        bells.remove(pane)
-        clearContent()
-        showingDiff = false
-        diffButton.title = "Diff"
-        syncReviewBar()
-
-        let view: TerminalSurfaceView
-        if let cached = surfaces[pane] {
-            view = cached
-        } else {
-            guard let app = runtime.app else { return }
-            let command = "\(zideBin) attach \(pane) --socket \(socketPath)"
-            view = TerminalSurfaceView(app: app, command: command)
-            view.onClose = { [weak self, weak view] in
-                guard let self else { return }
-                self.surfaces[pane] = nil
-                view?.removeFromSuperview()
-                if self.selectedPane == pane { self.placeholder.isHidden = false }
-                self.refresh()
+            guard !metas.isEmpty else { return }
+            self.viewModel.applyPaneMeta(metas)
+            // Fallback tab titles for shells that never set one: the
+            // foreground command, or cwd when the shell is idle. OSC
+            // titles stay authoritative.
+            for (pane, m) in metas where !self.oscTitled.contains(pane) {
+                if let t = self.metaDerivedTitle(command: fgTitles[pane] ?? nil, cwd: m.cwd) {
+                    self.paneTitleChanged(pane, title: t, fromOSC: false)
+                }
             }
-            surfaces[pane] = view
-        }
-        view.frame = hostFrame()
-        view.autoresizingMask = [.width, .height]
-        content.addSubview(view)
-        window.makeFirstResponder(view)
-        statusLabel.stringValue = "pane \(pane)\(exited.contains(pane) ? " — exited" : "")  ·  \(socketPath)"
-        reloadRow(pane)
-    }
-
-    func select(browser pane: UInt64) {
-        selectedPane = pane
-        clearContent()
-        showingDiff = false
-        syncReviewBar()
-        guard let web = webviews[pane] else {
-            placeholder.isHidden = false
-            return
-        }
-        web.frame = hostFrame()
-        web.autoresizingMask = [.width, .height]
-        content.addSubview(web)
-        window.makeFirstResponder(web)
-        statusLabel.stringValue = "web \(pane) — \(web.title ?? "")  ·  \(web.url?.absoluteString ?? "")"
-    }
-
-    func reloadRow(_ pane: UInt64) {
-        if let idx = rowIndex(of: pane) {
-            table.reloadData(forRowIndexes: [idx], columnIndexes: [0])
+            // Sidebar + status only: reloadChrome() rebuilds the host's
+            // panel slots, which yanks keyboard focus out of the
+            // terminal — unacceptable on a 4s timer.
+            self.sidebar.apply(
+                items: self.viewModel.items,
+                selectedWorkspaceId: self.viewModel.selectedWorkspaceId,
+                collapsedGroups: self.viewModel.collapsedGroups)
+            if let ws = self.viewModel.selectedWorkspace {
+                self.statusLabel.stringValue = self.statusLine(for: ws)
+            }
+            self.updateTitlebar()
         }
     }
 
     // MARK: Events
 
+    /// Append a live notification (cmux-style feed). Skipped when the
+    /// workspace's latest entry already says the same thing: agents flap
+    /// between working and needs_attention (quiescence detection), and
+    /// only working/finished transitions reset the sequence.
+    func pushNotification(workspaceId: String, title: String, subtitle: String, body: String) {
+        if let last = viewModel.notifications.last(where: { $0.workspaceId == workspaceId }),
+           last.subtitle == subtitle { return }
+        viewModel.notifications.append(ShellNotification(
+            id: "n-\(UUID().uuidString.prefix(8))",
+            workspaceId: workspaceId,
+            title: title,
+            subtitle: subtitle,
+            body: body,
+            isRead: workspaceId == viewModel.selectedWorkspaceId))
+        if viewModel.notifications.count > 50 {
+            viewModel.notifications.removeFirst(viewModel.notifications.count - 50)
+        }
+        if notifPanelVisible { notifPanel.show(viewModel.notifications) }
+        bumpNoticeWatermark()
+    }
+
     func handleEvent(_ obj: [String: Any]) {
+        if demoMode { return }
         let event = obj["event"] as? String ?? ""
         let pane = (obj["pane"] as? NSNumber)?.uint64Value ?? 0
         switch event {
         case "pane_output":
-            // A pane we don't know yet (spawned from the CLI or an agent).
-            if rowIndex(of: pane) == nil { refresh() }
+            // Output renders through attached surfaces; a full refresh
+            // per chunk would hammer the daemon (task-list +
+            // list-sessions + panes-meta with its ps/lsof/git). Only a
+            // pane nobody knows yet — spawned from the CLI or by an
+            // agent — needs the sidebar rebuilt.
+            if !knowsPane(pane) { refresh() }
         case "pane_bell":
             if pane != selectedPane {
                 bells.insert(pane)
-                reloadRow(pane)
+                refresh()
+                // A bell from a pane running an AI agent is that agent
+                // asking for you.
+                let title = paneTitles[pane] ?? "pane \(pane)"
+                if agentPanes.contains(pane) {
+                    pushNotification(
+                        workspaceId: "term-\(pane)", title: title,
+                        subtitle: "needs attention", body: "the agent is waiting for you")
+                    NSApp.requestUserAttention(.informationalRequest)
+                } else {
+                    pushNotification(
+                        workspaceId: "term-\(pane)", title: title,
+                        subtitle: "bell", body: "the terminal rang the bell")
+                }
             }
         case "pane_exit":
             exited.insert(pane)
-            reloadRow(pane)
-            if pane == selectedPane {
-                statusLabel.stringValue = "pane \(pane) — exited"
+            pendingKill.remove(pane)
+            // Terminal semantics: a pane whose child exited closes,
+            // like Terminal.app/ghostty — no grey placeholder ghosts.
+            client.send(["cmd": "remove-pane", "pane": pane]) { [weak self] _ in
+                self?.refresh()
             }
-        case "task_status":
-            let id = (obj["task"] as? NSNumber)?.uint64Value ?? 0
-            let status = obj["status"] as? String ?? "working"
-            if var t = tasks[id] {
-                t.status = status
-                tasks[id] = t
-                if let idx = rowIndex(of: t.pane) {
-                    table.reloadData(forRowIndexes: [idx], columnIndexes: [0])
-                }
-                if id == reviewTaskId { syncReviewBar() }
-            } else {
-                // A task we don't know yet (created from the CLI).
-                refresh()
-            }
-            // The cmux notification ring: an agent needs you.
-            if status == "needs_attention", tasks[id]?.pane != selectedPane {
-                NSApp.requestUserAttention(.informationalRequest)
-            }
-        case "task_removed":
-            let id = (obj["task"] as? NSNumber)?.uint64Value ?? 0
-            let removedPane = tasks[id]?.pane
-            tasks.removeValue(forKey: id)
-            if id == reviewTaskId {
-                // Its pane is gone from the daemon too.
-                if let p = removedPane { surfaces.removeValue(forKey: p) }
-                selectedPane = nil
-                reviewTaskId = nil
-                clearContent()
-                reviewBar.removeFromSuperview()
-                placeholder.isHidden = false
-            }
+            refresh()
+        case "pane_removed":
+            exited.remove(pane)
+            surfaces.removeValue(forKey: pane)
+            viewModel.removePaneEverywhere(pane)
             refresh()
         case "browser_open":
             ensureWebView(pane: pane, url: obj["url"] as? String ?? "about:blank")
@@ -652,9 +1045,70 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         }
     }
 
+    /// A pane's title changed — OSC 0/2 from the surface, or the
+    /// meta-derived fallback. Update tabs and sidebar in place — never
+    /// reloadChrome here, it rebuilds panel slots and steals keyboard
+    /// focus on every prompt.
+    func paneTitleChanged(_ pane: UInt64, title: String, fromOSC: Bool = true) {
+        if fromOSC { oscTitled.insert(pane) }
+        let t = title.isEmpty ? "pane \(pane)" : title
+        guard paneTitles[pane] != t else { return }
+        paneTitles[pane] = t
+        viewModel.setSurfaceTitle(paneId: pane, title: t)
+        sidebar.apply(
+            items: viewModel.items,
+            selectedWorkspaceId: viewModel.selectedWorkspaceId,
+            collapsedGroups: viewModel.collapsedGroups)
+    }
+
+    /// Tab title when the shell never sets one, cmux/tmux-style: the
+    /// foreground command ("vim", "sleep"), or the cwd for an idle
+    /// shell ("~", "zide").
+    static let shellNames: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "nu", "ksh", "tcsh"]
+    func metaDerivedTitle(command: String?, cwd: String?) -> String? {
+        if let command, !command.isEmpty, !Self.shellNames.contains(command) {
+            return command
+        }
+        guard let cwd, !cwd.isEmpty else { return command }
+        let home = NSHomeDirectory()
+        if cwd == home { return "~" }
+        return (cwd as NSString).lastPathComponent
+    }
+
+    /// Kill a daemon pane behind a closed surface: HUP the live child
+    /// and remove the pane once its exit lands (already-dead panes are
+    /// removed immediately). Without this, closing a terminal is purely
+    /// local and the pane resurrects as a row on the next refresh.
+    func killPane(_ pane: UInt64) {
+        if exited.contains(pane) {
+            client.send(["cmd": "remove-pane", "pane": pane]) { [weak self] _ in
+                self?.refresh()
+            }
+        } else {
+            pendingKill.insert(pane)
+            client.send(["cmd": "kill-pane", "pane": pane])
+        }
+    }
+
+    /// Whether any workspace already shows this daemon pane.
+    func knowsPane(_ pane: UInt64) -> Bool {
+        for item in viewModel.items {
+            guard case let .workspace(w) = item else { continue }
+            let panes: [ShellPaneNode]
+            switch w.layout {
+            case let .single(p): panes = [p]
+            case let .split(_, a, b, _): panes = [a, b]
+            }
+            for node in panes where node.surfaces.contains(where: { $0.paneId == pane }) {
+                return true
+            }
+        }
+        return false
+    }
+
     func ensureWebView(pane: UInt64, url: String) {
         guard webviews[pane] == nil else { return }
-        let web = WKWebView(frame: content.bounds)
+        let web = WKWebView(frame: .zero)
         web.navigationDelegate = self
         webviews[pane] = web
         paneOfWebView[ObjectIdentifier(web)] = pane
@@ -663,12 +1117,18 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let pane = paneOfWebView[ObjectIdentifier(webView)] else { return }
-        client.send(["cmd": "browser-update", "pane": pane,
-                     "url": webView.url?.absoluteString ?? "",
-                     "title": webView.title ?? "", "loading": false])
-        if pane == selectedPane {
-            statusLabel.stringValue = "web \(pane) — \(webView.title ?? "")  ·  \(webView.url?.absoluteString ?? "")"
+        let url = webView.url?.absoluteString ?? ""
+        let title = webView.title ?? ""
+        if !title.isEmpty {
+            browserTitles[pane] = title
+            viewModel.setBrowserTitle(pane: pane, title: title)
         }
+        client.send(["cmd": "browser-update", "pane": pane,
+                     "url": url, "title": title, "loading": false])
+        if pane == selectedPane {
+            statusLabel.stringValue = "web \(pane) — \(title.isEmpty ? url : title)  ·  \(url)"
+        }
+        reloadChrome()
     }
 
     // MARK: Window focus
@@ -684,26 +1144,29 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         runtime.setFocus(false)
     }
 
+    func windowDidResize(_ notification: Notification) {
+        layoutHost()
+    }
+
     // MARK: Actions
 
     var currentSession: UInt64 {
-        let idx = table.selectedRow
-        if idx >= 0, idx < rows.count {
-            var i = idx
-            while i >= 0 {
-                if case let .session(id, _) = rows[i] { return id }
-                i -= 1
-            }
-        }
-        for r in rows { if case let .session(id, _) = r { return id } }
-        return 1
+        sessionIds.first ?? 1
     }
 
     @objc func addSession() {
+        if demoMode {
+            statusLabel.stringValue = "demo — create-session not wired"
+            return
+        }
         client.send(["cmd": "create-session", "title": "session"]) { [weak self] _ in self?.refresh() }
     }
 
     @objc func addTerm() {
+        if demoMode {
+            statusLabel.stringValue = "demo — spawn-pane not wired"
+            return
+        }
         let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         var sid = currentSession
         let spawn: () -> Void = { [weak self] in
@@ -713,16 +1176,14 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
                 let pane = (resp["pane"] as? NSNumber)?.uint64Value
                 self.refresh()
                 if let pane {
-                    // Select once the sidebar knows the row.
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        if let idx = self.rowIndex(of: pane) {
-                            self.table.selectRowIndexes([idx], byExtendingSelection: false)
-                        }
+                        self.viewModel.selectWorkspace("term-\(pane)")
+                        self.reloadChrome()
                     }
                 }
             }
         }
-        if rows.isEmpty {
+        if sessionIds.isEmpty {
             client.send(["cmd": "create-session", "title": "main"]) { resp in
                 sid = (resp["session"] as? NSNumber)?.uint64Value ?? 1
                 spawn()
@@ -732,54 +1193,14 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         }
     }
 
-    @objc func addTask() {
-        let alert = NSAlert()
-        alert.messageText = "New agent task"
-        alert.informativeText = "Runs the agent in its own git worktree + branch."
-
-        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 360, height: 56))
-        stack.orientation = .vertical
-        stack.spacing = 8
-        let desc = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        desc.placeholderString = "what should the agent do?"
-        let repo = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
-        repo.placeholderString = "repository path"
-        repo.stringValue = UserDefaults.standard.string(forKey: "zide.lastRepo") ?? ""
-        stack.addArrangedSubview(desc)
-        stack.addArrangedSubview(repo)
-        alert.accessoryView = stack
-        alert.window.initialFirstResponder = desc
-
-        alert.addButton(withTitle: "Start")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn,
-              !desc.stringValue.isEmpty, !repo.stringValue.isEmpty else { return }
-        UserDefaults.standard.set(repo.stringValue, forKey: "zide.lastRepo")
-
-        client.send(["cmd": "task-create",
-                     "repo": repo.stringValue,
-                     "description": desc.stringValue]) { [weak self] resp in
-            guard let self else { return }
-            if resp["ok"] as? Bool != true {
-                self.statusLabel.stringValue = "task failed: \(resp["error"] as? String ?? "?")"
-                return
-            }
-            let pane = (resp["pane"] as? NSNumber)?.uint64Value
-            self.refresh()
-            if let pane {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    if let idx = self.rowIndex(of: pane) {
-                        self.table.selectRowIndexes([idx], byExtendingSelection: false)
-                    }
-                }
-            }
-        }
-    }
-
     @objc func addWeb() {
+        if demoMode {
+            statusLabel.stringValue = "demo — browser-open not wired"
+            return
+        }
         let alert = NSAlert()
         alert.messageText = "Open browser pane"
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: ShellTheme.alertFieldHeight))
         field.stringValue = "https://ziglang.org"
         alert.accessoryView = field
         alert.addButton(withTitle: "Open")
