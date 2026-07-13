@@ -10,9 +10,11 @@
 //!
 //! Every connected client receives every event. Commands: ping,
 //! create-session, list-sessions, spawn-pane, write, snapshot, resize,
-//! notices (bounded history of attention-worthy events, for clients
-//! that connected after they were broadcast), save, shutdown — plus
-//! the browser surface: browser-open,
+//! kill-pane (SIGHUP the child; exit flows through the normal drain)
+//! and remove-pane (drop a *finished* pane from its session, broadcast
+//! as pane_removed), notices (bounded history of attention-worthy
+//! events, for clients that connected after they were broadcast),
+//! save, shutdown — plus the browser surface: browser-open,
 //! browser-navigate, browser-eval work from any client; a shell process
 //! that can render webviews registers with host-register and receives
 //! browser_open / browser_nav / browser_eval events (existing panes are
@@ -392,6 +394,24 @@ pub const Server = struct {
             const cols = req.cols orelse return error.MissingSize;
             try ss.paneResize(pane, rows, cols);
             self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "kill-pane")) {
+            // Hang up the pane's child (tmux kill-pane semantics). The
+            // exit flows through the normal drain path — clients see
+            // pane_exit, then call remove-pane to drop the husk.
+            const pane = req.pane orelse return error.MissingPane;
+            const h = ss.panes.get(pane) orelse return error.NoSuchPane;
+            if (!h.exited) posix.kill(h.pane.pid, posix.SIG.HUP) catch {};
+            self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "remove-pane")) {
+            // Drop a finished pane from its session (PaneStillRunning
+            // otherwise). Separate from kill-pane because removal must
+            // happen from request context — never from inside the
+            // pane's own event callback, whose completions the handle
+            // still owns.
+            const pane = req.pane orelse return error.MissingPane;
+            try ss.removePane(pane);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "pane_removed", .pane = pane });
         } else if (eql(u8, req.cmd, "attach")) {
             const pane = req.pane orelse return error.MissingPane;
             if (ss.panes.get(pane) == null) return error.NoSuchPane;
@@ -1026,6 +1046,7 @@ const TestClient = struct {
     err: ?anyerror = null,
     saw_exit_event: bool = false,
     snapshot_ok: bool = false,
+    kill_remove_ok: bool = false,
 
     fn run(self: *TestClient) void {
         self.runInner() catch |err| {
@@ -1053,6 +1074,30 @@ const TestClient = struct {
         try client.sendLine("{\"id\":3,\"cmd\":\"snapshot\",\"pane\":1}");
         const r3 = try waitFor(&client, "\"id\":3");
         self.snapshot_ok = std.mem.indexOf(u8, r3, "hello-socket") != null;
+
+        // kill-pane hangs up a live child; remove-pane drops the husk
+        // once it finished — and refuses while it is still running.
+        try client.sendLine("{\"id\":6,\"cmd\":\"spawn-pane\",\"session\":1," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"sleep 30\"]}");
+        const r6 = try waitFor(&client, "\"id\":6");
+        if (std.mem.indexOf(u8, r6, "\"pane\":2") == null) return error.SpawnFailed;
+
+        try client.sendLine("{\"id\":7,\"cmd\":\"remove-pane\",\"pane\":2}");
+        const r7 = try waitFor(&client, "\"id\":7");
+        if (std.mem.indexOf(u8, r7, "PaneStillRunning") == null) return error.ExpectedRefusal;
+
+        try client.sendLine("{\"id\":8,\"cmd\":\"kill-pane\",\"pane\":2}");
+        _ = try waitFor(&client, "\"id\":8");
+        _ = try waitFor(&client, "\"event\":\"pane_exit\",\"pane\":2");
+
+        try client.sendLine("{\"id\":9,\"cmd\":\"remove-pane\",\"pane\":2}");
+        const r9 = try waitFor(&client, "\"id\":9");
+        if (std.mem.indexOf(u8, r9, "\"ok\":true") == null) return error.RemoveFailed;
+        _ = try waitFor(&client, "\"event\":\"pane_removed\"");
+
+        try client.sendLine("{\"id\":10,\"cmd\":\"list-sessions\"}");
+        const r10 = try waitFor(&client, "\"id\":10");
+        self.kill_remove_ok = std.mem.indexOf(u8, r10, "\"panes\":[1]") != null;
 
         var save_buf: [512]u8 = undefined;
         const save_req = try std.fmt.bufPrint(&save_buf, "{{\"id\":4,\"cmd\":\"save\",\"path\":\"{s}\"}}", .{self.state_path});
@@ -1651,6 +1696,7 @@ test "socket api: commands, events, save, shutdown" {
     try std.testing.expectEqual(@as(?anyerror, null), client.err);
     try std.testing.expect(client.saw_exit_event);
     try std.testing.expect(client.snapshot_ok);
+    try std.testing.expect(client.kill_remove_ok);
 
     // The save command persisted a restorable layout.
     var restored = try session.Server.init(alloc);

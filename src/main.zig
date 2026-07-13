@@ -39,6 +39,8 @@ const usage =
     \\                           (--branch deletes its branch, --force)
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
+    \\  kill <pane>              hang up a pane's child and remove the
+    \\                           pane from its session
     \\  meta                     cwd, git branch, listening ports per pane
     \\  notices [--since N]      recent attention-worthy events (task
     \\                           status changes, bells, exits)
@@ -338,6 +340,29 @@ pub fn main() !void {
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
         const resp = try roundtrip(arena, &client, .{ .id = 1, .cmd = "snapshot", .pane = pane });
         try stdout("{s}\n", .{resp.snapshot orelse ""});
+    } else if (std.mem.eql(u8, cmd, "kill")) {
+        if (pos.items.len != 1) return fail("usage: zide kill <pane>\n", .{});
+        const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
+        _ = try roundtrip(arena, &client, .{ .id = 1, .cmd = "kill-pane", .pane = pane });
+        // The child exits asynchronously (SIGHUP → drain → pane_exit);
+        // retry removal until the pane has finished, bounded for
+        // children that ignore the hangup.
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            const json = try std.fmt.allocPrint(
+                arena,
+                "{{\"id\":2,\"cmd\":\"remove-pane\",\"pane\":{d}}}",
+                .{pane},
+            );
+            try client.sendLine(json);
+            const parsed = try client.readResponse(BaseResponse, arena);
+            if (parsed.value.ok) break;
+            const e = parsed.value.@"error" orelse "unknown";
+            if (!std.mem.eql(u8, e, "PaneStillRunning") or tries >= 50)
+                return fail("error: {s}\n", .{e});
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        try stdout("pane {d} killed and removed\n", .{pane});
     } else if (std.mem.eql(u8, cmd, "meta")) {
         try client.sendLine("{\"id\":1,\"cmd\":\"panes-meta\"}");
         const Metas = struct {
