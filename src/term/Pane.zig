@@ -97,6 +97,16 @@ fn spawn(alloc: std.mem.Allocator, pty: Pty, argv: []const []const u8) !posix.pi
     return pid;
 }
 
+/// The PTY master fd, for event-loop registration by the session server.
+pub fn masterFd(self: *Pane) posix.fd_t {
+    return self.pty.master;
+}
+
+/// Parse raw PTY output into the terminal state.
+pub fn feed(self: *Pane, bytes: []const u8) !void {
+    try self.stream.nextSlice(bytes);
+}
+
 /// Send bytes to the child (keyboard input, once shells exist).
 pub fn writeInput(self: *Pane, bytes: []const u8) !void {
     var off: usize = 0;
@@ -115,7 +125,7 @@ pub fn pumpUntilEof(self: *Pane) !void {
             else => return err,
         };
         if (n == 0) break;
-        try self.stream.nextSlice(buf[0..n]);
+        try self.feed(buf[0..n]);
     }
 }
 

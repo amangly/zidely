@@ -10,25 +10,38 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    var server = zidely.session.Server.init(alloc);
+    var server = try zidely.session.Server.init(alloc);
     defer server.deinit();
+    server.handler = .{ .func = logEvent };
 
-    const id = try server.createSession("scratch");
-    std.debug.print("zidely {s} — core scaffold\n", .{zidely.version});
-    std.debug.print("created session #{d} ({d} total)\n", .{ id, server.count() });
+    std.debug.print("zidely {s} — event-loop demo: two shells, one loop\n", .{zidely.version});
 
-    // Demo: run a real shell command through a PTY, parse its output with
-    // the ghostty-vt engine, and print the resulting screen state.
-    var pane = try zidely.term.Pane.create(alloc, .{
-        .argv = &.{ "/bin/sh", "-c", "echo \"pane $(tty) says hello\"; uname -sm" },
+    // Two panes alternating output; the event log below shows the loop
+    // interleaving them instead of running one to completion first.
+    const sid = try server.createSession("demo");
+    const a = try server.spawnPane(sid, .{
+        .argv = &.{ "/bin/sh", "-c", "for i in 1 2 3; do echo \"A says $i\"; sleep 0.1; done" },
     });
-    defer pane.destroy();
-    try pane.pumpUntilEof();
-    const exit_code = pane.wait();
+    const b = try server.spawnPane(sid, .{
+        .argv = &.{ "/bin/sh", "-c", "for i in 1 2 3; do echo \"B says $i\"; sleep 0.1; done" },
+    });
 
-    const snap = try pane.snapshot(alloc);
-    defer alloc.free(snap);
-    std.debug.print("--- pane screen (exit code {?d}) ---\n{s}\n", .{ exit_code, snap });
+    try server.run();
+
+    for ([_]zidely.session.PaneId{ a, b }) |pane| {
+        const snap = try server.paneSnapshot(pane, alloc);
+        defer alloc.free(snap);
+        std.debug.print("--- pane {d} final screen ---\n{s}\n", .{ pane, snap });
+    }
+}
+
+fn logEvent(ud: ?*anyopaque, server: *zidely.session.Server, event: zidely.session.Event) void {
+    _ = ud;
+    _ = server;
+    switch (event) {
+        .pane_output => |pane| std.debug.print("event: output from pane {d}\n", .{pane}),
+        .pane_exit => |e| std.debug.print("event: pane {d} exited (code {?d})\n", .{ e.pane, e.exit_code }),
+    }
 }
 
 test {

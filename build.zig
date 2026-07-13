@@ -26,6 +26,13 @@ pub fn build(b: *std.Build) void {
     });
     core.addImport("ghostty-vt", ghostty_dep.module("ghostty-vt"));
 
+    // Event loop (kqueue/epoll/io_uring), same commit Ghostty pins.
+    const libxev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    core.addImport("xev", libxev_dep.module("xev"));
+
     // Dev CLI: temporary entry point for exercising the core before the
     // native shells exist.
     const exe = b.addExecutable(.{
