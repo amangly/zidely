@@ -55,6 +55,13 @@ const PaneHandle = struct {
     read_buf: [4096]u8 = undefined,
     bells: term.BellScanner = .{},
 
+    // The spawn recipe, retained so the layout can be persisted and
+    // respawned later (see persist.zig). Deep-owned by the server.
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    rows: u16,
+    cols: u16,
+
     // pane_exit is emitted only once BOTH the child has exited and the
     // PTY has drained to EOF, so no trailing output is ever lost.
     eof: bool = false,
@@ -123,6 +130,22 @@ const PaneHandle = struct {
     }
 };
 
+fn dupeArgv(alloc: std.mem.Allocator, argv: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, argv.len);
+    var i: usize = 0;
+    errdefer {
+        for (out[0..i]) |arg| alloc.free(arg);
+        alloc.free(out);
+    }
+    while (i < argv.len) : (i += 1) out[i] = try alloc.dupe(u8, argv[i]);
+    return out;
+}
+
+fn freeArgv(alloc: std.mem.Allocator, argv: []const []const u8) void {
+    for (argv) |arg| alloc.free(arg);
+    alloc.free(argv);
+}
+
 /// Both libxev backends deliver a plain exit code (kqueue decodes the
 /// wait status itself; the Linux pidfd path reads siginfo). Caveat, to
 /// fix by reaping ourselves later: signal deaths surface as 0 on macOS
@@ -160,6 +183,8 @@ pub const Server = struct {
             // Closing the master hangs up the PTY; a still-running child
             // gets SIGHUP from the kernel.
             h.pane.destroy();
+            freeArgv(self.alloc, h.argv);
+            if (h.cwd) |c| self.alloc.free(c);
             self.alloc.destroy(h);
         }
         self.panes.deinit(self.alloc);
@@ -218,6 +243,11 @@ pub const Server = struct {
         const fl = try posix.fcntl(pane.masterFd(), posix.F.GETFL, 0);
         _ = try posix.fcntl(pane.masterFd(), posix.F.SETFL, fl | nonblock);
 
+        const argv_copy = try dupeArgv(self.alloc, opts.argv);
+        errdefer freeArgv(self.alloc, argv_copy);
+        const cwd_copy: ?[]const u8 = if (opts.cwd) |c| try self.alloc.dupe(u8, c) else null;
+        errdefer if (cwd_copy) |c| self.alloc.free(c);
+
         const h = try self.alloc.create(PaneHandle);
         errdefer self.alloc.destroy(h);
         const id = self.next_pane_id;
@@ -233,6 +263,10 @@ pub const Server = struct {
             // its watchers ensureTag() on zero-inited completions).
             .c_read = .{},
             .c_proc = .{},
+            .argv = argv_copy,
+            .cwd = cwd_copy,
+            .rows = opts.rows,
+            .cols = opts.cols,
         };
         errdefer h.process.deinit();
 

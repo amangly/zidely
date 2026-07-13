@@ -10,6 +10,8 @@ pub const session = @import("session.zig");
 pub const agent = @import("agent.zig");
 pub const gitx = @import("gitx.zig");
 pub const term = @import("term.zig");
+pub const ipc = @import("ipc.zig");
+pub const persist = @import("persist.zig");
 pub const editor = @import("editor.zig");
 
 pub const version = "0.0.1";

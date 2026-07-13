@@ -15,11 +15,11 @@ foundation first, pixels when the core deserves them.
 - [x] Attention detection: bell (parser-aware) + output quiescence
 - [ ] macOS Swift/AppKit shell: libghostty rendering, vertical tabs,
       splits, notification rings (blocked on: full Xcode install)
-- [ ] Session restore (layout + cwd respawn)
+- [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach
 
-- [ ] Socket API (the session server's event/command stream, exposed)
+- [x] Socket API (the session server's event/command stream, exposed)
 - [ ] `zide` CLI against the socket
 - [ ] Embedded browser pane (WKWebView) with programmable API
 - [ ] Daemon mode: live session survival across UI restarts

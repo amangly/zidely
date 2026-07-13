@@ -46,6 +46,8 @@ shells will consume it as a library and stay thin.
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client |
+| `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
 | `src/main.zig` | Dev CLI (temporary; becomes the automation CLI) |
 
@@ -95,6 +97,10 @@ macOS iconset), `.github/workflows/` (CI).
   0.15.2 linking) — stay on `macos-15` until the Zig/Ghostty pin moves.
 - **Quiescence timer discipline**: any repeating xev timer must disarm
   itself when idle, or `Server.run(.until_done)` never returns.
+- **Never close an fd with a pending xev completion**: kqueue silently
+  drops the filter and the completion never fires, stranding the loop.
+  The ipc server drains its accept completion with a self-connect poke
+  on shutdown, and EOFs clients via `shutdown(2)` instead of `close`.
 
 ## Further reading
 
