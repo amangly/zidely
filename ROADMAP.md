@@ -45,6 +45,9 @@ foundation first, pixels when the core deserves them.
 - [x] Daemon mode: live session survival across UI restarts
 - [x] `panes-meta`: per-pane cwd, git branch/dirty, listening ports
       (the sidebar metadata the shell shows)
+- [x] `notices`: daemon-side history of attention-worthy events
+      (task attention/finished, bells, exits) — the shell's
+      notification panel can survive app restarts
 - [ ] SSH / remote workspaces
 
 ## Phase 3 — Editor & git UI

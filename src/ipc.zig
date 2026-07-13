@@ -10,7 +10,9 @@
 //!
 //! Every connected client receives every event. Commands: ping,
 //! create-session, list-sessions, spawn-pane, write, snapshot, resize,
-//! save, shutdown — plus the browser surface: browser-open,
+//! notices (bounded history of attention-worthy events, for clients
+//! that connected after they were broadcast), save, shutdown — plus
+//! the browser surface: browser-open,
 //! browser-navigate, browser-eval work from any client; a shell process
 //! that can render webviews registers with host-register and receives
 //! browser_open / browser_nav / browser_eval events (existing panes are
@@ -148,8 +150,31 @@ pub const Server = struct {
     /// Task ids are global across repos: handed to each manager before
     /// every startTask so shells never see colliding ids.
     next_task_id: agent.TaskId = 1,
+    /// Bounded history of notification-worthy events (task attention /
+    /// finish, bells, exits). Broadcasts only reach clients that were
+    /// connected when they fired; a shell relaunching later rebuilds
+    /// its notification panel from this via the `notices` command.
+    notices: std.ArrayListUnmanaged(Notice) = .empty,
+    next_notice_seq: u64 = 1,
     shutting_down: bool = false,
     listener_closed: bool = false,
+
+    const max_notices = 256;
+
+    pub const Notice = struct {
+        seq: u64,
+        /// Unix milliseconds, so clients can render "5m ago".
+        ts: i64,
+        /// "task_status" | "pane_bell" | "pane_exit" (static strings).
+        kind: []const u8,
+        pane: ?session.PaneId = null,
+        task: ?agent.TaskId = null,
+        /// Static @tagName of the task status, for kind "task_status".
+        status: ?[]const u8 = null,
+        /// Owned copy of the task description.
+        description: ?[]const u8 = null,
+        exit_code: ?u8 = null,
+    };
 
     const RepoManager = struct {
         repo: []const u8,
@@ -201,6 +226,10 @@ pub const Server = struct {
             self.alloc.free(rm.repo);
         }
         self.managers.deinit(self.alloc);
+        for (self.notices.items) |n| {
+            if (n.description) |d| self.alloc.free(d);
+        }
+        self.notices.deinit(self.alloc);
         self.session_server.handler = self.downstream;
         for (self.clients.items) |client| {
             posix.close(client.fd);
@@ -389,6 +418,18 @@ pub const Server = struct {
             if (ss.paneFinished(pane)) {
                 posix.shutdown(client.fd, .both) catch {};
             }
+        } else if (eql(u8, req.cmd, "notices")) {
+            // Entries newer than `seq` (0 / omitted: everything kept).
+            // Seqs are monotonic and the ring is ordered, so the answer
+            // is a suffix.
+            const since = req.seq orelse 0;
+            var start: usize = self.notices.items.len;
+            while (start > 0 and self.notices.items[start - 1].seq > since) start -= 1;
+            self.reply(client, .{
+                .id = req.id,
+                .ok = true,
+                .notices = self.notices.items[start..],
+            });
         } else if (eql(u8, req.cmd, "save")) {
             const path = req.path orelse return error.MissingPath;
             try self.saveState(path);
@@ -735,6 +776,50 @@ pub const Server = struct {
             .description = task.description,
             .exit_code = task.exit_code,
         });
+        // History keeps only the notification-worthy states — `working`
+        // is live state (task-list), and recording it would let the
+        // constant working↔needs_attention flapping churn the ring.
+        if (event.status == .working) return;
+        // Same task, same status as its latest entry: a flap, not news.
+        var i = self.notices.items.len;
+        while (i > 0) {
+            i -= 1;
+            const n = self.notices.items[i];
+            if (n.task != event.task) continue;
+            if (n.status) |s| if (std.mem.eql(u8, s, @tagName(event.status))) return;
+            break;
+        }
+        self.addNotice(.{
+            .seq = 0,
+            .ts = 0,
+            .kind = "task_status",
+            .task = event.task,
+            .pane = task.pane,
+            .status = @tagName(event.status),
+            .description = task.description,
+            .exit_code = task.exit_code,
+        });
+    }
+
+    /// Append to the notice ring: stamps seq + time, deep-copies the
+    /// description, evicts the oldest entry past capacity.
+    fn addNotice(self: *Server, notice: Notice) void {
+        var n = notice;
+        n.seq = self.next_notice_seq;
+        n.ts = std.time.milliTimestamp();
+        n.description = if (notice.description) |d|
+            self.alloc.dupe(u8, d) catch return
+        else
+            null;
+        if (self.notices.items.len >= max_notices) {
+            const old = self.notices.orderedRemove(0);
+            if (old.description) |d| self.alloc.free(d);
+        }
+        self.notices.append(self.alloc, n) catch {
+            if (n.description) |d| self.alloc.free(d);
+            return;
+        };
+        self.next_notice_seq += 1;
     }
 
     /// Send a payload to one specific connection (host routing).
@@ -782,10 +867,20 @@ pub const Server = struct {
                     };
                 }
             },
-            .pane_bell => |p| self.broadcast(.{ .event = "pane_bell", .pane = p }),
+            .pane_bell => |p| {
+                self.broadcast(.{ .event = "pane_bell", .pane = p });
+                self.addNotice(.{ .seq = 0, .ts = 0, .kind = "pane_bell", .pane = p });
+            },
             .pane_exit => |e| {
                 self.broadcast(.{
                     .event = "pane_exit",
+                    .pane = e.pane,
+                    .exit_code = e.exit_code,
+                });
+                self.addNotice(.{
+                    .seq = 0,
+                    .ts = 0,
+                    .kind = "pane_exit",
                     .pane = e.pane,
                     .exit_code = e.exit_code,
                 });
@@ -1197,6 +1292,8 @@ const TaskTestClient = struct {
     diff_ok: bool = false,
     merged_ok: bool = false,
     panes_gone: bool = false,
+    notices_ok: bool = false,
+    notices_since_ok: bool = false,
 
     fn run(self: *TaskTestClient) void {
         self.runInner() catch |err| {
@@ -1268,6 +1365,21 @@ const TaskTestClient = struct {
         const r8 = try waitFor(&client, "\"id\":8");
         self.panes_gone = std.mem.indexOf(u8, r8, "\"panes\":[]") != null;
 
+        // Notice history: a client connecting only now — the app
+        // relaunching — still sees what happened, even for the task
+        // that was already cleaned up.
+        try client.sendLine("{\"id\":10,\"cmd\":\"notices\"}");
+        const r10 = try waitFor(&client, "\"id\":10");
+        self.notices_ok = std.mem.indexOf(u8, r10, "\"finished\"") != null and
+            std.mem.indexOf(u8, r10, "prove the harness") != null and
+            std.mem.indexOf(u8, r10, "commit some work") != null and
+            std.mem.indexOf(u8, r10, "pane_exit") != null;
+
+        // `seq` filters to entries newer than the given sequence.
+        try client.sendLine("{\"id\":11,\"cmd\":\"notices\",\"seq\":999999}");
+        const r11 = try waitFor(&client, "\"id\":11");
+        self.notices_since_ok = std.mem.indexOf(u8, r11, "\"notices\":[]") != null;
+
         try client.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
         _ = try waitFor(&client, "\"id\":9");
     }
@@ -1304,6 +1416,8 @@ test "agent tasks over the socket: create, list, status stream, cleanup" {
     try std.testing.expect(tc.diff_ok);
     try std.testing.expect(tc.merged_ok);
     try std.testing.expect(tc.panes_gone);
+    try std.testing.expect(tc.notices_ok);
+    try std.testing.expect(tc.notices_since_ok);
 
     // The merged task's work is on the repo's branch.
     const res = try std.process.Child.run(.{

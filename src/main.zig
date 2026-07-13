@@ -40,6 +40,8 @@ const usage =
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
     \\  meta                     cwd, git branch, listening ports per pane
+    \\  notices [--since N]      recent attention-worthy events (task
+    \\                           status changes, bells, exits)
     \\  browse <session> <url>   open a browser pane, print its id
     \\  nav <pane> <url>         navigate a browser pane
     \\  eval <pane> <js>         run JS in a browser pane (needs a host)
@@ -81,6 +83,7 @@ pub fn main() !void {
     var agent_opt: ?[]const u8 = null;
     var branch_flag = false;
     var force_flag = false;
+    var since_opt: u64 = 0;
     var pos: std.ArrayList([]const u8) = .empty;
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -104,6 +107,11 @@ pub fn main() !void {
             branch_flag = true;
         } else if (std.mem.eql(u8, args[i], "--force")) {
             force_flag = true;
+        } else if (std.mem.eql(u8, args[i], "--since")) {
+            i += 1;
+            if (i == args.len) return fail("--since needs a sequence number\n", .{});
+            since_opt = std.fmt.parseInt(u64, args[i], 10) catch
+                return fail("--since needs a sequence number\n", .{});
         } else {
             try pos.append(arena, args[i]);
         }
@@ -282,6 +290,44 @@ pub fn main() !void {
             .force = force_flag,
         });
         try stdout("task {d} cleaned up\n", .{tid});
+    } else if (std.mem.eql(u8, cmd, "notices")) {
+        try client.sendLine(try std.fmt.allocPrint(
+            arena,
+            "{{\"id\":1,\"cmd\":\"notices\",\"seq\":{d}}}",
+            .{since_opt},
+        ));
+        const Notices = struct {
+            ok: bool = false,
+            @"error": ?[]const u8 = null,
+            notices: []const struct {
+                seq: u64,
+                ts: i64,
+                kind: []const u8,
+                pane: ?u64 = null,
+                task: ?u64 = null,
+                status: ?[]const u8 = null,
+                description: ?[]const u8 = null,
+                exit_code: ?u8 = null,
+            } = &.{},
+        };
+        const parsed = try client.readResponse(Notices, arena);
+        if (!parsed.value.ok) return fail("error: {s}\n", .{parsed.value.@"error" orelse "unknown"});
+        if (parsed.value.notices.len == 0) {
+            try stdout("no notices\n", .{});
+        }
+        for (parsed.value.notices) |n| {
+            if (n.task) |t| {
+                try stdout("{d}  task {d} {s}  —  {s}\n", .{
+                    n.seq, t, n.status orelse "?", n.description orelse "",
+                });
+            } else if (std.mem.eql(u8, n.kind, "pane_exit")) {
+                try stdout("{d}  pane {d} exited ({d})\n", .{
+                    n.seq, n.pane orelse 0, n.exit_code orelse 0,
+                });
+            } else {
+                try stdout("{d}  pane {d} {s}\n", .{ n.seq, n.pane orelse 0, n.kind });
+            }
+        }
     } else if (std.mem.eql(u8, cmd, "send")) {
         if (pos.items.len != 2) return fail("usage: zide send <pane> <text>\n", .{});
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
