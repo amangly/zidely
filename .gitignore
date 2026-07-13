@@ -6,3 +6,4 @@ hosts/macos-browser/zide-browser-host
 vendor/
 macos/out/
 .zide-worktrees/
+.firecrawl/

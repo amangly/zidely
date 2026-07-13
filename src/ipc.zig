@@ -33,6 +33,8 @@ const xev = @import("xev").Dynamic;
 const session = @import("session.zig");
 const persist = @import("persist.zig");
 const agent = @import("agent.zig");
+const gitx = @import("gitx.zig");
+const procinfo = @import("procinfo.zig");
 
 /// Wire format of a request. Unknown fields are ignored; every command
 /// validates the fields it needs.
@@ -433,6 +435,72 @@ pub const Server = struct {
                 .seq = req.seq orelse 0,
                 .value = req.data orelse "",
             });
+        } else if (eql(u8, req.cmd, "panes-meta")) {
+            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            const Meta = struct {
+                pane: session.PaneId,
+                cwd: ?[]const u8,
+                branch: ?[]const u8,
+                dirty: ?bool,
+                ports: []const u16,
+            };
+            const PaneScope = struct {
+                meta_index: usize,
+                pids: []const i32,
+            };
+
+            // One process-table snapshot and one lsof call serve every
+            // pane; only the git queries are per-pane.
+            const tree = procinfo.ProcessTree.snapshot(arena) catch
+                procinfo.ProcessTree{ .entries = &.{} };
+
+            var metas: std.ArrayListUnmanaged(Meta) = .empty;
+            var scopes: std.ArrayListUnmanaged(PaneScope) = .empty;
+            var all_pids: std.ArrayListUnmanaged(i32) = .empty;
+            var it = ss.panes.valueIterator();
+            while (it.next()) |handle_ptr| {
+                const h = handle_ptr.*;
+                const cwd = procinfo.cwdOfPid(arena, h.pane.pid);
+                var branch: ?[]const u8 = null;
+                var dirty: ?bool = null;
+                if (cwd) |dir| {
+                    if (gitx.repoStatus(arena, dir)) |status| {
+                        branch = status.branch;
+                        dirty = status.dirty;
+                    }
+                }
+                const pids = tree.descendantsOf(arena, h.pane.pid) catch &.{};
+                try scopes.append(arena, .{ .meta_index = metas.items.len, .pids = pids });
+                try all_pids.appendSlice(arena, pids);
+                try metas.append(arena, .{
+                    .pane = h.id,
+                    .cwd = cwd,
+                    .branch = branch,
+                    .dirty = dirty,
+                    .ports = &.{},
+                });
+            }
+
+            const listeners = procinfo.listeningPorts(arena, all_pids.items);
+            for (scopes.items) |scope| {
+                var ports: std.ArrayListUnmanaged(u16) = .empty;
+                for (listeners) |l| {
+                    const ours = for (scope.pids) |pid| {
+                        if (pid == l.pid) break true;
+                    } else false;
+                    if (!ours) continue;
+                    const dup = for (ports.items) |p| {
+                        if (p == l.port) break true;
+                    } else false;
+                    if (!dup) try ports.append(arena, l.port);
+                }
+                metas.items[scope.meta_index].ports = ports.items;
+            }
+
+            self.reply(client, .{ .id = req.id, .ok = true, .panes = metas.items });
         } else if (eql(u8, req.cmd, "task-create")) {
             const repo = req.repo orelse return error.MissingRepo;
             const desc = req.description orelse return error.MissingDescription;
@@ -1165,7 +1233,6 @@ test "agent tasks over the socket: create, list, status stream, cleanup" {
     try tmp.dir.makeDir("repo");
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
-    const gitx = @import("gitx.zig");
     try gitx.setupTestRepo(alloc, repo);
 
     var server = try session.Server.init(alloc);
@@ -1194,6 +1261,71 @@ test "agent tasks over the socket: create, list, status stream, cleanup" {
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
     try std.testing.expectEqualStrings("diffable-content\n", res.stdout);
+}
+
+const MetaTestClient = struct {
+    socket_path: []const u8,
+    repo: []const u8,
+    err: ?anyerror = null,
+    meta_ok: bool = false,
+
+    fn run(self: *MetaTestClient) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *MetaTestClient) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        try client.sendLine("{\"id\":1,\"cmd\":\"create-session\",\"title\":\"meta\"}");
+        _ = try waitFor(&client, "\"id\":1");
+        var buf: [512]u8 = undefined;
+        const spawn = try std.fmt.bufPrint(&buf, "{{\"id\":2,\"cmd\":\"spawn-pane\",\"session\":1," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"read _\"],\"cwd\":\"{s}\"}}", .{self.repo});
+        try client.sendLine(spawn);
+        _ = try waitFor(&client, "\"id\":2");
+
+        try client.sendLine("{\"id\":3,\"cmd\":\"panes-meta\"}");
+        const r3 = try waitFor(&client, "\"id\":3");
+        self.meta_ok = std.mem.indexOf(u8, r3, self.repo) != null and
+            std.mem.indexOf(u8, r3, "\"branch\":\"main\"") != null and
+            std.mem.indexOf(u8, r3, "\"dirty\":false") != null;
+
+        try client.sendLine("{\"id\":4,\"cmd\":\"write\",\"pane\":1,\"data\":\"\\n\"}");
+        _ = try waitFor(&client, "\"id\":4");
+        try client.sendLine("{\"id\":5,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":5");
+    }
+};
+
+test "panes-meta reports cwd and git status over the socket" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try gitx.setupTestRepo(alloc, repo);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+
+    var tc: MetaTestClient = .{ .socket_path = socket_path, .repo = repo };
+    const thread = try std.Thread.spawn(.{}, MetaTestClient.run, .{&tc});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
+    try std.testing.expect(tc.meta_ok);
 }
 
 /// Phase 1 of the restart test: run a committing agent task, save, quit.
@@ -1281,7 +1413,6 @@ test "agent tasks survive a daemon restart as reviewable orphans" {
     try tmp.dir.makeDir("repo");
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
-    const gitx = @import("gitx.zig");
     try gitx.setupTestRepo(alloc, repo);
 
     // First daemon generation: task runs, state saves, daemon dies.

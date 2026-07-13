@@ -39,6 +39,7 @@ const usage =
     \\                           (--branch deletes its branch, --force)
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
+    \\  meta                     cwd, git branch, listening ports per pane
     \\  browse <session> <url>   open a browser pane, print its id
     \\  nav <pane> <url>         navigate a browser pane
     \\  eval <pane> <js>         run JS in a browser pane (needs a host)
@@ -289,6 +290,34 @@ pub fn main() !void {
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
         const resp = try roundtrip(arena, &client, .{ .id = 1, .cmd = "snapshot", .pane = pane });
         try stdout("{s}\n", .{resp.snapshot orelse ""});
+    } else if (std.mem.eql(u8, cmd, "meta")) {
+        try client.sendLine("{\"id\":1,\"cmd\":\"panes-meta\"}");
+        const Metas = struct {
+            ok: bool = false,
+            @"error": ?[]const u8 = null,
+            panes: []const struct {
+                pane: u64,
+                cwd: ?[]const u8 = null,
+                branch: ?[]const u8 = null,
+                dirty: ?bool = null,
+                ports: []const u16 = &.{},
+            } = &.{},
+        };
+        const parsed = try client.readResponse(Metas, arena);
+        if (!parsed.value.ok) return fail("error: {s}\n", .{parsed.value.@"error" orelse "unknown"});
+        if (parsed.value.panes.len == 0) try stdout("no panes\n", .{});
+        for (parsed.value.panes) |m| {
+            var line: std.ArrayList(u8) = .empty;
+            try line.writer(arena).print("{d}  {s}", .{ m.pane, m.cwd orelse "?" });
+            if (m.branch) |b| {
+                try line.writer(arena).print("  ({s}{s})", .{ b, if (m.dirty orelse false) "*" else "" });
+            }
+            if (m.ports.len > 0) {
+                try line.appendSlice(arena, "  ports:");
+                for (m.ports) |p| try line.writer(arena).print(" {d}", .{p});
+            }
+            try stdout("{s}\n", .{line.items});
+        }
     } else if (std.mem.eql(u8, cmd, "browse")) {
         if (pos.items.len != 2) return fail("usage: zide browse <session> <url>\n", .{});
         const sid = try std.fmt.parseInt(u64, pos.items[0], 10);

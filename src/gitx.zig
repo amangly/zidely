@@ -165,6 +165,32 @@ pub fn removeTaskWorktree(
     }
 }
 
+pub const RepoStatus = struct {
+    /// Current branch name, or short SHA when detached. Owned.
+    branch: []const u8,
+    /// Tracked files modified (untracked ignored: cheap, and noise for
+    /// a status glance).
+    dirty: bool,
+
+    pub fn deinit(self: *RepoStatus, alloc: std.mem.Allocator) void {
+        alloc.free(self.branch);
+        self.* = undefined;
+    }
+};
+
+/// Branch + dirtiness of the repository containing `dir`, or null when
+/// it isn't inside one — pane metadata for status displays.
+pub fn repoStatus(alloc: std.mem.Allocator, dir: []const u8) ?RepoStatus {
+    const branch = git(alloc, dir, &.{ "rev-parse", "--abbrev-ref", "HEAD" }) catch return null;
+    errdefer alloc.free(branch);
+    const status = git(alloc, dir, &.{ "status", "--porcelain", "--untracked-files=no" }) catch {
+        alloc.free(branch);
+        return null;
+    };
+    defer alloc.free(status);
+    return .{ .branch = branch, .dirty = status.len != 0 };
+}
+
 /// True when the worktree has uncommitted changes — staged, unstaged,
 /// or untracked files.
 pub fn worktreeDirty(alloc: std.mem.Allocator, worktree_path: []const u8) !bool {

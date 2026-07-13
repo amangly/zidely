@@ -39,6 +39,8 @@ foundation first, pixels when the core deserves them.
 - [x] Embedded browser pane (WKWebView) with programmable API
       (prototype host; moves into the Swift shell when it lands)
 - [x] Daemon mode: live session survival across UI restarts
+- [x] `panes-meta`: per-pane cwd, git branch/dirty, listening ports
+      (the sidebar metadata the shell shows)
 - [ ] SSH / remote workspaces
 
 ## Phase 3 — Editor & git UI
