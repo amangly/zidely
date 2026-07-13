@@ -32,6 +32,7 @@ const posix = std.posix;
 const xev = @import("xev").Dynamic;
 const session = @import("session.zig");
 const persist = @import("persist.zig");
+const agent = @import("agent.zig");
 
 /// Wire format of a request. Unknown fields are ignored; every command
 /// validates the fields it needs.
@@ -50,6 +51,11 @@ const Request = struct {
     url: ?[]const u8 = null,
     seq: ?u64 = null,
     loading: ?bool = null,
+    repo: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    task: ?agent.TaskId = null,
+    delete_branch: ?bool = null,
+    force: ?bool = null,
 };
 
 const Connection = struct {
@@ -133,8 +139,20 @@ pub const Server = struct {
     /// The connection that renders webviews, if one registered.
     host: ?*Connection = null,
     downstream: ?session.EventHandler,
+    /// One agent manager per repo, created lazily on first task-create.
+    /// Ordered: their event handlers chain onto the session server and
+    /// must unwind LIFO on destroy.
+    managers: std.ArrayListUnmanaged(RepoManager) = .empty,
+    /// Task ids are global across repos: handed to each manager before
+    /// every startTask so shells never see colliding ids.
+    next_task_id: agent.TaskId = 1,
     shutting_down: bool = false,
     listener_closed: bool = false,
+
+    const RepoManager = struct {
+        repo: []const u8,
+        manager: *agent.Manager,
+    };
 
     /// Create the socket at `socket_path` (an existing file there is
     /// replaced) and start accepting on the session server's loop.
@@ -175,6 +193,12 @@ pub const Server = struct {
     /// Tear down bookkeeping. Only call once the event loop is drained
     /// (after `shutdown` ran, or when the loop will never run again).
     pub fn destroy(self: *Server) void {
+        // Managers chained their handlers after ours: unwind LIFO first.
+        while (self.managers.pop()) |rm| {
+            rm.manager.destroy();
+            self.alloc.free(rm.repo);
+        }
+        self.managers.deinit(self.alloc);
         self.session_server.handler = self.downstream;
         for (self.clients.items) |client| {
             posix.close(client.fd);
@@ -409,12 +433,126 @@ pub const Server = struct {
                 .seq = req.seq orelse 0,
                 .value = req.data orelse "",
             });
+        } else if (eql(u8, req.cmd, "task-create")) {
+            const repo = req.repo orelse return error.MissingRepo;
+            const desc = req.description orelse return error.MissingDescription;
+            const mgr = try self.managerFor(repo);
+
+            // Default agent: interactive Claude Code seeded with the task.
+            const default_argv = [_][]const u8{ "claude", desc };
+            const argv: []const []const u8 = req.argv orelse &default_argv;
+
+            mgr.next_task_id = self.next_task_id;
+            const tid = try mgr.startTask(.{
+                .description = desc,
+                .argv = argv,
+                .rows = req.rows orelse 24,
+                .cols = req.cols orelse 80,
+            });
+            self.next_task_id = mgr.next_task_id;
+
+            const task = mgr.get(tid).?;
+            self.reply(client, .{
+                .id = req.id,
+                .ok = true,
+                .task = tid,
+                .pane = task.pane,
+                .branch = task.worktree.branch,
+            });
+            self.broadcast(.{
+                .event = "task_status",
+                .task = tid,
+                .status = @tagName(task.status),
+                .pane = task.pane,
+                .description = desc,
+            });
+        } else if (eql(u8, req.cmd, "task-list")) {
+            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+
+            const TaskInfo = struct {
+                id: agent.TaskId,
+                description: []const u8,
+                status: []const u8,
+                pane: session.PaneId,
+                repo: []const u8,
+                branch: []const u8,
+                exit_code: ?u8,
+            };
+            var infos: std.ArrayListUnmanaged(TaskInfo) = .empty;
+            for (self.managers.items) |rm| {
+                var it = rm.manager.tasks.valueIterator();
+                while (it.next()) |task_ptr| {
+                    const t = task_ptr.*;
+                    try infos.append(arena, .{
+                        .id = t.id,
+                        .description = t.description,
+                        .status = @tagName(t.status),
+                        .pane = t.pane,
+                        .repo = rm.repo,
+                        .branch = t.worktree.branch,
+                        .exit_code = t.exit_code,
+                    });
+                }
+            }
+            self.reply(client, .{ .id = req.id, .ok = true, .tasks = infos.items });
+        } else if (eql(u8, req.cmd, "task-cleanup")) {
+            const tid = req.task orelse return error.MissingTask;
+            const mgr = for (self.managers.items) |rm| {
+                if (rm.manager.get(tid) != null) break rm.manager;
+            } else return error.NoSuchTask;
+            try mgr.cleanupTask(tid, .{
+                .delete_branch = req.delete_branch orelse false,
+                .force = req.force orelse false,
+            });
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "task_removed", .task = tid });
         } else if (eql(u8, req.cmd, "shutdown")) {
             self.reply(client, .{ .id = req.id, .ok = true });
             self.beginShutdown(client);
         } else {
             return error.UnknownCommand;
         }
+    }
+
+    /// The agent manager for a repo, created on first use along with the
+    /// session its task panes live in.
+    fn managerFor(self: *Server, repo: []const u8) !*agent.Manager {
+        for (self.managers.items) |rm| {
+            if (std.mem.eql(u8, rm.repo, repo)) return rm.manager;
+        }
+
+        const title = try std.fmt.allocPrint(self.alloc, "agents: {s}", .{std.fs.path.basename(repo)});
+        defer self.alloc.free(title);
+        const sid = try self.session_server.createSession(title);
+
+        const wt_dir = try std.fs.path.join(self.alloc, &.{ repo, ".zide-worktrees" });
+        defer self.alloc.free(wt_dir);
+        const mgr = try agent.Manager.create(self.alloc, self.session_server, sid, .{
+            .repo = repo,
+            .worktrees_dir = wt_dir,
+        });
+        errdefer mgr.destroy();
+        mgr.task_handler = .{ .userdata = self, .func = onTaskEvent };
+
+        const repo_owned = try self.alloc.dupe(u8, repo);
+        errdefer self.alloc.free(repo_owned);
+        try self.managers.append(self.alloc, .{ .repo = repo_owned, .manager = mgr });
+        return mgr;
+    }
+
+    fn onTaskEvent(ud: ?*anyopaque, manager: *agent.Manager, event: agent.TaskEvent) void {
+        const self: *Server = @ptrCast(@alignCast(ud.?));
+        const task = manager.get(event.task) orelse return;
+        self.broadcast(.{
+            .event = "task_status",
+            .task = event.task,
+            .status = @tagName(event.status),
+            .pane = task.pane,
+            .description = task.description,
+            .exit_code = task.exit_code,
+        });
     }
 
     /// Send a payload to one specific connection (host routing).
@@ -826,6 +964,94 @@ test "attach: raw passthrough, live resize, exit EOF" {
     try std.testing.expectEqual(@as(?anyerror, null), tc.err);
     try std.testing.expect(tc.saw_eof);
     try std.testing.expect(tc.resized_output_ok);
+}
+
+/// Drives the agent-task protocol end to end: create a task (fake
+/// agent in a real scratch repo), see it in task-list, watch the
+/// task_status stream to finished, clean it up, see task_removed.
+const TaskTestClient = struct {
+    socket_path: []const u8,
+    repo: []const u8,
+    err: ?anyerror = null,
+    listed_ok: bool = false,
+    finished_ok: bool = false,
+    removed_ok: bool = false,
+
+    fn run(self: *TaskTestClient) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *TaskTestClient) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        var buf: [1024]u8 = undefined;
+        const create = try std.fmt.bufPrint(&buf, "{{\"id\":1,\"cmd\":\"task-create\"," ++
+            "\"repo\":\"{s}\",\"description\":\"prove the harness\"," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"git rev-parse --abbrev-ref HEAD; echo task-done\"]}}", .{self.repo});
+        try client.sendLine(create);
+        const r1 = try waitFor(&client, "\"id\":1");
+        if (std.mem.indexOf(u8, r1, "\"ok\":true") == null) return error.CreateFailed;
+        if (std.mem.indexOf(u8, r1, "zide/prove-the-harness") == null) return error.NoBranch;
+
+        try client.sendLine("{\"id\":2,\"cmd\":\"task-list\"}");
+        const r2 = try waitFor(&client, "\"id\":2");
+        self.listed_ok = std.mem.indexOf(u8, r2, "prove the harness") != null and
+            std.mem.indexOf(u8, r2, self.repo) != null;
+
+        // The agent exits on its own; status must reach finished.
+        while (true) {
+            const line = try client.readLine();
+            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
+            if (std.mem.indexOf(u8, line, "\"finished\"") == null) continue;
+            self.finished_ok = true;
+            break;
+        }
+
+        try client.sendLine("{\"id\":3,\"cmd\":\"task-cleanup\",\"task\":1," ++
+            "\"delete_branch\":true,\"force\":true}");
+        _ = try waitFor(&client, "\"id\":3");
+        _ = try waitFor(&client, "\"task_removed\"");
+        try client.sendLine("{\"id\":4,\"cmd\":\"task-list\"}");
+        const r4 = try waitFor(&client, "\"id\":4");
+        self.removed_ok = std.mem.indexOf(u8, r4, "prove the harness") == null;
+
+        try client.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":9");
+    }
+};
+
+test "agent tasks over the socket: create, list, status stream, cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    const gitx = @import("gitx.zig");
+    try gitx.setupTestRepo(alloc, repo);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+
+    var tc: TaskTestClient = .{ .socket_path = socket_path, .repo = repo };
+    const thread = try std.Thread.spawn(.{}, TaskTestClient.run, .{&tc});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
+    try std.testing.expect(tc.listed_ok);
+    try std.testing.expect(tc.finished_ok);
+    try std.testing.expect(tc.removed_ok);
 }
 
 test "socket api: commands, events, save, shutdown" {

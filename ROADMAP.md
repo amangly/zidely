@@ -18,7 +18,12 @@ foundation first, pixels when the core deserves them.
       panes, daemon-owned panes that survive the app
   - [x] `zide attach` — raw PTY transport the surfaces ride
   - [x] GhosttyKit.xcframework builds (scripts/build-ghosttykit.sh)
-  - [ ] splits, vertical tabs per workspace, IME/preedit, agent-task UI
+  - [x] agent tasks end-to-end: socket surface (`task-create/list/cleanup`,
+        `task_status` stream), `zide task/tasks/task-rm` CLI, sidebar
+        AGENT TASKS section with attention rings (verified with a real
+        Claude Code agent in a worktree)
+  - [ ] splits, vertical tabs per workspace, IME/preedit
+  - [ ] task review → merge → cleanup flow in the UI
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

@@ -47,10 +47,10 @@ shells will consume it as a library and stay thin.
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
-| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing) and the `attach` command: raw PTY passthrough for terminal renderers (plus `resize` for their SIGWINCH) |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing), the `attach` command (raw PTY passthrough for terminal renderers, plus `resize`), and the agent-task surface: `task-create`/`task-list`/`task-cleanup` with `task_status`/`task_removed` events — one lazily created `agent.Manager` (+ its `agents: <repo>` session) per repo, task ids kept globally unique by the socket layer |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
-| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride |
+| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride. `zide task <desc>` starts an agent task in the cwd's repo (default agent: `claude`) and attaches; `tasks` / `task-rm` list and clean up |
 
 The macOS shell (`macos/`, built by `macos/build.sh` with swiftc — no
 Xcode project):
@@ -60,7 +60,7 @@ Xcode project):
 | `macos/Sources/main.swift` | Entry point: finds the `zide` binary, auto-starts the daemon, `ghostty_init`, hands off to the controller |
 | `macos/Sources/GhosttyRuntime.swift` | The process-wide `ghostty_app_t` + runtime callbacks (wakeup/tick, clipboard, close); loads the user's own ghostty config so terminals look like their ghostty |
 | `macos/Sources/TerminalSurfaceView.swift` | One libghostty surface per pane; its child command is `zide attach <pane>`. Minimal port of Ghostty's SurfaceView input handling (keys, mouse, scroll, focus, resize) |
-| `macos/Sources/ShellController.swift` | The window: cmux-style sidebar (sessions, panes, attention dots), pane hosting, browser panes, menu/shortcuts |
+| `macos/Sources/ShellController.swift` | The window: cmux-style sidebar (AGENT TASKS with status rings, sessions, panes), pane hosting, browser panes, menu/shortcuts (⌘K new task). Task panes render under AGENT TASKS only; their host sessions are hidden when they'd be pure duplication |
 | `macos/Sources/SocketClient.swift` | JSON-lines client for the control socket |
 
 Support directories: `docs/` (decision record), `assets/` (logo +

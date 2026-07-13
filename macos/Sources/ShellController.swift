@@ -9,9 +9,18 @@ import WebKit
 import GhosttyKit
 
 enum SidebarRow {
+    case tasksHeader
+    case task(id: UInt64)
     case session(id: UInt64, title: String)
     case term(pane: UInt64)
     case browser(pane: UInt64)
+}
+
+struct TaskInfo {
+    var id: UInt64
+    var pane: UInt64
+    var description: String
+    var status: String // working | needs_attention | finished
 }
 
 final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegate, WKNavigationDelegate, NSWindowDelegate {
@@ -29,6 +38,7 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
     var rows: [SidebarRow] = []
     var exited: Set<UInt64> = []
     var bells: Set<UInt64> = []
+    var tasks: [UInt64: TaskInfo] = [:]
     var surfaces: [UInt64: TerminalSurfaceView] = [:]
     var webviews: [UInt64: WKWebView] = [:]
     var paneOfWebView: [ObjectIdentifier: UInt64] = [:]
@@ -80,7 +90,9 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         buttons.orientation = .horizontal
         buttons.spacing = 6
         buttons.autoresizingMask = [.minYMargin]
-        for (title, action) in [("＋ session", #selector(addSession)),
+        // New-session lives in the menu (⌘N); three buttons is the limit
+        // of the sidebar width.
+        for (title, action) in [("＋ task", #selector(addTask)),
                                 ("＋ term", #selector(addTerm)),
                                 ("＋ web", #selector(addWeb))] {
             let b = NSButton(title: title, target: self, action: action)
@@ -146,6 +158,7 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         let shellItem = NSMenuItem()
         menu.addItem(shellItem)
         let shellMenu = NSMenu(title: "Shell")
+        shellMenu.addItem(withTitle: "New Agent Task", action: #selector(addTask), keyEquivalent: "k")
         shellMenu.addItem(withTitle: "New Terminal", action: #selector(addTerm), keyEquivalent: "t")
         shellMenu.addItem(withTitle: "New Session", action: #selector(addSession), keyEquivalent: "n")
         shellMenu.addItem(withTitle: "New Browser Pane", action: #selector(addWeb), keyEquivalent: "b")
@@ -167,20 +180,45 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
     // MARK: Sidebar data
 
     func refresh(selectFirst: Bool = false) {
+        // Tasks first: session rendering hides panes that belong to tasks.
+        client.send(["cmd": "task-list"]) { [weak self] resp in
+            guard let self else { return }
+            self.tasks.removeAll()
+            for t in resp["tasks"] as? [[String: Any]] ?? [] {
+                let info = TaskInfo(
+                    id: (t["id"] as? NSNumber)?.uint64Value ?? 0,
+                    pane: (t["pane"] as? NSNumber)?.uint64Value ?? 0,
+                    description: t["description"] as? String ?? "",
+                    status: t["status"] as? String ?? "working")
+                self.tasks[info.id] = info
+            }
+            self.refreshSessions(selectFirst: selectFirst)
+        }
+    }
+
+    private func refreshSessions(selectFirst: Bool) {
         client.send(["cmd": "list-sessions"]) { [weak self] resp in
             guard let self, let sessions = resp["sessions"] as? [[String: Any]] else { return }
+            let taskPanes = Set(self.tasks.values.map(\.pane))
+
             var new: [SidebarRow] = []
+            if !self.tasks.isEmpty {
+                new.append(.tasksHeader)
+                for t in self.tasks.values.sorted(by: { $0.id < $1.id }) {
+                    new.append(.task(id: t.id))
+                }
+            }
             for s in sessions {
                 let sid = (s["id"] as? NSNumber)?.uint64Value ?? 0
+                let panes = (s["panes"] as? [NSNumber] ?? []).map(\.uint64Value)
+                let browsers = (s["browsers"] as? [NSNumber] ?? []).map(\.uint64Value)
+                let visible = panes.filter { !taskPanes.contains($0) }
+                // Agent-task host sessions with nothing else to show are
+                // pure duplication of the tasks section.
+                if visible.isEmpty && browsers.isEmpty { continue }
                 new.append(.session(id: sid, title: s["title"] as? String ?? ""))
-                for p in s["panes"] as? [NSNumber] ?? [] {
-                    new.append(.term(pane: p.uint64Value))
-                }
-                for b in s["browsers"] as? [NSNumber] ?? [] {
-                    new.append(.browser(pane: b.uint64Value))
-                }
-                // Panes that died before this shell connected: their
-                // pane_exit events predate us.
+                for p in visible { new.append(.term(pane: p)) }
+                for b in browsers { new.append(.browser(pane: b)) }
                 for e in s["exited"] as? [NSNumber] ?? [] {
                     self.exited.insert(e.uint64Value)
                 }
@@ -206,6 +244,7 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
             switch r {
             case let .term(p) where p == pane: return i
             case let .browser(p) where p == pane: return i
+            case let .task(id) where tasks[id]?.pane == pane: return i
             default: continue
             }
         }
@@ -226,6 +265,32 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
 
     func label(for row: SidebarRow) -> NSAttributedString {
         switch row {
+        case .tasksHeader:
+            return NSAttributedString(
+                string: "AGENT TASKS",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .semibold),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ])
+        case let .task(id):
+            let t = tasks[id]
+            let status = t?.status ?? "working"
+            let dotColor: NSColor = switch status {
+            case "needs_attention": .systemOrange
+            case "finished": .systemGray
+            default: .systemGreen
+            }
+            let s = NSMutableAttributedString(
+                string: status == "needs_attention" ? "◉ " : "● ",
+                attributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: dotColor])
+            s.append(NSAttributedString(
+                string: t?.description ?? "task \(id)",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 12),
+                    .foregroundColor: status == "finished"
+                        ? NSColor.secondaryLabelColor : NSColor.labelColor,
+                ]))
+            return s
         case let .session(id, title):
             return NSAttributedString(
                 string: "SESSION \(id)  \(title.uppercased())",
@@ -259,16 +324,20 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
     }
 
     func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
-        if case .session = rows[row] { return false }
-        return true
+        switch rows[row] {
+        case .session, .tasksHeader: return false
+        default: return true
+        }
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         let idx = table.selectedRow
         guard idx >= 0, idx < rows.count else { return }
         switch rows[idx] {
-        case .session:
+        case .session, .tasksHeader:
             break
+        case let .task(id):
+            if let pane = tasks[id]?.pane { select(terminal: pane) }
         case let .term(pane):
             select(terminal: pane)
         case let .browser(pane):
@@ -352,6 +421,27 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
             if pane == selectedPane {
                 statusLabel.stringValue = "pane \(pane) — exited"
             }
+        case "task_status":
+            let id = (obj["task"] as? NSNumber)?.uint64Value ?? 0
+            let status = obj["status"] as? String ?? "working"
+            if var t = tasks[id] {
+                t.status = status
+                tasks[id] = t
+                if let idx = rowIndex(of: t.pane) {
+                    table.reloadData(forRowIndexes: [idx], columnIndexes: [0])
+                }
+            } else {
+                // A task we don't know yet (created from the CLI).
+                refresh()
+            }
+            // The cmux notification ring: an agent needs you.
+            if status == "needs_attention", tasks[id]?.pane != selectedPane {
+                NSApp.requestUserAttention(.informationalRequest)
+            }
+        case "task_removed":
+            let id = (obj["task"] as? NSNumber)?.uint64Value ?? 0
+            tasks.removeValue(forKey: id)
+            refresh()
         case "browser_open":
             ensureWebView(pane: pane, url: obj["url"] as? String ?? "about:blank")
             refresh()
@@ -450,6 +540,50 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
             }
         } else {
             spawn()
+        }
+    }
+
+    @objc func addTask() {
+        let alert = NSAlert()
+        alert.messageText = "New agent task"
+        alert.informativeText = "Runs the agent in its own git worktree + branch."
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 360, height: 56))
+        stack.orientation = .vertical
+        stack.spacing = 8
+        let desc = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        desc.placeholderString = "what should the agent do?"
+        let repo = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
+        repo.placeholderString = "repository path"
+        repo.stringValue = UserDefaults.standard.string(forKey: "zide.lastRepo") ?? ""
+        stack.addArrangedSubview(desc)
+        stack.addArrangedSubview(repo)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = desc
+
+        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn,
+              !desc.stringValue.isEmpty, !repo.stringValue.isEmpty else { return }
+        UserDefaults.standard.set(repo.stringValue, forKey: "zide.lastRepo")
+
+        client.send(["cmd": "task-create",
+                     "repo": repo.stringValue,
+                     "description": desc.stringValue]) { [weak self] resp in
+            guard let self else { return }
+            if resp["ok"] as? Bool != true {
+                self.statusLabel.stringValue = "task failed: \(resp["error"] as? String ?? "?")"
+                return
+            }
+            let pane = (resp["pane"] as? NSNumber)?.uint64Value
+            self.refresh()
+            if let pane {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    if let idx = self.rowIndex(of: pane) {
+                        self.table.selectRowIndexes([idx], byExtendingSelection: false)
+                    }
+                }
+            }
         }
     }
 
