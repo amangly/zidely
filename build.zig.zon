@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .ghostty = .{
-            .url = "https://github.com/amangly/ghostty/archive/6146faa2ec7cfacd1df43813fe1f617be3b6d169.tar.gz",
-            .hash = "ghostty-1.3.1-5UdBC2Mm-gQV5hqp8r2gEi-uBsyKe6HbK_2NdYV3K8SS",
+            .url = "https://github.com/amangly/ghostty/archive/7cda66a55ff1e812aa54577f5d12381f1943d475.tar.gz",
+            .hash = "ghostty-1.3.1-5UdBC90r-gR52W1vDTPcD8a8E5NDRVxLIx6rtfx-ngo5",
         },
         .libxev = .{
             .url = "https://github.com/amangly/libxev/archive/f6d1a93924d93ed7cc147b9b9874f7300890a47c.tar.gz",
