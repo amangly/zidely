@@ -371,6 +371,16 @@ pub const Server = struct {
             // connections), so everything after it is pane bytes.
             client.attached = pane;
             self.reply(client, .{ .id = req.id, .ok = true });
+            // Repaint the pane's current state (content, colors, cursor)
+            // as the first raw bytes — the attaching renderer starts from
+            // a blank terminal and missed all prior output. Best-effort:
+            // a failed replay just means a blank screen until new output.
+            if (ss.paneReplay(pane, self.alloc)) |replay| {
+                defer self.alloc.free(replay);
+                writeAllSocket(client.fd, replay) catch {
+                    client.closing = true;
+                };
+            } else |_| {}
             // A pane that already finished will never emit the pane_exit
             // that half-closes attachments — it fired before this
             // connection existed. EOF immediately or the client waits
@@ -1060,7 +1070,9 @@ const AttachTestClient = struct {
     err: ?anyerror = null,
     resized_output_ok: bool = false,
     saw_eof: bool = false,
+    replay_prefix_ok: bool = false,
     late_attach_eof: bool = false,
+    late_replay_ok: bool = false,
 
     fn run(self: *AttachTestClient) void {
         self.runInner() catch |err| {
@@ -1096,7 +1108,9 @@ const AttachTestClient = struct {
         // size the resize command set.
         try writeAllSocket(raw.fd, "\n");
 
-        var collected: [4096]u8 = undefined;
+        // Sized for the replay burst: the full-palette dump alone is
+        // ~6 KiB of OSC 4 sequences.
+        var collected: [32768]u8 = undefined;
         var len: usize = 0;
         // Bytes that raced the ok reply are already pane output.
         if (raw.end > raw.start) {
@@ -1110,20 +1124,33 @@ const AttachTestClient = struct {
             len += n;
         }
         self.saw_eof = true;
+        // The attach stream must open with the state replay (home+clear
+        // then reconstructed screen), not wait for fresh pane output.
+        self.replay_prefix_ok = std.mem.startsWith(u8, collected[0..len], "\x1b[H\x1b[2J");
         self.resized_output_ok = std.mem.indexOf(u8, collected[0..len], "33 111") != null;
 
         // Attaching to the now-exited pane must EOF immediately, not
-        // hang waiting for a pane_exit that already happened.
+        // hang waiting for a pane_exit that already happened — but only
+        // after replaying the final screen, or a late renderer shows a
+        // blank pane.
         var late = try Client.connect(self.socket_path);
         defer late.close();
         try late.sendLine("{\"id\":1,\"cmd\":\"attach\",\"pane\":1}");
         _ = try waitFor(&late, "\"id\":1");
-        var scratch: [256]u8 = undefined;
-        while (true) {
-            const n = posix.read(late.fd, &scratch) catch 0;
+        var late_bytes: [32768]u8 = undefined;
+        var late_len: usize = 0;
+        if (late.end > late.start) {
+            const pending = late.buf[late.start..late.end];
+            @memcpy(late_bytes[0..pending.len], pending);
+            late_len = pending.len;
+        }
+        while (late_len < late_bytes.len) {
+            const n = posix.read(late.fd, late_bytes[late_len..]) catch 0;
             if (n == 0) break;
+            late_len += n;
         }
         self.late_attach_eof = true;
+        self.late_replay_ok = std.mem.indexOf(u8, late_bytes[0..late_len], "33 111") != null;
 
         try control.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
         _ = try waitFor(&control, "\"id\":9");
@@ -1151,8 +1178,10 @@ test "attach: raw passthrough, live resize, exit EOF" {
 
     try std.testing.expectEqual(@as(?anyerror, null), tc.err);
     try std.testing.expect(tc.saw_eof);
+    try std.testing.expect(tc.replay_prefix_ok);
     try std.testing.expect(tc.resized_output_ok);
     try std.testing.expect(tc.late_attach_eof);
+    try std.testing.expect(tc.late_replay_ok);
 }
 
 /// Drives the agent-task protocol end to end: create a task (fake

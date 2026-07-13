@@ -151,6 +151,46 @@ pub fn snapshot(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
     return self.terminal.plainString(alloc);
 }
 
+/// VT byte stream that reconstructs the pane's current terminal state
+/// (content, colors, palette, cursor, modes) on a fresh terminal — the
+/// tmux-attach repaint a newly attached renderer needs. Starts from
+/// home+clear so it composes onto any terminal. Caller owns the memory.
+pub fn replayBytes(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    try builder.writer.writeAll("\x1b[H\x1b[2J");
+    var formatter: ghostty.formatter.TerminalFormatter = .init(self.terminal, .vt);
+    formatter.extra = .all;
+    formatter.format(&builder.writer) catch return error.OutOfMemory;
+    return builder.toOwnedSlice();
+}
+
+test "replay reconstructs styled screen state for a fresh terminal" {
+    const alloc = std.testing.allocator;
+    var pane = try Pane.create(alloc, .{
+        .argv = &.{ "/bin/sh", "-c", "printf 'plain \\033[31mred-replay\\033[0m done'" },
+    });
+    defer pane.destroy();
+    try pane.pumpUntilEof();
+    try std.testing.expectEqual(@as(?u8, 0), pane.wait());
+
+    const replay = try pane.replayBytes(alloc);
+    defer alloc.free(replay);
+
+    // Feed the replay to a brand-new terminal: same text, same style.
+    var t = try ghostty.Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice(replay);
+    const text = try t.plainString(alloc);
+    defer alloc.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "plain red-replay done") != null);
+    // The styling survived as escape sequences, not stripped text.
+    try std.testing.expect(std.mem.indexOf(u8, replay, "red-replay") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "\x1b[") != null);
+}
+
 test "pane captures child output through the vt engine" {
     const alloc = std.testing.allocator;
     var pane = try Pane.create(alloc, .{

@@ -377,6 +377,14 @@ pub const Server = struct {
         return h.pane.snapshot(alloc);
     }
 
+    /// VT byte stream that repaints the pane's full state (content,
+    /// colors, cursor) on the attaching renderer's terminal. Caller
+    /// owns the memory.
+    pub fn paneReplay(self: *Server, id: PaneId, alloc: std.mem.Allocator) ![]const u8 {
+        const h = self.panes.get(id) orelse return error.NoSuchPane;
+        return h.pane.replayBytes(alloc);
+    }
+
     /// Whether a pane's child has exited. Clients that connect after the
     /// fact (a shell restarting onto a live daemon) have missed the
     /// pane_exit event, so this state must be queryable, not just

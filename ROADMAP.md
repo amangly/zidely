@@ -17,6 +17,10 @@ foundation first, pixels when the core deserves them.
       surfaces, sidebar of sessions/panes with attention dots, browser
       panes, daemon-owned panes that survive the app
   - [x] `zide attach` — raw PTY transport the surfaces ride
+  - [x] attach state replay: the daemon repaints the pane's full
+        screen (content, colors, cursor, modes) as the first bytes of
+        every attachment — new surfaces and late attachers start from
+        the real screen, not blank
   - [x] GhosttyKit.xcframework builds (scripts/build-ghosttykit.sh)
   - [x] agent tasks end-to-end: socket surface (`task-create/list/cleanup`,
         `task_status` stream), `zide task/tasks/task-rm` CLI, sidebar

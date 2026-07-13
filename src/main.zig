@@ -182,15 +182,17 @@ pub fn main() !void {
             break :blk std.mem.trim(u8, res.stdout, " \n");
         };
 
-        // --agent overrides the server's default (claude). Split on
-        // spaces so "--agent 'codex --yolo'" works; the description is
-        // always the final argument.
+        // --agent overrides the server's default (claude). Shell-style
+        // word splitting so quoted sub-commands survive
+        // ("--agent \"sh -c 'a && b'\""); the description is always the
+        // final argument.
         var argv_override: ?[]const []const u8 = null;
         if (agent_opt) |a| {
+            const words = shellWords(arena, a) catch
+                return fail("--agent: unbalanced quote\n", .{});
+            if (words.len == 0) return fail("--agent needs a command\n", .{});
             var list: std.ArrayList([]const u8) = .empty;
-            var it = std.mem.tokenizeScalar(u8, a, ' ');
-            while (it.next()) |tok| try list.append(arena, tok);
-            if (list.items.len == 0) return fail("--agent needs a command\n", .{});
+            try list.appendSlice(arena, words);
             try list.append(arena, desc);
             argv_override = list.items;
         }
@@ -408,7 +410,8 @@ fn cmdAttach(
     const stdout_file = std.fs.File.stdout();
     const is_tty = posix.isatty(stdin_fd);
 
-    // Size the pane to this terminal before painting the backlog.
+    // Size the pane to this terminal before the server replays the
+    // backlog, so the repaint is laid out for this window.
     if (posix.isatty(posix.STDOUT_FILENO)) {
         if (zide.term.Pty.ttySize(posix.STDOUT_FILENO)) |ws| {
             _ = try roundtrip(arena, control, .{
@@ -421,12 +424,8 @@ fn cmdAttach(
         } else |_| {}
     }
 
-    // Current screen contents as context. Output arriving between this
-    // snapshot and the attach below is lost to this client — a small
-    // window, acceptable until state replay exists.
-    const snap = try roundtrip(arena, control, .{ .id = 2, .cmd = "snapshot", .pane = pane });
-    if (snap.snapshot) |s| if (s.len > 0) try stdout_file.writeAll(s);
-
+    // No local repaint needed: the server replays the pane's full state
+    // (content, colors, cursor) as the first bytes after the attach ok.
     var raw = try zide.ipc.Client.connect(socket_path);
     defer raw.close();
     _ = try roundtrip(arena, &raw, .{ .id = 1, .cmd = "attach", .pane = pane });
@@ -685,6 +684,102 @@ fn stdout(comptime fmt: []const u8, fmt_args: anytype) !void {
 fn fail(comptime fmt: []const u8, fmt_args: anytype) noreturn {
     std.debug.print(fmt, fmt_args);
     std.process.exit(1);
+}
+
+/// POSIX-shell-style word splitting for `--agent`: single quotes are
+/// literal, double quotes group with backslash escapes, backslash
+/// escapes the next byte outside quotes. No expansion of any kind.
+fn shellWords(arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
+    var words: std.ArrayList([]const u8) = .empty;
+    var word: std.ArrayList(u8) = .empty;
+    var in_word = false;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
+        switch (c) {
+            ' ', '\t', '\n' => {
+                if (in_word) {
+                    try words.append(arena, try word.toOwnedSlice(arena));
+                    in_word = false;
+                }
+            },
+            '\'' => {
+                in_word = true;
+                const close = std.mem.indexOfScalarPos(u8, input, i + 1, '\'') orelse
+                    return error.UnbalancedQuote;
+                try word.appendSlice(arena, input[i + 1 .. close]);
+                i = close;
+            },
+            '"' => {
+                in_word = true;
+                i += 1;
+                while (true) : (i += 1) {
+                    if (i >= input.len) return error.UnbalancedQuote;
+                    switch (input[i]) {
+                        '"' => break,
+                        '\\' => {
+                            i += 1;
+                            if (i >= input.len) return error.UnbalancedQuote;
+                            try word.append(arena, input[i]);
+                        },
+                        else => try word.append(arena, input[i]),
+                    }
+                }
+            },
+            '\\' => {
+                in_word = true;
+                i += 1;
+                if (i >= input.len) return error.UnbalancedQuote;
+                try word.append(arena, input[i]);
+            },
+            else => {
+                in_word = true;
+                try word.append(arena, c);
+            },
+        }
+    }
+    if (in_word) try words.append(arena, try word.toOwnedSlice(arena));
+    return words.items;
+}
+
+test shellWords {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const simple = try shellWords(arena, "codex --yolo");
+    try std.testing.expectEqual(@as(usize, 2), simple.len);
+    try std.testing.expectEqualStrings("codex", simple[0]);
+    try std.testing.expectEqualStrings("--yolo", simple[1]);
+
+    // The case that used to break: a quoted sub-command stays one word.
+    const quoted = try shellWords(arena, "sh -c 'echo a && echo b'");
+    try std.testing.expectEqual(@as(usize, 3), quoted.len);
+    try std.testing.expectEqualStrings("sh", quoted[0]);
+    try std.testing.expectEqualStrings("-c", quoted[1]);
+    try std.testing.expectEqualStrings("echo a && echo b", quoted[2]);
+
+    const double = try shellWords(arena, "run \"a \\\"b\\\" c\" tail");
+    try std.testing.expectEqual(@as(usize, 3), double.len);
+    try std.testing.expectEqualStrings("a \"b\" c", double[1]);
+
+    // Adjacent quoted/unquoted segments concatenate, shell-style.
+    const glued = try shellWords(arena, "--flag='x y'z");
+    try std.testing.expectEqual(@as(usize, 1), glued.len);
+    try std.testing.expectEqualStrings("--flag=x yz", glued[0]);
+
+    const escaped = try shellWords(arena, "echo one\\ word");
+    try std.testing.expectEqual(@as(usize, 2), escaped.len);
+    try std.testing.expectEqualStrings("one word", escaped[1]);
+
+    // An empty quoted string is a real (empty) argument.
+    const empty_arg = try shellWords(arena, "prog ''");
+    try std.testing.expectEqual(@as(usize, 2), empty_arg.len);
+    try std.testing.expectEqualStrings("", empty_arg[1]);
+
+    try std.testing.expectError(error.UnbalancedQuote, shellWords(arena, "sh -c 'oops"));
+    try std.testing.expectError(error.UnbalancedQuote, shellWords(arena, "sh -c \"oops"));
+    try std.testing.expectEqual(@as(usize, 0), (try shellWords(arena, "   ")).len);
 }
 
 test {
