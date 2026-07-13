@@ -365,6 +365,25 @@ pub const Server = struct {
         return b.*;
     }
 
+    /// Close a browser pane: pure state removal (rendering hosts drop
+    /// their webview on the broadcast). Without this, a "closed"
+    /// browser resurrects from the daemon on every refresh.
+    pub fn closeBrowserPane(self: *Server, id: PaneId) !void {
+        const b = self.browser_panes.get(id) orelse return error.NoSuchPane;
+        if (self.sessions.getPtr(b.session)) |sess| {
+            for (sess.browsers.items, 0..) |p, i| {
+                if (p == id) {
+                    _ = sess.browsers.orderedRemove(i);
+                    break;
+                }
+            }
+        }
+        _ = self.browser_panes.remove(id);
+        self.alloc.free(b.url);
+        self.alloc.free(b.title);
+        self.alloc.destroy(b);
+    }
+
     /// Send input bytes to a pane's child (keyboard input, agent control).
     pub fn paneWrite(self: *Server, id: PaneId, bytes: []const u8) !void {
         const h = self.panes.get(id) orelse return error.NoSuchPane;

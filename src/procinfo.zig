@@ -36,12 +36,19 @@ pub fn cwdOfPid(alloc: std.mem.Allocator, pid: std.posix.pid_t) ?[]const u8 {
 // Zig 0.15.2's std.c doesn't declare tcgetpgrp; both libcs have it.
 extern "c" fn tcgetpgrp(fd: std.c.fd_t) std.c.pid_t;
 
+/// Foreground process group on a PTY master, or 0 when there is none
+/// to report (dead fd).
+pub fn foregroundPgid(master_fd: std.posix.fd_t) std.posix.pid_t {
+    const pgid = tcgetpgrp(master_fd);
+    return if (pgid > 0) pgid else 0;
+}
+
 /// Command name of the PTY's foreground process group leader — what
 /// tmux calls pane_current_command ("vim", "sleep", "zsh"). Null when
 /// nothing can be reported (dead fd, ps failure). Caller owns the
 /// result.
 pub fn foregroundCommand(alloc: std.mem.Allocator, master_fd: std.posix.fd_t) ?[]const u8 {
-    const pgid = tcgetpgrp(master_fd);
+    const pgid = foregroundPgid(master_fd);
     if (pgid <= 0) return null;
     var buf: [16]u8 = undefined;
     const pid_s = std.fmt.bufPrint(&buf, "{d}", .{pgid}) catch return null;

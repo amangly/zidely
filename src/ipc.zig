@@ -10,12 +10,14 @@
 //!
 //! Every connected client receives every event. Commands: ping,
 //! create-session, list-sessions, spawn-pane, write, snapshot, resize,
-//! kill-pane (SIGHUP the child; exit flows through the normal drain)
+//! kill-pane (HUP the child's and the foreground process group;
+//! `force` escalates to SIGKILL; exit flows through the normal drain)
 //! and remove-pane (drop a *finished* pane from its session, broadcast
 //! as pane_removed), notices (bounded history of attention-worthy
 //! events, for clients that connected after they were broadcast),
 //! save, shutdown — plus the browser surface: browser-open,
-//! browser-navigate, browser-eval work from any client; a shell process
+//! browser-close (broadcast as browser_removed), browser-navigate,
+//! browser-eval work from any client; a shell process
 //! that can render webviews registers with host-register and receives
 //! browser_open / browser_nav / browser_eval events (existing panes are
 //! replayed on registration), reporting state back with browser-update
@@ -56,6 +58,7 @@ const Request = struct {
     url: ?[]const u8 = null,
     seq: ?u64 = null,
     loading: ?bool = null,
+    force: ?bool = null,
 };
 
 const Connection = struct {
@@ -363,12 +366,25 @@ pub const Server = struct {
             try ss.paneResize(pane, rows, cols);
             self.reply(client, .{ .id = req.id, .ok = true });
         } else if (eql(u8, req.cmd, "kill-pane")) {
-            // Hang up the pane's child (tmux kill-pane semantics). The
-            // exit flows through the normal drain path — clients see
-            // pane_exit, then call remove-pane to drop the husk.
+            // Hang up the pane (tmux kill-pane semantics): signal the
+            // child's process group AND the PTY's foreground group — a
+            // running job is its own group, so HUPing only the shell
+            // leaves it alive and the pane resurrects on the next
+            // refresh. `force` escalates to SIGKILL for children that
+            // trap HUP. Exit flows through the normal drain path —
+            // clients see pane_exit, then remove-pane drops the husk.
             const pane = req.pane orelse return error.MissingPane;
             const h = ss.panes.get(pane) orelse return error.NoSuchPane;
-            if (!h.exited) posix.kill(h.pane.pid, posix.SIG.HUP) catch {};
+            if (!h.exited) {
+                const sig: u8 = if (req.force orelse false) posix.SIG.KILL else posix.SIG.HUP;
+                posix.kill(-h.pane.pid, sig) catch {
+                    posix.kill(h.pane.pid, sig) catch {};
+                };
+                const fg = procinfo.foregroundPgid(h.pane.masterFd());
+                if (fg > 0 and fg != h.pane.pid) {
+                    posix.kill(-fg, sig) catch {};
+                }
+            }
             self.reply(client, .{ .id = req.id, .ok = true });
         } else if (eql(u8, req.cmd, "remove-pane")) {
             // Drop a finished pane from its session (PaneStillRunning
@@ -442,6 +458,11 @@ pub const Server = struct {
             const pane = try ss.openBrowserPane(sid, url);
             self.reply(client, .{ .id = req.id, .ok = true, .pane = pane });
             self.broadcast(.{ .event = "browser_open", .pane = pane, .session = sid, .url = url });
+        } else if (eql(u8, req.cmd, "browser-close")) {
+            const pane = req.pane orelse return error.MissingPane;
+            try ss.closeBrowserPane(pane);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "browser_removed", .pane = pane });
         } else if (eql(u8, req.cmd, "browser-navigate")) {
             const pane = req.pane orelse return error.MissingPane;
             const url = req.url orelse return error.MissingUrl;
@@ -890,6 +911,7 @@ const BrowserTestClient = struct {
     host_got_replayed: bool = false,
     client_saw_update: bool = false,
     client_got_eval_result: bool = false,
+    closed_ok: bool = false,
 
     fn run(self: *BrowserTestClient) void {
         self.runInner() catch |err| {
@@ -937,6 +959,18 @@ const BrowserTestClient = struct {
         self.client_got_eval_result = std.mem.indexOf(u8, res, "\"seq\":42") != null and
             std.mem.indexOf(u8, res, "\"value\":\"2\"") != null;
 
+        // browser-close removes the pane for good — a "closed" browser
+        // must not resurrect from the daemon on the next refresh.
+        try client.sendLine("{\"id\":6,\"cmd\":\"browser-open\",\"session\":1,\"url\":\"https://close.me\"}");
+        const r6 = try waitFor(&client, "\"id\":6");
+        if (std.mem.indexOf(u8, r6, "\"pane\":2") == null) return error.OpenFailed;
+        try client.sendLine("{\"id\":7,\"cmd\":\"browser-close\",\"pane\":2}");
+        _ = try waitFor(&client, "\"id\":7");
+        _ = try waitFor(&client, "\"event\":\"browser_removed\"");
+        try client.sendLine("{\"id\":8,\"cmd\":\"list-sessions\"}");
+        const r8 = try waitFor(&client, "\"id\":8");
+        self.closed_ok = std.mem.indexOf(u8, r8, "\"browsers\":[1]") != null;
+
         try client.sendLine("{\"id\":5,\"cmd\":\"shutdown\"}");
         _ = try waitFor(&client, "\"id\":5");
     }
@@ -966,6 +1000,7 @@ test "browser panes: host protocol round-trip" {
     try std.testing.expect(tc.client_saw_update);
     try std.testing.expect(tc.host_got_open);
     try std.testing.expect(tc.client_got_eval_result);
+    try std.testing.expect(tc.closed_ok);
 
     // Browser pane state survived in the core.
     const b = server.getBrowserPane(1).?;
