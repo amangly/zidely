@@ -407,10 +407,11 @@ pub const Client = struct {
 };
 
 fn tcpFd(tcp: xev.TCP) posix.socket_t {
-    return if (comptime @hasField(xev.TCP, "fd"))
-        tcp.fd
-    else switch (tcp.backend) {
-        inline else => |v| v.fd,
+    if (comptime @hasField(xev.TCP, "fd")) return tcp.fd;
+    // Dynamic xev: `backend` is an untagged union; pick the variant the
+    // runtime-detected backend says is active.
+    return switch (xev.backend) {
+        inline else => |tag| @field(tcp.backend, @tagName(tag)).fd,
     };
 }
 
