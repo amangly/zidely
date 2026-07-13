@@ -35,7 +35,7 @@ const Request = struct {
     path: ?[]const u8 = null,
 };
 
-const Client = struct {
+const Connection = struct {
     server: *Server,
     conn: xev.TCP,
     fd: posix.socket_t,
@@ -46,7 +46,7 @@ const Client = struct {
     closing: bool = false,
 
     fn onRead(
-        ud: ?*Client,
+        ud: ?*Connection,
         loop: *xev.Loop,
         c: *xev.Completion,
         conn: xev.TCP,
@@ -94,7 +94,7 @@ pub const Server = struct {
     listener: xev.TCP,
     listen_fd: posix.socket_t,
     c_accept: xev.Completion = .{},
-    clients: std.ArrayListUnmanaged(*Client) = .empty,
+    clients: std.ArrayListUnmanaged(*Connection) = .empty,
     downstream: ?session.EventHandler,
     shutting_down: bool = false,
     listener_closed: bool = false,
@@ -180,7 +180,7 @@ pub const Server = struct {
             posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one)) catch {};
         }
 
-        const client = self.alloc.create(Client) catch {
+        const client = self.alloc.create(Connection) catch {
             posix.close(fd);
             return .rearm;
         };
@@ -191,13 +191,13 @@ pub const Server = struct {
             return .rearm;
         };
 
-        client.conn.read(loop, &client.c_read, .{ .slice = &client.read_buf }, Client, client, Client.onRead);
+        client.conn.read(loop, &client.c_read, .{ .slice = &client.read_buf }, Connection, client, Connection.onRead);
         return .rearm;
     }
 
     /// Only safe from the client's own read callback (single-threaded
     /// loop; the caller disarms the read completion).
-    fn removeClient(self: *Server, client: *Client) void {
+    fn removeClient(self: *Server, client: *Connection) void {
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.swapRemove(i);
@@ -209,7 +209,7 @@ pub const Server = struct {
         self.alloc.destroy(client);
     }
 
-    fn handleLine(self: *Server, client: *Client, line: []const u8) void {
+    fn handleLine(self: *Server, client: *Connection, line: []const u8) void {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) return;
 
@@ -227,7 +227,7 @@ pub const Server = struct {
         };
     }
 
-    fn dispatch(self: *Server, client: *Client, req: Request) !void {
+    fn dispatch(self: *Server, client: *Connection, req: Request) !void {
         const ss = self.session_server;
         const eql = std.mem.eql;
 
@@ -293,12 +293,17 @@ pub const Server = struct {
     /// self-connect pokes the pending accept so its completion fires
     /// and can release the listener (closing an fd out from under a
     /// kqueue/io_uring completion would strand it forever).
-    fn beginShutdown(self: *Server, requester: *Client) void {
+    fn beginShutdown(self: *Server, requester: *Connection) void {
         self.shutting_down = true;
         requester.closing = true;
         for (self.clients.items) |client| {
             if (client != requester) posix.shutdown(client.fd, .both) catch {};
         }
+
+        // Hang up pane children so their completions drain and the loop
+        // can actually finish; layout state survives for a final save.
+        var it = self.session_server.panes.valueIterator();
+        while (it.next()) |h| posix.kill(h.*.pane.pid, posix.SIG.HUP) catch {};
 
         const addr = std.net.Address.initUnix(self.socket_path) catch return;
         const fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0) catch return;
@@ -331,12 +336,73 @@ pub const Server = struct {
         }
     }
 
-    fn reply(self: *Server, client: *Client, payload: anytype) void {
+    fn reply(self: *Server, client: *Connection, payload: anytype) void {
         const json = std.fmt.allocPrint(self.alloc, "{f}\n", .{std.json.fmt(payload, .{})}) catch return;
         defer self.alloc.free(json);
         writeAllSocket(client.fd, json) catch {
             client.closing = true;
         };
+    }
+};
+
+/// Synchronous client for the control socket: the CLI and tests speak
+/// the protocol through this. One request in flight at a time; event
+/// lines interleave with responses and are surfaced by readLine too.
+pub const Client = struct {
+    fd: posix.socket_t,
+    buf: [65536]u8 = undefined,
+    start: usize = 0,
+    end: usize = 0,
+
+    pub fn connect(path: []const u8) !Client {
+        const stream = try std.net.connectUnixSocket(path);
+        return .{ .fd = stream.handle };
+    }
+
+    pub fn close(self: *Client) void {
+        posix.close(self.fd);
+        self.* = undefined;
+    }
+
+    pub fn sendLine(self: *Client, line: []const u8) !void {
+        try writeAllSocket(self.fd, line);
+        try writeAllSocket(self.fd, "\n");
+    }
+
+    /// Next protocol line (response or event). The slice is valid until
+    /// the next readLine call.
+    pub fn readLine(self: *Client) ![]u8 {
+        while (true) {
+            if (std.mem.indexOfScalar(u8, self.buf[self.start..self.end], '\n')) |i| {
+                const line = self.buf[self.start..][0..i];
+                self.start += i + 1;
+                return line;
+            }
+            if (self.start > 0) {
+                std.mem.copyForwards(u8, self.buf[0 .. self.end - self.start], self.buf[self.start..self.end]);
+                self.end -= self.start;
+                self.start = 0;
+            }
+            if (self.end == self.buf.len) return error.LineTooLong;
+            const n = try posix.read(self.fd, self.buf[self.end..]);
+            if (n == 0) return error.Disconnected;
+            self.end += n;
+        }
+    }
+
+    /// Skip event lines and return the next response, parsed as T.
+    pub fn readResponse(
+        self: *Client,
+        comptime T: type,
+        alloc: std.mem.Allocator,
+    ) !std.json.Parsed(T) {
+        while (true) {
+            const line = self.readLine() catch |err| return err;
+            if (std.mem.indexOf(u8, line, "\"event\":") != null) continue;
+            return try std.json.parseFromSlice(T, alloc, line, .{
+                .ignore_unknown_fields = true,
+            });
+        }
     }
 };
 
@@ -371,30 +437,11 @@ fn writeAllSocket(fd: posix.socket_t, bytes: []const u8) !void {
 
 // --- tests ---------------------------------------------------------------
 
-/// Blocking, byte-at-a-time line reader for the test client thread.
-fn readLine(fd: posix.socket_t, buf: []u8) ![]u8 {
-    var i: usize = 0;
-    while (i < buf.len) {
-        var ch: [1]u8 = undefined;
-        const n = try posix.read(fd, &ch);
-        if (n == 0) return error.Disconnected;
-        if (ch[0] == '\n') return buf[0..i];
-        buf[i] = ch[0];
-        i += 1;
-    }
-    return error.LineTooLong;
-}
-
-fn readLineContaining(fd: posix.socket_t, buf: []u8, needle: []const u8) ![]u8 {
+fn waitFor(client: *Client, needle: []const u8) ![]u8 {
     while (true) {
-        const line = try readLine(fd, buf);
+        const line = try client.readLine();
         if (std.mem.indexOf(u8, line, needle) != null) return line;
     }
-}
-
-fn sendLine(fd: posix.socket_t, line: []const u8) !void {
-    try writeAllSocket(fd, line);
-    try writeAllSocket(fd, "\n");
 }
 
 const TestClient = struct {
@@ -411,35 +458,33 @@ const TestClient = struct {
     }
 
     fn runInner(self: *TestClient) !void {
-        const stream = try std.net.connectUnixSocket(self.socket_path);
-        const fd = stream.handle;
-        defer posix.close(fd);
-        var buf: [8192]u8 = undefined;
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
 
-        try sendLine(fd, "{\"id\":1,\"cmd\":\"create-session\",\"title\":\"remote\"}");
-        const r1 = try readLineContaining(fd, &buf, "\"id\":1");
+        try client.sendLine("{\"id\":1,\"cmd\":\"create-session\",\"title\":\"remote\"}");
+        const r1 = try waitFor(&client, "\"id\":1");
         if (std.mem.indexOf(u8, r1, "\"ok\":true") == null) return error.CreateFailed;
 
-        try sendLine(fd, "{\"id\":2,\"cmd\":\"spawn-pane\",\"session\":1," ++
+        try client.sendLine("{\"id\":2,\"cmd\":\"spawn-pane\",\"session\":1," ++
             "\"argv\":[\"/bin/sh\",\"-c\",\"echo hello-socket\"]}");
-        const r2 = try readLineContaining(fd, &buf, "\"id\":2");
+        const r2 = try waitFor(&client, "\"id\":2");
         if (std.mem.indexOf(u8, r2, "\"pane\":1") == null) return error.SpawnFailed;
 
         // The exit event proves the event stream reaches clients.
-        _ = try readLineContaining(fd, &buf, "\"event\":\"pane_exit\"");
+        _ = try waitFor(&client, "\"event\":\"pane_exit\"");
         self.saw_exit_event = true;
 
-        try sendLine(fd, "{\"id\":3,\"cmd\":\"snapshot\",\"pane\":1}");
-        const r3 = try readLineContaining(fd, &buf, "\"id\":3");
+        try client.sendLine("{\"id\":3,\"cmd\":\"snapshot\",\"pane\":1}");
+        const r3 = try waitFor(&client, "\"id\":3");
         self.snapshot_ok = std.mem.indexOf(u8, r3, "hello-socket") != null;
 
         var save_buf: [512]u8 = undefined;
         const save_req = try std.fmt.bufPrint(&save_buf, "{{\"id\":4,\"cmd\":\"save\",\"path\":\"{s}\"}}", .{self.state_path});
-        try sendLine(fd, save_req);
-        _ = try readLineContaining(fd, &buf, "\"id\":4");
+        try client.sendLine(save_req);
+        _ = try waitFor(&client, "\"id\":4");
 
-        try sendLine(fd, "{\"id\":5,\"cmd\":\"shutdown\"}");
-        _ = try readLineContaining(fd, &buf, "\"id\":5");
+        try client.sendLine("{\"id\":5,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":5");
     }
 };
 

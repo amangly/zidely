@@ -47,6 +47,10 @@ not an MVP experiment.
   and repin to the next upstream release (v1.4+) when it ships.
 - Consumers must pass `emit-xcframework=false` and `emit-macos-app=false`
   to the dependency: their defaults are *true* on Darwin hosts.
+- **libxev** is pinned to `amangly/libxev@zide-fix-kqueue-rearm-state` —
+  the commit Ghostty pins plus a one-line kqueue fix (rearm via the
+  completions path lost the completion's active state, stranding the
+  loop; see ZIDE.md gotchas). Drop the fork once upstreamed.
 
 ## Phases
 

@@ -46,10 +46,10 @@ shells will consume it as a library and stay thin.
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
-| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
-| `src/main.zig` | Dev CLI (temporary; becomes the automation CLI) |
+| `src/main.zig` | The `zide` CLI: `serve` hosts the server+socket (restores/saves state), everything else is a client command |
 
 Support directories: `docs/` (decision record), `assets/` (logo +
 macOS iconset), `.github/workflows/` (CI).
@@ -101,6 +101,14 @@ macOS iconset), `.github/workflows/` (CI).
   drops the filter and the completion never fires, stranding the loop.
   The ipc server drains its accept completion with a self-connect poke
   on shutdown, and EOFs clients via `shutdown(2)` instead of `close`.
+- **libxev is a fork pin** (`amangly/libxev@zide-fix-kqueue-rearm-state`):
+  upstream's kqueue backend loses a completion's `.active` state when it
+  is rearmed via the submit()/completions path (ready-at-registration
+  events), so its eventual disarm skips the active-counter decrement and
+  `run(.until_done)` never returns. One-line fix; upstream it.
+- **`std.fs.File.writer()` is positional**: every fresh writer starts at
+  offset 0 and overwrites redirected output. Use `writeAll` (or
+  `writerStreaming`) for stdout.
 
 ## Further reading
 

@@ -20,7 +20,7 @@ foundation first, pixels when the core deserves them.
 ## Phase 2 — Automation & reach
 
 - [x] Socket API (the session server's event/command stream, exposed)
-- [ ] `zide` CLI against the socket
+- [x] `zide` CLI against the socket
 - [ ] Embedded browser pane (WKWebView) with programmable API
 - [ ] Daemon mode: live session survival across UI restarts
 - [ ] SSH / remote workspaces
