@@ -39,6 +39,20 @@ pub const Session = struct {
     /// Display title, owned by the server's allocator.
     title: []const u8,
     panes: std.ArrayListUnmanaged(PaneId) = .empty,
+    browsers: std.ArrayListUnmanaged(PaneId) = .empty,
+};
+
+/// A browser pane: webview state owned by the core, rendered by
+/// whichever shell/host is attached (see ipc.zig's host protocol).
+/// Headless-first — the state exists and persists with no host running.
+pub const BrowserPane = struct {
+    id: PaneId,
+    session: SessionId,
+    /// Current URL; owned by the server's allocator.
+    url: []const u8,
+    /// Page title as reported by the host; owned, empty until known.
+    title: []const u8,
+    loading: bool = true,
 };
 
 /// Per-pane event-loop state. Heap-pinned: completions and the read
@@ -159,7 +173,9 @@ pub const Server = struct {
     loop: xev.Loop,
     sessions: std.AutoHashMapUnmanaged(SessionId, Session),
     panes: std.AutoHashMapUnmanaged(PaneId, *PaneHandle),
+    browser_panes: std.AutoHashMapUnmanaged(PaneId, *BrowserPane),
     next_session_id: SessionId = 1,
+    /// Shared by terminal and browser panes so ids never collide.
     next_pane_id: PaneId = 1,
     handler: ?EventHandler = null,
 
@@ -172,6 +188,7 @@ pub const Server = struct {
             .loop = try xev.Loop.init(.{}),
             .sessions = .empty,
             .panes = .empty,
+            .browser_panes = .empty,
         };
     }
 
@@ -189,9 +206,19 @@ pub const Server = struct {
         }
         self.panes.deinit(self.alloc);
 
+        var browser_it = self.browser_panes.valueIterator();
+        while (browser_it.next()) |bp| {
+            const b = bp.*;
+            self.alloc.free(b.url);
+            self.alloc.free(b.title);
+            self.alloc.destroy(b);
+        }
+        self.browser_panes.deinit(self.alloc);
+
         var session_it = self.sessions.valueIterator();
         while (session_it.next()) |s| {
             s.panes.deinit(self.alloc);
+            s.browsers.deinit(self.alloc);
             self.alloc.free(s.title);
         }
         self.sessions.deinit(self.alloc);
@@ -278,6 +305,62 @@ pub const Server = struct {
         h.stream.read(&self.loop, &h.c_read, .{ .slice = &h.read_buf }, PaneHandle, h, PaneHandle.onRead);
         h.process.wait(&self.loop, &h.c_proc, PaneHandle, h, PaneHandle.onExit);
         return id;
+    }
+
+    /// Create a browser pane in a session. Pure state: rendering happens
+    /// in whatever host attaches via the ipc host protocol.
+    pub fn openBrowserPane(self: *Server, session_id: SessionId, url: []const u8) !PaneId {
+        const sess = self.sessions.getPtr(session_id) orelse return error.NoSuchSession;
+
+        const b = try self.alloc.create(BrowserPane);
+        errdefer self.alloc.destroy(b);
+        const id = self.next_pane_id;
+        b.* = .{
+            .id = id,
+            .session = session_id,
+            .url = try self.alloc.dupe(u8, url),
+            .title = try self.alloc.dupe(u8, ""),
+        };
+        errdefer {
+            self.alloc.free(b.url);
+            self.alloc.free(b.title);
+        }
+
+        try self.browser_panes.put(self.alloc, id, b);
+        errdefer _ = self.browser_panes.remove(id);
+        try sess.browsers.append(self.alloc, id);
+        self.next_pane_id += 1;
+        return id;
+    }
+
+    /// Update browser pane state (navigation from a client, or the host
+    /// reporting load progress/title). Null fields stay unchanged.
+    pub fn updateBrowserPane(
+        self: *Server,
+        id: PaneId,
+        url: ?[]const u8,
+        title: ?[]const u8,
+        loading: ?bool,
+    ) !void {
+        const b = self.browser_panes.get(id) orelse return error.NoSuchPane;
+        if (url) |u| {
+            const owned = try self.alloc.dupe(u8, u);
+            self.alloc.free(b.url);
+            b.url = owned;
+        }
+        if (title) |t| {
+            const owned = try self.alloc.dupe(u8, t);
+            self.alloc.free(b.title);
+            b.title = owned;
+        }
+        if (loading) |l| b.loading = l;
+    }
+
+    /// Browser pane state by value; string fields are borrowed from the
+    /// server and valid until the next update.
+    pub fn getBrowserPane(self: *Server, id: PaneId) ?BrowserPane {
+        const b = self.browser_panes.get(id) orelse return null;
+        return b.*;
     }
 
     /// Send input bytes to a pane's child (keyboard input, agent control).

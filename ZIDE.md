@@ -39,20 +39,21 @@ shells will consume it as a library and stay thin.
 | Path | Responsibility |
 |---|---|
 | `src/zide.zig` | Library root; re-exports the modules below |
-| `src/session.zig` | Session server: owns the xev event loop, sessions, panes; emits `pane_output` / `pane_bell` / `pane_exit` through `EventHandler`. The seam that later becomes the daemon + automation socket |
+| `src/session.zig` | Session server: owns the xev event loop, sessions, terminal panes, and browser-pane state; emits `pane_output` / `pane_bell` / `pane_exit` through `EventHandler` |
 | `src/term.zig` | Terminal namespace: re-exports Pty, Pane, BellScanner |
 | `src/term/Pty.zig` | POSIX pseudo-terminal: openpty, sizing ioctls, child pre-exec setup |
 | `src/term/Pane.zig` | PTY-attached child process feeding a ghostty-vt Terminal (queryable screen state, no rendering) |
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
-| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol: `host-register` + browser-open/navigate/eval routing |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
 | `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start |
 
 Support directories: `docs/` (decision record), `assets/` (logo +
-macOS iconset), `.github/workflows/` (CI).
+macOS iconset), `hosts/macos-browser/` (WKWebView host prototype,
+built with swiftc only — see its README), `.github/workflows/` (CI).
 
 ## Conventions
 

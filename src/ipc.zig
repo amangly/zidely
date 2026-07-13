@@ -10,7 +10,13 @@
 //!
 //! Every connected client receives every event. Commands: ping,
 //! create-session, list-sessions, spawn-pane, write, snapshot, save,
-//! shutdown.
+//! shutdown — plus the browser surface: browser-open, browser-navigate,
+//! browser-eval work from any client; a shell process that can render
+//! webviews registers with host-register and receives browser_open /
+//! browser_nav / browser_eval events (existing panes are replayed on
+//! registration), reporting state back with browser-update and
+//! browser-eval-result. Browser panes are core state: they exist,
+//! persist, and restore with no host attached.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -33,6 +39,9 @@ const Request = struct {
     cols: ?u16 = null,
     data: ?[]const u8 = null,
     path: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    seq: ?u64 = null,
+    loading: ?bool = null,
 };
 
 const Connection = struct {
@@ -95,6 +104,8 @@ pub const Server = struct {
     listen_fd: posix.socket_t,
     c_accept: xev.Completion = .{},
     clients: std.ArrayListUnmanaged(*Connection) = .empty,
+    /// The connection that renders webviews, if one registered.
+    host: ?*Connection = null,
     downstream: ?session.EventHandler,
     shutting_down: bool = false,
     listener_closed: bool = false,
@@ -202,6 +213,7 @@ pub const Server = struct {
     /// Only safe from the client's own read callback (single-threaded
     /// loop; the caller disarms the read completion).
     fn removeClient(self: *Server, client: *Connection) void {
+        if (self.host == client) self.host = null;
         for (self.clients.items, 0..) |c, i| {
             if (c == client) {
                 _ = self.clients.swapRemove(i);
@@ -250,12 +262,18 @@ pub const Server = struct {
                 id: session.SessionId,
                 title: []const u8,
                 panes: []const session.PaneId,
+                browsers: []const session.PaneId,
             };
             const infos = try arena.alloc(Info, ss.sessions.count());
             var it = ss.sessions.valueIterator();
             var i: usize = 0;
             while (it.next()) |s| : (i += 1) {
-                infos[i] = .{ .id = s.id, .title = s.title, .panes = s.panes.items };
+                infos[i] = .{
+                    .id = s.id,
+                    .title = s.title,
+                    .panes = s.panes.items,
+                    .browsers = s.browsers.items,
+                };
             }
             self.reply(client, .{ .id = req.id, .ok = true, .sessions = infos });
         } else if (eql(u8, req.cmd, "spawn-pane")) {
@@ -283,12 +301,81 @@ pub const Server = struct {
             const path = req.path orelse return error.MissingPath;
             try persist.save(self.alloc, ss, path);
             self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "host-register")) {
+            self.host = client;
+            self.reply(client, .{ .id = req.id, .ok = true });
+            // Replay existing browser panes so a late host renders them.
+            var it = ss.browser_panes.valueIterator();
+            while (it.next()) |bp| {
+                const b = bp.*;
+                self.sendTo(client, .{
+                    .event = "browser_open",
+                    .pane = b.id,
+                    .session = b.session,
+                    .url = b.url,
+                });
+            }
+        } else if (eql(u8, req.cmd, "browser-open")) {
+            const sid = req.session orelse return error.MissingSession;
+            const url = req.url orelse return error.MissingUrl;
+            const pane = try ss.openBrowserPane(sid, url);
+            self.reply(client, .{ .id = req.id, .ok = true, .pane = pane });
+            self.broadcast(.{ .event = "browser_open", .pane = pane, .session = sid, .url = url });
+        } else if (eql(u8, req.cmd, "browser-navigate")) {
+            const pane = req.pane orelse return error.MissingPane;
+            const url = req.url orelse return error.MissingUrl;
+            try ss.updateBrowserPane(pane, url, null, true);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "browser_nav", .pane = pane, .url = url });
+        } else if (eql(u8, req.cmd, "browser-update")) {
+            // The host reporting navigation state / page title back.
+            const pane = req.pane orelse return error.MissingPane;
+            try ss.updateBrowserPane(pane, req.url, req.title, req.loading);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            const b = ss.getBrowserPane(pane).?;
+            self.broadcast(.{
+                .event = "browser_update",
+                .pane = pane,
+                .url = b.url,
+                .title = b.title,
+                .loading = b.loading,
+            });
+        } else if (eql(u8, req.cmd, "browser-eval")) {
+            const pane = req.pane orelse return error.MissingPane;
+            const js = req.data orelse return error.MissingData;
+            if (ss.getBrowserPane(pane) == null) return error.NoSuchPane;
+            const host = self.host orelse return error.NoBrowserHost;
+            self.sendTo(host, .{
+                .event = "browser_eval",
+                .pane = pane,
+                .seq = req.seq orelse 0,
+                .js = js,
+            });
+            self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "browser-eval-result")) {
+            const pane = req.pane orelse return error.MissingPane;
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{
+                .event = "browser_eval_result",
+                .pane = pane,
+                .seq = req.seq orelse 0,
+                .value = req.data orelse "",
+            });
         } else if (eql(u8, req.cmd, "shutdown")) {
             self.reply(client, .{ .id = req.id, .ok = true });
             self.beginShutdown(client);
         } else {
             return error.UnknownCommand;
         }
+    }
+
+    /// Send a payload to one specific connection (host routing).
+    fn sendTo(self: *Server, client: *Connection, payload: anytype) void {
+        const json = std.fmt.allocPrint(self.alloc, "{f}\n", .{std.json.fmt(payload, .{})}) catch return;
+        defer self.alloc.free(json);
+        writeAllSocket(client.fd, json) catch {
+            client.closing = true;
+        };
     }
 
     /// Close the socket surface so the loop can drain: other clients
@@ -492,6 +579,99 @@ const TestClient = struct {
         _ = try waitFor(&client, "\"id\":5");
     }
 };
+
+/// Plays both sides of the browser protocol on one thread: a mock host
+/// connection (pretend WKWebView) and a regular client, interleaved in
+/// an order where every read has already been written by the server.
+const BrowserTestClient = struct {
+    socket_path: []const u8,
+    err: ?anyerror = null,
+    host_got_open: bool = false,
+    host_got_replayed: bool = false,
+    client_saw_update: bool = false,
+    client_got_eval_result: bool = false,
+
+    fn run(self: *BrowserTestClient) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *BrowserTestClient) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        try client.sendLine("{\"id\":1,\"cmd\":\"create-session\",\"title\":\"web\"}");
+        _ = try waitFor(&client, "\"id\":1");
+        try client.sendLine("{\"id\":2,\"cmd\":\"browser-open\",\"session\":1,\"url\":\"https://example.com\"}");
+        const r2 = try waitFor(&client, "\"id\":2");
+        if (std.mem.indexOf(u8, r2, "\"pane\":1") == null) return error.OpenFailed;
+
+        // Eval without a host must fail cleanly.
+        try client.sendLine("{\"id\":3,\"cmd\":\"browser-eval\",\"pane\":1,\"data\":\"1+1\",\"seq\":9}");
+        const r3 = try waitFor(&client, "\"id\":3");
+        if (std.mem.indexOf(u8, r3, "NoBrowserHost") == null) return error.ExpectedNoHost;
+
+        // A host attaches late: it must get the existing pane replayed.
+        var host = try Client.connect(self.socket_path);
+        defer host.close();
+        try host.sendLine("{\"id\":1,\"cmd\":\"host-register\"}");
+        _ = try waitFor(&host, "\"id\":1");
+        const replay = try waitFor(&host, "\"event\":\"browser_open\"");
+        self.host_got_replayed = std.mem.indexOf(u8, replay, "example.com") != null;
+
+        // Host reports the page loaded; the client sees the update.
+        try host.sendLine("{\"id\":2,\"cmd\":\"browser-update\",\"pane\":1," ++
+            "\"title\":\"Example Domain\",\"loading\":false}");
+        _ = try waitFor(&host, "\"id\":2");
+        const upd = try waitFor(&client, "\"event\":\"browser_update\"");
+        self.client_saw_update = std.mem.indexOf(u8, upd, "Example Domain") != null;
+
+        // Eval round-trip: client → core → host → core → client.
+        try client.sendLine("{\"id\":4,\"cmd\":\"browser-eval\",\"pane\":1,\"data\":\"1+1\",\"seq\":42}");
+        _ = try waitFor(&client, "\"id\":4");
+        const ev = try waitFor(&host, "\"event\":\"browser_eval\"");
+        self.host_got_open = std.mem.indexOf(u8, ev, "\"seq\":42") != null;
+        try host.sendLine("{\"id\":3,\"cmd\":\"browser-eval-result\",\"pane\":1,\"seq\":42,\"data\":\"2\"}");
+        const res = try waitFor(&client, "\"event\":\"browser_eval_result\"");
+        self.client_got_eval_result = std.mem.indexOf(u8, res, "\"seq\":42") != null and
+            std.mem.indexOf(u8, res, "\"value\":\"2\"") != null;
+
+        try client.sendLine("{\"id\":5,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":5");
+    }
+};
+
+test "browser panes: host protocol round-trip" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+
+    var tc: BrowserTestClient = .{ .socket_path = socket_path };
+    const thread = try std.Thread.spawn(.{}, BrowserTestClient.run, .{&tc});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
+    try std.testing.expect(tc.host_got_replayed);
+    try std.testing.expect(tc.client_saw_update);
+    try std.testing.expect(tc.host_got_open);
+    try std.testing.expect(tc.client_got_eval_result);
+
+    // Browser pane state survived in the core.
+    const b = server.getBrowserPane(1).?;
+    try std.testing.expectEqualStrings("Example Domain", b.title);
+    try std.testing.expect(!b.loading);
+}
 
 test "socket api: commands, events, save, shutdown" {
     const alloc = std.testing.allocator;

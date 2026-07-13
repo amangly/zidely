@@ -27,6 +27,9 @@ const usage =
     \\  spawn <session> <cmd..>  spawn a pane in a session, print its id
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
+    \\  browse <session> <url>   open a browser pane, print its id
+    \\  nav <pane> <url>         navigate a browser pane
+    \\  eval <pane> <js>         run JS in a browser pane (needs a host)
     \\  save <path>              persist the layout to a state file
     \\  events                   follow the event stream (until shutdown)
     \\  shutdown                 stop the server (panes get SIGHUP)
@@ -139,6 +142,47 @@ pub fn main() !void {
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
         const resp = try roundtrip(arena, &client, .{ .id = 1, .cmd = "snapshot", .pane = pane });
         try stdout("{s}\n", .{resp.snapshot orelse ""});
+    } else if (std.mem.eql(u8, cmd, "browse")) {
+        if (pos.items.len != 2) return fail("usage: zide browse <session> <url>\n", .{});
+        const sid = try std.fmt.parseInt(u64, pos.items[0], 10);
+        const resp = try roundtrip(arena, &client, .{
+            .id = 1,
+            .cmd = "browser-open",
+            .session = sid,
+            .url = pos.items[1],
+        });
+        try stdout("{d}\n", .{resp.pane.?});
+    } else if (std.mem.eql(u8, cmd, "nav")) {
+        if (pos.items.len != 2) return fail("usage: zide nav <pane> <url>\n", .{});
+        const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
+        _ = try roundtrip(arena, &client, .{
+            .id = 1,
+            .cmd = "browser-navigate",
+            .pane = pane,
+            .url = pos.items[1],
+        });
+    } else if (std.mem.eql(u8, cmd, "eval")) {
+        if (pos.items.len != 2) return fail("usage: zide eval <pane> <js>\n", .{});
+        const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
+        _ = try roundtrip(arena, &client, .{
+            .id = 1,
+            .cmd = "browser-eval",
+            .pane = pane,
+            .data = pos.items[1],
+            .seq = @as(u64, 7),
+        });
+        // The result comes back on the event stream.
+        while (true) {
+            const line = try client.readLine();
+            if (std.mem.indexOf(u8, line, "\"browser_eval_result\"") == null) continue;
+            if (std.mem.indexOf(u8, line, "\"seq\":7") == null) continue;
+            const Result = struct { value: []const u8 = "" };
+            const parsed = try std.json.parseFromSlice(Result, arena, line, .{
+                .ignore_unknown_fields = true,
+            });
+            try stdout("{s}\n", .{parsed.value.value});
+            break;
+        }
     } else if (std.mem.eql(u8, cmd, "save")) {
         if (pos.items.len != 1) return fail("usage: zide save <path>\n", .{});
         _ = try roundtrip(arena, &client, .{ .id = 1, .cmd = "save", .path = pos.items[0] });

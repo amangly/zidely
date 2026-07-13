@@ -18,9 +18,14 @@ const SavedPane = struct {
     cols: u16 = 80,
 };
 
+const SavedBrowser = struct {
+    url: []const u8,
+};
+
 const SavedSession = struct {
     title: []const u8,
     panes: []const SavedPane = &.{},
+    browsers: []const SavedBrowser = &.{},
 };
 
 const SavedState = struct {
@@ -43,7 +48,12 @@ pub fn save(alloc: std.mem.Allocator, server: *session.Server, path: []const u8)
             const h = server.panes.get(pane_id) orelse continue;
             panes[j] = .{ .argv = h.argv, .cwd = h.cwd, .rows = h.rows, .cols = h.cols };
         }
-        sessions[i] = .{ .title = s.title, .panes = panes };
+        const browsers = try arena.alloc(SavedBrowser, s.browsers.items.len);
+        for (s.browsers.items, 0..) |pane_id, j| {
+            const b = server.browser_panes.get(pane_id) orelse continue;
+            browsers[j] = .{ .url = b.url };
+        }
+        sessions[i] = .{ .title = s.title, .panes = panes, .browsers = browsers };
     }
 
     const state: SavedState = .{ .sessions = sessions };
@@ -83,6 +93,10 @@ pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const 
                 .rows = p.rows,
                 .cols = p.cols,
             });
+            result.panes += 1;
+        }
+        for (s.browsers) |b| {
+            _ = try server.openBrowserPane(sid, b.url);
             result.panes += 1;
         }
     }

@@ -21,7 +21,8 @@ foundation first, pixels when the core deserves them.
 
 - [x] Socket API (the session server's event/command stream, exposed)
 - [x] `zide` CLI against the socket
-- [ ] Embedded browser pane (WKWebView) with programmable API
+- [x] Embedded browser pane (WKWebView) with programmable API
+      (prototype host; moves into the Swift shell when it lands)
 - [x] Daemon mode: live session survival across UI restarts
 - [ ] SSH / remote workspaces
 
