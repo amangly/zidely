@@ -585,11 +585,16 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
     @objc func closeWorkspace() {
         if !demoMode, let ws = viewModel.selectedWorkspace {
-            // Kill the daemon panes behind the workspace's terminals or
-            // they resurrect as rows. Browser panes are core daemon
-            // state and stay (they re-list until closed daemon-side).
-            for pane in terminalPaneIds(of: ws.layout) {
-                killPane(pane)
+            // Close daemon-side or the workspace resurrects as a row on
+            // the next refresh: terminals get their child killed,
+            // browser panes are core state removed via browser-close.
+            for surf in allSurfaces(of: ws.layout) {
+                guard let pane = surf.paneId else { continue }
+                switch surf.kind {
+                case .terminal: killPane(pane)
+                case .browser: closeBrowserPane(pane)
+                case .placeholder: break
+                }
             }
         }
         if viewModel.closeSelectedWorkspace() {
@@ -610,8 +615,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             if let node,
                let surf = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
                    ?? node.surfaces.first,
-               surf.kind == .terminal, let pane = surf.paneId {
-                killPane(pane)
+               let pane = surf.paneId {
+                switch surf.kind {
+                case .terminal: killPane(pane)
+                case .browser: closeBrowserPane(pane)
+                case .placeholder: break
+                }
             }
         }
         if viewModel.closeSelectedSurface() {
@@ -621,16 +630,14 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         }
     }
 
-    /// Daemon panes behind a layout's terminal surfaces.
-    private func terminalPaneIds(of layout: ShellLayout) -> [UInt64] {
+    /// Every surface in a layout.
+    private func allSurfaces(of layout: ShellLayout) -> [ShellSurface] {
         let nodes: [ShellPaneNode]
         switch layout {
         case let .single(p): nodes = [p]
         case let .split(_, a, b, _): nodes = [a, b]
         }
-        return nodes.flatMap { node in
-            node.surfaces.filter { $0.kind == .terminal }.compactMap(\.paneId)
-        }
+        return nodes.flatMap(\.surfaces)
     }
 
     @objc func focusNextPane() {
@@ -1021,7 +1028,15 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             refresh()
         case "pane_removed":
             exited.remove(pane)
+            pendingKill.remove(pane)
             surfaces.removeValue(forKey: pane)
+            viewModel.removePaneEverywhere(pane)
+            refresh()
+        case "browser_removed":
+            if let web = webviews.removeValue(forKey: pane) {
+                paneOfWebView.removeValue(forKey: ObjectIdentifier(web))
+            }
+            browserTitles.removeValue(forKey: pane)
             viewModel.removePaneEverywhere(pane)
             refresh()
         case "browser_open":
@@ -1079,6 +1094,8 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// and remove the pane once its exit lands (already-dead panes are
     /// removed immediately). Without this, closing a terminal is purely
     /// local and the pane resurrects as a row on the next refresh.
+    /// Children that trap HUP (TUIs, agents) get SIGKILL after a grace
+    /// period — closed means closed.
     func killPane(_ pane: UInt64) {
         if exited.contains(pane) {
             client.send(["cmd": "remove-pane", "pane": pane]) { [weak self] _ in
@@ -1087,6 +1104,18 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         } else {
             pendingKill.insert(pane)
             client.send(["cmd": "kill-pane", "pane": pane])
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                guard let self, self.pendingKill.contains(pane) else { return }
+                self.client.send(["cmd": "kill-pane", "pane": pane, "force": true])
+            }
+        }
+    }
+
+    /// Close a browser pane daemon-side — browser panes are core state,
+    /// so a local-only close resurrects on the next refresh.
+    func closeBrowserPane(_ pane: UInt64) {
+        client.send(["cmd": "browser-close", "pane": pane]) { [weak self] _ in
+            self?.refresh()
         }
     }
 

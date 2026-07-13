@@ -195,8 +195,8 @@ pub fn main() !void {
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
         _ = try roundtrip(arena, &client, .{ .id = 1, .cmd = "kill-pane", .pane = pane });
         // The child exits asynchronously (SIGHUP → drain → pane_exit);
-        // retry removal until the pane has finished, bounded for
-        // children that ignore the hangup.
+        // retry removal until the pane has finished. Children that trap
+        // HUP get SIGKILL after a grace period — closed means closed.
         var tries: u32 = 0;
         while (true) : (tries += 1) {
             const json = try std.fmt.allocPrint(
@@ -210,6 +210,14 @@ pub fn main() !void {
             const e = parsed.value.@"error" orelse "unknown";
             if (!std.mem.eql(u8, e, "PaneStillRunning") or tries >= 50)
                 return fail("error: {s}\n", .{e});
+            if (tries == 20) {
+                _ = try roundtrip(arena, &client, .{
+                    .id = 3,
+                    .cmd = "kill-pane",
+                    .pane = pane,
+                    .force = true,
+                });
+            }
             std.Thread.sleep(100 * std.time.ns_per_ms);
         }
         try stdout("pane {d} killed and removed\n", .{pane});
