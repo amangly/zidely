@@ -40,6 +40,7 @@ fn logEvent(ud: ?*anyopaque, server: *zidely.session.Server, event: zidely.sessi
     _ = server;
     switch (event) {
         .pane_output => |pane| std.debug.print("event: output from pane {d}\n", .{pane}),
+        .pane_bell => |pane| std.debug.print("event: BELL from pane {d}\n", .{pane}),
         .pane_exit => |e| std.debug.print("event: pane {d} exited (code {?d})\n", .{ e.pane, e.exit_code }),
     }
 }

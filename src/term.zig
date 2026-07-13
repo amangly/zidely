@@ -11,6 +11,7 @@ const std = @import("std");
 
 pub const Pty = @import("term/Pty.zig");
 pub const Pane = @import("term/Pane.zig");
+pub const BellScanner = @import("term/bell.zig").BellScanner;
 
 pub const PaneId = u64;
 

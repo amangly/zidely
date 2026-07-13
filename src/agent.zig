@@ -7,16 +7,17 @@
 //! phase behind this same task model.
 
 const std = @import("std");
+const xev = @import("xev").Dynamic;
 const session = @import("session.zig");
 const gitx = @import("gitx.zig");
 
 pub const TaskId = u64;
 
 pub const Status = enum {
-    /// Agent process is running.
+    /// Agent process is running and producing output.
     working,
-    /// Agent is waiting for user input — surfaced as a notification.
-    /// (Detection heuristics land with the shell; unused until then.)
+    /// Agent likely waits for user input: it rang the bell, or went
+    /// quiet while running (TUI agents animate while they work).
     needs_attention,
     /// Agent process exited; work is ready for review/merge/cleanup.
     finished,
@@ -30,6 +31,17 @@ pub const Task = struct {
     pane: session.PaneId,
     status: Status,
     exit_code: ?u8 = null,
+    /// Wall clock (ms) of the last PTY output, for quiescence detection.
+    last_output_ms: i64 = 0,
+};
+
+/// A task changed status. Shells subscribe to drive notification rings.
+pub const TaskEvent = struct { task: TaskId, status: Status };
+
+pub const TaskEventHandler = struct {
+    userdata: ?*anyopaque = null,
+    /// Called from inside the event loop; keep it quick and non-blocking.
+    func: *const fn (userdata: ?*anyopaque, manager: *Manager, event: TaskEvent) void,
 };
 
 /// Orchestrates agent tasks on top of a session server: provisions the
@@ -46,12 +58,21 @@ pub const Manager = struct {
     by_pane: std.AutoHashMapUnmanaged(session.PaneId, TaskId),
     next_task_id: TaskId = 1,
     downstream: ?session.EventHandler,
+    /// Subscriber for task status changes.
+    task_handler: ?TaskEventHandler = null,
+    attention_after_ms: u32,
+    timer: xev.Timer,
+    timer_c: xev.Completion = .{},
+    timer_armed: bool = false,
 
     pub const Options = struct {
         /// Repository agent tasks operate on (its root).
         repo: []const u8,
         /// Directory task worktrees are created under.
         worktrees_dir: []const u8,
+        /// A working task with no output for this long is assumed to be
+        /// waiting for input and flips to needs_attention.
+        attention_after_ms: u32 = 2000,
     };
 
     pub fn create(
@@ -71,6 +92,8 @@ pub const Manager = struct {
             .tasks = .empty,
             .by_pane = .empty,
             .downstream = server.handler,
+            .attention_after_ms = opts.attention_after_ms,
+            .timer = try xev.Timer.init(),
         };
         server.handler = .{ .userdata = self, .func = onEvent };
         return self;
@@ -78,7 +101,10 @@ pub const Manager = struct {
 
     /// Releases task bookkeeping; does NOT remove worktrees (they may
     /// hold unreviewed agent work). Restores the previous event handler.
+    /// Only call once the event loop is drained: an armed quiescence
+    /// timer still references this manager.
     pub fn destroy(self: *Manager) void {
+        self.timer.deinit();
         self.server.handler = self.downstream;
         var it = self.tasks.valueIterator();
         while (it.next()) |task_ptr| self.destroyTask(task_ptr.*);
@@ -139,6 +165,7 @@ pub const Manager = struct {
             .worktree = wt,
             .pane = pane,
             .status = .working,
+            .last_output_ms = std.time.milliTimestamp(),
         };
         errdefer self.alloc.free(task.description);
 
@@ -146,6 +173,7 @@ pub const Manager = struct {
         errdefer _ = self.tasks.remove(id);
         try self.by_pane.put(self.alloc, pane, id);
         self.next_task_id += 1;
+        self.ensureTimer();
         return id;
     }
 
@@ -179,20 +207,79 @@ pub const Manager = struct {
         self.destroyTask(task);
     }
 
+    fn setStatus(self: *Manager, task: *Task, status: Status) void {
+        if (task.status == status) return;
+        task.status = status;
+        if (self.task_handler) |h|
+            h.func(h.userdata, self, .{ .task = task.id, .status = status });
+    }
+
+    fn taskForPane(self: *Manager, pane: session.PaneId) ?*Task {
+        const task_id = self.by_pane.get(pane) orelse return null;
+        return self.tasks.get(task_id);
+    }
+
     fn onEvent(ud: ?*anyopaque, server: *session.Server, event: session.Event) void {
         const self: *Manager = @ptrCast(@alignCast(ud.?));
         switch (event) {
-            .pane_exit => |e| if (self.by_pane.get(e.pane)) |task_id| {
-                if (self.tasks.get(task_id)) |task| {
-                    task.status = .finished;
-                    task.exit_code = e.exit_code;
-                }
+            .pane_output => |pane| if (self.taskForPane(pane)) |task| {
+                task.last_output_ms = std.time.milliTimestamp();
+                if (task.status == .needs_attention) self.setStatus(task, .working);
+                self.ensureTimer();
             },
-            // Attention detection (agent waiting for input) hooks in
-            // here once the heuristics exist.
-            .pane_output => {},
+            .pane_bell => |pane| if (self.taskForPane(pane)) |task| {
+                if (task.status != .finished) self.setStatus(task, .needs_attention);
+            },
+            .pane_exit => |e| if (self.taskForPane(e.pane)) |task| {
+                task.exit_code = e.exit_code;
+                self.setStatus(task, .finished);
+            },
         }
         if (self.downstream) |d| d.func(d.userdata, server, event);
+    }
+
+    fn anyWorking(self: *Manager) bool {
+        var it = self.tasks.valueIterator();
+        while (it.next()) |task| if (task.*.status == .working) return true;
+        return false;
+    }
+
+    /// Arm the quiescence timer if any task needs watching. The timer
+    /// disarms itself when nothing is working so that a drained loop
+    /// can finish (`Server.run` runs until no work remains).
+    fn ensureTimer(self: *Manager) void {
+        if (self.timer_armed or !self.anyWorking()) return;
+        self.timer_armed = true;
+        const interval = @max(self.attention_after_ms / 2, 25);
+        self.timer.run(&self.server.loop, &self.timer_c, interval, Manager, self, onTimer);
+    }
+
+    fn onTimer(
+        ud: ?*Manager,
+        loop: *xev.Loop,
+        c: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = c;
+        const self = ud.?;
+        r catch {
+            self.timer_armed = false;
+            return .disarm;
+        };
+
+        const now = std.time.milliTimestamp();
+        var it = self.tasks.valueIterator();
+        while (it.next()) |task_ptr| {
+            const task = task_ptr.*;
+            if (task.status != .working) continue;
+            if (now - task.last_output_ms >= self.attention_after_ms)
+                self.setStatus(task, .needs_attention);
+        }
+
+        if (self.anyWorking()) return .rearm;
+        self.timer_armed = false;
+        return .disarm;
     }
 };
 
@@ -215,6 +302,7 @@ test "agent task runs in its own worktree and reports finish" {
     var manager = try Manager.create(alloc, &server, sid, .{
         .repo = repo,
         .worktrees_dir = wt_dir,
+        .attention_after_ms = 300,
     });
     defer manager.destroy();
 
@@ -274,6 +362,7 @@ test "cleanup refuses while the agent is still running" {
     var manager = try Manager.create(alloc, &server, sid, .{
         .repo = repo,
         .worktrees_dir = wt_dir,
+        .attention_after_ms = 300,
     });
     defer manager.destroy();
 
@@ -287,4 +376,113 @@ test "cleanup refuses while the agent is still running" {
     try server.paneWrite(manager.get(task_id).?.pane, "\n");
     try server.run();
     try std.testing.expectEqual(Status.finished, manager.get(task_id).?.status);
+}
+
+const StatusRecorder = struct {
+    events: [16]TaskEvent = undefined,
+    len: usize = 0,
+
+    fn on(ud: ?*anyopaque, manager: *Manager, event: TaskEvent) void {
+        _ = manager;
+        const self: *StatusRecorder = @ptrCast(@alignCast(ud.?));
+        if (self.len < self.events.len) {
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+    }
+
+    fn statuses(self: *const StatusRecorder) []const TaskEvent {
+        return self.events[0..self.len];
+    }
+};
+
+test "quiet task flips to needs_attention and back on output" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try gitx.setupTestRepo(alloc, repo);
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    defer alloc.free(wt_dir);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    const sid = try server.createSession("agents");
+    var manager = try Manager.create(alloc, &server, sid, .{
+        .repo = repo,
+        .worktrees_dir = wt_dir,
+        .attention_after_ms = 150,
+    });
+    defer manager.destroy();
+
+    var recorder: StatusRecorder = .{};
+    manager.task_handler = .{ .userdata = &recorder, .func = StatusRecorder.on };
+
+    // Outputs, goes quiet well past the threshold, outputs again, exits.
+    _ = try manager.startTask(.{
+        .description = "quiet spell",
+        .argv = &.{ "/bin/sh", "-c", "echo start; sleep 0.7; echo resumed" },
+    });
+    try server.run();
+
+    const events = recorder.statuses();
+    try std.testing.expect(events.len >= 2);
+    try std.testing.expectEqual(Status.finished, events[events.len - 1].status);
+
+    // Quiescence must have fired, and output must have recovered it.
+    var first_attention: ?usize = null;
+    for (events, 0..) |e, i| {
+        if (e.status == .needs_attention) {
+            first_attention = i;
+            break;
+        }
+    }
+    try std.testing.expect(first_attention != null);
+    var recovered = false;
+    for (events[first_attention.?..]) |e| {
+        if (e.status == .working) recovered = true;
+    }
+    try std.testing.expect(recovered);
+}
+
+test "bell flips to needs_attention immediately" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    try gitx.setupTestRepo(alloc, repo);
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    defer alloc.free(wt_dir);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    const sid = try server.createSession("agents");
+    // Huge quiescence threshold: any needs_attention here is bell-driven.
+    var manager = try Manager.create(alloc, &server, sid, .{
+        .repo = repo,
+        .worktrees_dir = wt_dir,
+        .attention_after_ms = 60_000,
+    });
+    defer manager.destroy();
+
+    var recorder: StatusRecorder = .{};
+    manager.task_handler = .{ .userdata = &recorder, .func = StatusRecorder.on };
+
+    const task_id = try manager.startTask(.{
+        .description = "asks a question",
+        .argv = &.{ "/bin/sh", "-c", "printf '\\aproceed? '; read _; echo ok" },
+    });
+    try server.paneWrite(manager.get(task_id).?.pane, "y\n");
+    try server.run();
+
+    const events = recorder.statuses();
+    try std.testing.expect(events.len >= 2);
+    try std.testing.expectEqual(Status.needs_attention, events[0].status);
+    try std.testing.expectEqual(Status.finished, events[events.len - 1].status);
 }

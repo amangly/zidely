@@ -17,6 +17,8 @@ pub const PaneId = term.PaneId;
 pub const Event = union(enum) {
     /// The pane's terminal state changed; read it via paneSnapshot().
     pane_output: PaneId,
+    /// The child rang the terminal bell — an explicit attention signal.
+    pane_bell: PaneId,
     /// The pane's child exited and its PTY output is fully drained.
     /// exit_code is null only when the exit status could not be read.
     pane_exit: struct { pane: PaneId, exit_code: ?u8 },
@@ -51,6 +53,7 @@ const PaneHandle = struct {
     c_read: xev.Completion,
     c_proc: xev.Completion,
     read_buf: [4096]u8 = undefined,
+    bells: term.BellScanner = .{},
 
     // pane_exit is emitted only once BOTH the child has exited and the
     // PTY has drained to EOF, so no trailing output is ever lost.
@@ -85,11 +88,14 @@ const PaneHandle = struct {
             return .disarm;
         }
 
+        const bell_count = h.bells.scan(h.read_buf[0..n]);
         h.pane.feed(h.read_buf[0..n]) catch |err| {
             std.log.warn("pane {d}: dropped {d} bytes of output: {}", .{ h.id, n, err });
         };
-        if (h.server.handler) |handler|
+        if (h.server.handler) |handler| {
             handler.emit(h.server, .{ .pane_output = h.id });
+            if (bell_count > 0) handler.emit(h.server, .{ .pane_bell = h.id });
+        }
         return .rearm;
     }
 
@@ -284,6 +290,7 @@ const TestCollector = struct {
         const self: *TestCollector = @ptrCast(@alignCast(ud.?));
         switch (event) {
             .pane_output => self.outputs += 1,
+            .pane_bell => {},
             .pane_exit => |e| {
                 self.exits[self.exit_count] = .{ .pane = e.pane, .code = e.exit_code };
                 self.exit_count += 1;
