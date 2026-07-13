@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-white-256.png">
+    <img src="assets/logo-256.png" alt="zidely logo" width="128">
+  </picture>
+</p>
+
 # zidely
 
 A terminal built for running many AI coding agents in parallel, growing into
