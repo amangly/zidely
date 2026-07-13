@@ -117,11 +117,6 @@ const PaneHandle = struct {
     }
 };
 
-/// Dynamic xev's Completion needs init(); the static API uses `.{}`.
-fn completionInit() xev.Completion {
-    return if (comptime @hasDecl(xev.Completion, "init")) .init() else .{};
-}
-
 /// Both libxev backends deliver a plain exit code (kqueue decodes the
 /// wait status itself; the Linux pidfd path reads siginfo). Caveat, to
 /// fix by reaping ourselves later: signal deaths surface as 0 on macOS
@@ -225,8 +220,11 @@ pub const Server = struct {
             .pane = pane,
             .stream = xev.Stream.initFd(pane.masterFd()),
             .process = try xev.Process.init(pane.pid),
-            .c_read = completionInit(),
-            .c_proc = completionInit(),
+            // Zero-init is the correct completion init for both static
+            // and Dynamic xev (Dynamic's init() is broken for io_uring;
+            // its watchers ensureTag() on zero-inited completions).
+            .c_read = .{},
+            .c_proc = .{},
         };
         errdefer h.process.deinit();
 
