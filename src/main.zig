@@ -25,6 +25,8 @@ const usage =
     \\  ls                       list sessions and their panes
     \\  new <title>              create a session, print its id
     \\  spawn <session> <cmd..>  spawn a pane in a session, print its id
+    \\  attach <pane>            take over the terminal: raw passthrough
+    \\                           to the pane (detach: ctrl-\)
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
     \\  browse <session> <url>   open a browser pane, print its id
@@ -132,6 +134,10 @@ pub fn main() !void {
             .argv = pos.items[1..],
         });
         try stdout("{d}\n", .{resp.pane.?});
+    } else if (std.mem.eql(u8, cmd, "attach")) {
+        if (pos.items.len != 1) return fail("usage: zide attach <pane>\n", .{});
+        const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
+        try cmdAttach(arena, &client, socket_path, pane);
     } else if (std.mem.eql(u8, cmd, "send")) {
         if (pos.items.len != 2) return fail("usage: zide send <pane> <text>\n", .{});
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
@@ -204,6 +210,163 @@ pub fn main() !void {
 }
 
 extern "c" fn setsid() std.c.pid_t;
+
+/// Ctrl-\ — detaches an interactive attach. Chosen over prefix-key
+/// schemes for v1: single byte, no state machine, and rare enough in
+/// real terminal input (its usual meaning, SIGQUIT, is disabled by raw
+/// mode anyway).
+const detach_byte: u8 = 0x1c;
+
+var winch_flag = std.atomic.Value(bool).init(false);
+
+fn onWinch(_: c_int) callconv(.c) void {
+    winch_flag.store(true, .release);
+}
+
+/// Raw passthrough to a pane, tmux-attach style: this terminal becomes
+/// the pane until ctrl-\ or pane exit. Two connections: `control` stays
+/// on the JSON protocol (resize on SIGWINCH, and drained so broadcasts
+/// never block the server on us); a second connection issues `attach`
+/// and becomes the byte pipe.
+fn cmdAttach(
+    arena: std.mem.Allocator,
+    control: *zide.ipc.Client,
+    socket_path: []const u8,
+    pane: u64,
+) !void {
+    const stdin_fd = posix.STDIN_FILENO;
+    const stdout_file = std.fs.File.stdout();
+    const is_tty = posix.isatty(stdin_fd);
+
+    // Size the pane to this terminal before painting the backlog.
+    if (posix.isatty(posix.STDOUT_FILENO)) {
+        if (zide.term.Pty.ttySize(posix.STDOUT_FILENO)) |ws| {
+            _ = try roundtrip(arena, control, .{
+                .id = 1,
+                .cmd = "resize",
+                .pane = pane,
+                .rows = ws.ws_row,
+                .cols = ws.ws_col,
+            });
+        } else |_| {}
+    }
+
+    // Current screen contents as context. Output arriving between this
+    // snapshot and the attach below is lost to this client — a small
+    // window, acceptable until state replay exists.
+    const snap = try roundtrip(arena, control, .{ .id = 2, .cmd = "snapshot", .pane = pane });
+    if (snap.snapshot) |s| if (s.len > 0) try stdout_file.writeAll(s);
+
+    var raw = try zide.ipc.Client.connect(socket_path);
+    defer raw.close();
+    _ = try roundtrip(arena, &raw, .{ .id = 1, .cmd = "attach", .pane = pane });
+    // Bytes that raced the ok reply into the client buffer are already
+    // raw pane output.
+    if (raw.end > raw.start) {
+        try stdout_file.writeAll(raw.buf[raw.start..raw.end]);
+        raw.start = 0;
+        raw.end = 0;
+    }
+
+    var orig_termios: ?posix.termios = null;
+    if (is_tty) {
+        const orig = try posix.tcgetattr(stdin_fd);
+        var t = orig;
+        t.lflag.ECHO = false;
+        t.lflag.ICANON = false;
+        t.lflag.ISIG = false;
+        t.lflag.IEXTEN = false;
+        t.iflag.IXON = false;
+        t.iflag.ICRNL = false;
+        t.iflag.BRKINT = false;
+        t.iflag.ISTRIP = false;
+        t.oflag.OPOST = false;
+        t.cc[@intFromEnum(posix.V.MIN)] = 1;
+        t.cc[@intFromEnum(posix.V.TIME)] = 0;
+        try posix.tcsetattr(stdin_fd, .FLUSH, t);
+        orig_termios = orig;
+
+        var sa: posix.Sigaction = .{
+            .handler = .{ .handler = onWinch },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.WINCH, &sa, null);
+    }
+    defer if (orig_termios) |orig| posix.tcsetattr(stdin_fd, .FLUSH, orig) catch {};
+
+    var out_buf: [4096]u8 = undefined;
+    var in_buf: [1024]u8 = undefined;
+    var stdin_open = true;
+    var detached = false;
+
+    while (true) {
+        if (winch_flag.swap(false, .acq_rel)) {
+            if (zide.term.Pty.ttySize(posix.STDOUT_FILENO)) |ws| {
+                // Fire-and-forget: the ok lands in the control drain. A
+                // failure here must not exit while the tty is raw.
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(
+                    &msg_buf,
+                    "{{\"cmd\":\"resize\",\"pane\":{d},\"rows\":{d},\"cols\":{d}}}",
+                    .{ pane, ws.ws_row, ws.ws_col },
+                ) catch unreachable;
+                control.sendLine(msg) catch {};
+            } else |_| {}
+        }
+
+        var fds = [3]posix.pollfd{
+            .{ .fd = raw.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = control.fd, .events = posix.POLL.IN, .revents = 0 },
+            .{ .fd = if (stdin_open) stdin_fd else -1, .events = posix.POLL.IN, .revents = 0 },
+        };
+        // Timeout paces the winch check; EINTR (the signal itself)
+        // just means poll again.
+        _ = posix.poll(&fds, 200) catch 0;
+
+        const ready = posix.POLL.IN | posix.POLL.HUP | posix.POLL.ERR;
+
+        if (fds[0].revents & ready != 0) {
+            const n = posix.read(raw.fd, &out_buf) catch 0;
+            if (n == 0) break; // pane exited (server half-closed us)
+            try stdout_file.writeAll(out_buf[0..n]);
+        }
+
+        if (fds[1].revents & ready != 0) {
+            const n = posix.read(control.fd, &out_buf) catch 0;
+            if (n == 0) break; // server went away entirely
+        }
+
+        if (stdin_open and fds[2].revents & ready != 0) {
+            const n = posix.read(stdin_fd, &in_buf) catch 0;
+            if (n == 0) {
+                // Piped stdin ended; stay attached for output.
+                stdin_open = false;
+                continue;
+            }
+            const chunk = in_buf[0..n];
+            if (is_tty) {
+                if (std.mem.indexOfScalar(u8, chunk, detach_byte)) |i| {
+                    try writeAllFd(raw.fd, chunk[0..i]);
+                    detached = true;
+                    break;
+                }
+            }
+            try writeAllFd(raw.fd, chunk);
+        }
+    }
+
+    if (orig_termios) |orig| {
+        posix.tcsetattr(stdin_fd, .FLUSH, orig) catch {};
+        orig_termios = null;
+    }
+    try stdout("\r\n[zide: {s}]\n", .{if (detached) "detached" else "pane closed"});
+}
+
+fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) off += try posix.write(fd, bytes[off..]);
+}
 
 /// Start the server detached: double-fork + setsid, stdio to the log
 /// file, pidfile written, then the ordinary serve loop. Runs before any

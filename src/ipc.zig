@@ -9,14 +9,22 @@
 //!   event    {"event":"pane_exit","pane":2,"exit_code":0}
 //!
 //! Every connected client receives every event. Commands: ping,
-//! create-session, list-sessions, spawn-pane, write, snapshot, save,
-//! shutdown — plus the browser surface: browser-open, browser-navigate,
-//! browser-eval work from any client; a shell process that can render
-//! webviews registers with host-register and receives browser_open /
-//! browser_nav / browser_eval events (existing panes are replayed on
-//! registration), reporting state back with browser-update and
-//! browser-eval-result. Browser panes are core state: they exist,
+//! create-session, list-sessions, spawn-pane, write, snapshot, resize,
+//! save, shutdown — plus the browser surface: browser-open,
+//! browser-navigate, browser-eval work from any client; a shell process
+//! that can render webviews registers with host-register and receives
+//! browser_open / browser_nav / browser_eval events (existing panes are
+//! replayed on registration), reporting state back with browser-update
+//! and browser-eval-result. Browser panes are core state: they exist,
 //! persist, and restore with no host attached.
+//!
+//! The `attach` command converts a connection to raw PTY passthrough —
+//! permanently leaving the JSON protocol. After the ok reply, bytes the
+//! client sends go verbatim into the pane and the pane's output comes
+//! back verbatim; the server half-closes the socket when the pane
+//! exits. This is the transport terminal renderers sit on (a libghostty
+//! surface runs `zide attach <pane>` the way a terminal runs tmux
+//! attach), so panes stay daemon-owned while rendering stays native.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,6 +60,9 @@ const Connection = struct {
     read_buf: [4096]u8 = undefined,
     /// Partial-line accumulator; requests may arrive split or batched.
     line: std.ArrayListUnmanaged(u8) = .empty,
+    /// Raw-passthrough mode: bytes flow verbatim to/from this pane and
+    /// the JSON protocol no longer applies (see the attach command).
+    attached: ?session.PaneId = null,
     closing: bool = false,
 
     fn onRead(
@@ -75,6 +86,13 @@ const Connection = struct {
             return .disarm;
         }
 
+        if (self.attached) |pane| {
+            // A vanished pane EOFs the attachment rather than erroring:
+            // the exit path already half-closed this socket.
+            server.session_server.paneWrite(pane, self.read_buf[0..n]) catch {};
+            return .rearm;
+        }
+
         self.line.appendSlice(server.alloc, self.read_buf[0..n]) catch {
             server.removeClient(self);
             return .disarm;
@@ -86,6 +104,14 @@ const Connection = struct {
             std.mem.copyForwards(u8, self.line.items[0..rest.len], rest);
             self.line.shrinkRetainingCapacity(rest.len);
             if (self.closing) break;
+            if (self.attached) |pane| {
+                // The attach request may arrive batched with the first
+                // input bytes; everything after its newline is raw.
+                if (self.line.items.len > 0)
+                    server.session_server.paneWrite(pane, self.line.items) catch {};
+                self.line.clearRetainingCapacity();
+                break;
+            }
         }
 
         if (self.closing) {
@@ -297,6 +323,20 @@ pub const Server = struct {
             const snap = try ss.paneSnapshot(pane, self.alloc);
             defer self.alloc.free(snap);
             self.reply(client, .{ .id = req.id, .ok = true, .snapshot = snap });
+        } else if (eql(u8, req.cmd, "resize")) {
+            const pane = req.pane orelse return error.MissingPane;
+            const rows = req.rows orelse return error.MissingSize;
+            const cols = req.cols orelse return error.MissingSize;
+            try ss.paneResize(pane, rows, cols);
+            self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "attach")) {
+            const pane = req.pane orelse return error.MissingPane;
+            if (ss.panes.get(pane) == null) return error.NoSuchPane;
+            // Mode-switch before replying: the ok line must be the last
+            // JSON this connection ever sees (broadcasts skip attached
+            // connections), so everything after it is pane bytes.
+            client.attached = pane;
+            self.reply(client, .{ .id = req.id, .ok = true });
         } else if (eql(u8, req.cmd, "save")) {
             const path = req.path orelse return error.MissingPath;
             try persist.save(self.alloc, ss, path);
@@ -405,22 +445,41 @@ pub const Server = struct {
     fn onSessionEvent(ud: ?*anyopaque, server: *session.Server, event: session.Event) void {
         const self: *Server = @ptrCast(@alignCast(ud.?));
         switch (event) {
-            .pane_output => |p| self.broadcast(.{ .event = "pane_output", .pane = p }),
+            .pane_output => |p| {
+                self.broadcast(.{ .event = "pane_output", .pane = p.pane });
+                for (self.clients.items) |client| {
+                    if (client.attached != p.pane) continue;
+                    writeAllSocket(client.fd, p.bytes) catch {
+                        client.closing = true;
+                    };
+                }
+            },
             .pane_bell => |p| self.broadcast(.{ .event = "pane_bell", .pane = p }),
-            .pane_exit => |e| self.broadcast(.{
-                .event = "pane_exit",
-                .pane = e.pane,
-                .exit_code = e.exit_code,
-            }),
+            .pane_exit => |e| {
+                self.broadcast(.{
+                    .event = "pane_exit",
+                    .pane = e.pane,
+                    .exit_code = e.exit_code,
+                });
+                // EOF raw attachments; their client loops end on read 0.
+                // shutdown(2), not close — the read completion stays live.
+                for (self.clients.items) |client| {
+                    if (client.attached != e.pane) continue;
+                    posix.shutdown(client.fd, .both) catch {};
+                }
+            },
         }
         if (self.downstream) |d| d.func(d.userdata, server, event);
     }
 
+    /// JSON to every protocol-mode client. Attached connections are raw
+    /// byte streams — a JSON line would corrupt them, so they are skipped.
     fn broadcast(self: *Server, payload: anytype) void {
         if (self.clients.items.len == 0) return;
         const json = std.fmt.allocPrint(self.alloc, "{f}\n", .{std.json.fmt(payload, .{})}) catch return;
         defer self.alloc.free(json);
         for (self.clients.items) |client| {
+            if (client.attached != null) continue;
             writeAllSocket(client.fd, json) catch {
                 client.closing = true;
             };
@@ -671,6 +730,94 @@ test "browser panes: host protocol round-trip" {
     const b = server.getBrowserPane(1).?;
     try std.testing.expectEqualStrings("Example Domain", b.title);
     try std.testing.expect(!b.loading);
+}
+
+/// Drives the attach transport end to end: spawn an interactive child,
+/// resize its pane, attach raw, type into it, read its raw output, and
+/// observe the EOF the server sends when the pane exits.
+const AttachTestClient = struct {
+    socket_path: []const u8,
+    err: ?anyerror = null,
+    resized_output_ok: bool = false,
+    saw_eof: bool = false,
+
+    fn run(self: *AttachTestClient) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *AttachTestClient) !void {
+        var control = try Client.connect(self.socket_path);
+        defer control.close();
+
+        try control.sendLine("{\"id\":1,\"cmd\":\"create-session\",\"title\":\"attach\"}");
+        _ = try waitFor(&control, "\"id\":1");
+
+        // An interactive child: waits for one line, reports its tty size.
+        try control.sendLine("{\"id\":2,\"cmd\":\"spawn-pane\",\"session\":1," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"read line; stty size\"]}");
+        const r2 = try waitFor(&control, "\"id\":2");
+        if (std.mem.indexOf(u8, r2, "\"pane\":1") == null) return error.SpawnFailed;
+
+        // Live resize: what an attached client sends on SIGWINCH.
+        try control.sendLine("{\"id\":3,\"cmd\":\"resize\",\"pane\":1,\"rows\":33,\"cols\":111}");
+        const r3 = try waitFor(&control, "\"id\":3");
+        if (std.mem.indexOf(u8, r3, "\"ok\":true") == null) return error.ResizeFailed;
+
+        // Second connection becomes the raw byte pipe.
+        var raw = try Client.connect(self.socket_path);
+        defer raw.close();
+        try raw.sendLine("{\"id\":1,\"cmd\":\"attach\",\"pane\":1}");
+        _ = try waitFor(&raw, "\"id\":1");
+
+        // Raw input: unblocks `read line`; the child then prints the
+        // size the resize command set.
+        try writeAllSocket(raw.fd, "\n");
+
+        var collected: [4096]u8 = undefined;
+        var len: usize = 0;
+        // Bytes that raced the ok reply are already pane output.
+        if (raw.end > raw.start) {
+            const pending = raw.buf[raw.start..raw.end];
+            @memcpy(collected[0..pending.len], pending);
+            len = pending.len;
+        }
+        while (len < collected.len) {
+            const n = posix.read(raw.fd, collected[len..]) catch 0;
+            if (n == 0) break; // pane exit half-closed the attachment
+            len += n;
+        }
+        self.saw_eof = true;
+        self.resized_output_ok = std.mem.indexOf(u8, collected[0..len], "33 111") != null;
+
+        try control.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&control, "\"id\":9");
+    }
+};
+
+test "attach: raw passthrough, live resize, exit EOF" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+
+    var tc: AttachTestClient = .{ .socket_path = socket_path };
+    const thread = try std.Thread.spawn(.{}, AttachTestClient.run, .{&tc});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
+    try std.testing.expect(tc.saw_eof);
+    try std.testing.expect(tc.resized_output_ok);
 }
 
 test "socket api: commands, events, save, shutdown" {

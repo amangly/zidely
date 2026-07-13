@@ -30,6 +30,7 @@ not an MVP experiment.
 | Agent model | Orchestrate external CLI agents first; native Zig agent later | Orchestration is cheap (agents are PTY processes) and delivers the value now; the native agent needs the editor and competes with Claude Code on day one. Both share pane/workspace plumbing. |
 | Worktrees | First-class managed worktree-per-agent-task with review → merge → clean-up | This is what makes parallel agents safe; worktree-awareness must live in the core data model from day one. Shell out to `git`; libgit2 only if necessary. |
 | Sessions | Server-shaped core library, in-process now, daemon later | Same library later runs detached → live session survival, SSH workspaces, mobile companion. Early "restore" = layout+cwd respawn, honestly labeled. |
+| Shell pane transport | libghostty surfaces run `zide attach <pane>` (the tmux-client model); attach = raw-passthrough mode on the control socket | Resolves the PTY-ownership tension: panes stay daemon-owned (survival, agents, CLI) while rendering is native ghostty GPU — cmux's remote-tmux-attach pattern. Any terminal can attach, not just our shell. |
 | Automation | The session-server message API doubles as the socket + CLI API | cmux's CLI/socket feature falls out of the architecture for free. |
 | Browser / preview | Platform webview (WKWebView, later WebKitGTK) in the shell | No one builds a browser engine; per-platform glue is unavoidable, so it lives in the shells. |
 | Config | Ghostty-style `key = value` file; per-project markdown memory when the native agent lands | Boring and proven. |

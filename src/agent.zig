@@ -222,7 +222,7 @@ pub const Manager = struct {
     fn onEvent(ud: ?*anyopaque, server: *session.Server, event: session.Event) void {
         const self: *Manager = @ptrCast(@alignCast(ud.?));
         switch (event) {
-            .pane_output => |pane| if (self.taskForPane(pane)) |task| {
+            .pane_output => |p| if (self.taskForPane(p.pane)) |task| {
                 task.last_output_ms = std.time.milliTimestamp();
                 if (task.status == .needs_attention) self.setStatus(task, .working);
                 self.ensureTimer();

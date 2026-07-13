@@ -46,10 +46,10 @@ shells will consume it as a library and stay thin.
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
-| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol: `host-register` + browser-open/navigate/eval routing |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing) and the `attach` command: raw PTY passthrough for terminal renderers (plus `resize` for their SIGWINCH) |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
-| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start |
+| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride |
 
 Support directories: `docs/` (decision record), `assets/` (logo +
 macOS iconset), `hosts/` (native prototypes built with swiftc only —
@@ -76,9 +76,12 @@ macOS iconset), `hosts/` (native prototypes built with swiftc only —
 ## Known gotchas
 
 - **ghostty is a fork pin**: `amangly/ghostty` branch `zide-v1.3.1` —
-  upstream v1.3.1 plus a build patch gating Darwin xcframework/app step
+  upstream v1.3.1 plus build patches: gating Darwin xcframework/app step
   construction (needs full Xcode otherwise; upstream main already has
-  the fix). Repin to upstream at the next Ghostty release.
+  the fix), constructing only the xcframework lib variants the target
+  needs (a native build must not resolve iOS SDKs), and
+  `GHOSTTY_METAL_DEVELOPER_DIR` for CLT-host Metal compiles. Repin to
+  upstream at the next Ghostty release; offer the last two upstream.
 - **Dependency emit flags**: consumers must pass
   `emit-xcframework=false` and `emit-macos-app=false` to the ghostty
   dependency — their defaults are *true* on Darwin hosts.
@@ -119,6 +122,19 @@ macOS iconset), `hosts/` (native prototypes built with swiftc only —
   errno yourself.
 - **Daemonize before the event loop exists**: kqueue descriptors do not
   survive fork; `zide daemon` double-forks first, then builds the server.
+- **Attached connections leave JSON forever**: after the `attach` ok
+  reply a connection is a raw byte pipe — `broadcast` must skip it (one
+  JSON line corrupts the stream) and the pane-exit path half-closes it
+  with `shutdown(2)` so the client sees EOF.
+- **Never set DEVELOPER_DIR globally for zig**: Zig 0.15.2 cannot link
+  under the macOS 26+ SDKs a new Xcode activates (missing-libSystem
+  errors; same failure as `macos-latest` CI). GhosttyKit needs full
+  Xcode only for the Metal compiler and `-create-xcframework`, so
+  `scripts/build-ghosttykit.sh` scopes it: zig under CLT,
+  `GHOSTTY_METAL_DEVELOPER_DIR` (fork patch) for metal/metallib, a PATH
+  shim for xcodebuild. Xcode 26+ also needs the Metal Toolchain
+  component downloaded once (`xcodebuild -downloadComponent
+  MetalToolchain`).
 
 ## Further reading
 

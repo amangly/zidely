@@ -14,8 +14,10 @@ foundation first, pixels when the core deserves them.
 - [x] Agent task manager: task → worktree → pane → status
 - [x] Attention detection: bell (parser-aware) + output quiescence
 - [ ] macOS Swift/AppKit shell: libghostty rendering, vertical tabs,
-      splits, notification rings (blocked on: full Xcode install;
-      a CLT-only proto-shell exists at hosts/macos-shell)
+      splits, notification rings (cmux-style: sidebar + terminal first;
+      a CLT-only proto-shell exists at hosts/macos-shell). Unblocked:
+  - [x] `zide attach` — raw PTY transport its surfaces ride
+  - [x] GhosttyKit.xcframework builds (scripts/build-ghosttykit.sh)
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

@@ -16,7 +16,9 @@ pub const PaneId = term.PaneId;
 
 pub const Event = union(enum) {
     /// The pane's terminal state changed; read it via paneSnapshot().
-    pane_output: PaneId,
+    /// `bytes` is the raw chunk that caused the change (for attached
+    /// raw-passthrough clients) — only valid during the callback.
+    pane_output: struct { pane: PaneId, bytes: []const u8 },
     /// The child rang the terminal bell — an explicit attention signal.
     pane_bell: PaneId,
     /// The pane's child exited and its PTY output is fully drained.
@@ -114,7 +116,7 @@ const PaneHandle = struct {
             std.log.warn("pane {d}: dropped {d} bytes of output: {}", .{ h.id, n, err });
         };
         if (h.server.handler) |handler| {
-            handler.emit(h.server, .{ .pane_output = h.id });
+            handler.emit(h.server, .{ .pane_output = .{ .pane = h.id, .bytes = h.read_buf[0..n] } });
             if (bell_count > 0) handler.emit(h.server, .{ .pane_bell = h.id });
         }
         return .rearm;
@@ -373,6 +375,15 @@ pub const Server = struct {
     pub fn paneSnapshot(self: *Server, id: PaneId, alloc: std.mem.Allocator) ![]const u8 {
         const h = self.panes.get(id) orelse return error.NoSuchPane;
         return h.pane.snapshot(alloc);
+    }
+
+    /// Resize a pane's PTY and terminal grid (an attached client's
+    /// window changed). The new size joins the persisted spawn recipe.
+    pub fn paneResize(self: *Server, id: PaneId, rows: u16, cols: u16) !void {
+        const h = self.panes.get(id) orelse return error.NoSuchPane;
+        try h.pane.resize(rows, cols);
+        h.rows = rows;
+        h.cols = cols;
     }
 
     /// Run the event loop until no registered work remains (i.e. every

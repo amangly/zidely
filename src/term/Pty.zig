@@ -83,6 +83,15 @@ pub fn setSize(self: *Pty, size: Winsize) !void {
         return error.IoctlFailed;
 }
 
+/// Window size of an arbitrary tty fd — e.g. the CLI's own stdout, for
+/// sizing an attached pane to the local terminal.
+pub fn ttySize(fd: posix.fd_t) !Winsize {
+    var ws: Winsize = undefined;
+    if (c.ioctl(fd, TIOCGWINSZ, @intFromPtr(&ws)) < 0)
+        return error.IoctlFailed;
+    return ws;
+}
+
 /// Called in the forked child, before exec: reset signal handlers,
 /// start a new session, and make the slave our controlling terminal.
 /// Only async-signal-safe operations allowed here.
