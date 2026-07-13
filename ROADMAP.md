@@ -13,11 +13,12 @@ foundation first, pixels when the core deserves them.
 - [x] Worktree-per-task provisioning (`zide/<slug>` branches)
 - [x] Agent task manager: task → worktree → pane → status
 - [x] Attention detection: bell (parser-aware) + output quiescence
-- [ ] macOS Swift/AppKit shell: libghostty rendering, vertical tabs,
-      splits, notification rings (cmux-style: sidebar + terminal first;
-      a CLT-only proto-shell exists at hosts/macos-shell). Unblocked:
-  - [x] `zide attach` — raw PTY transport its surfaces ride
+- [x] macOS Swift/AppKit shell (`macos/`, cmux-style): GPU libghostty
+      surfaces, sidebar of sessions/panes with attention dots, browser
+      panes, daemon-owned panes that survive the app
+  - [x] `zide attach` — raw PTY transport the surfaces ride
   - [x] GhosttyKit.xcframework builds (scripts/build-ghosttykit.sh)
+  - [ ] splits, vertical tabs per workspace, IME/preedit, agent-task UI
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

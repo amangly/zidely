@@ -15,10 +15,15 @@ git UI, and native agent with inline diffs.
 Think [cmux](https://cmux.com) + [terax](https://terax.app), combined, with
 the core written in Zig.
 
-**Status: pre-alpha.** The core library works — event-loop session server,
-PTY panes with real terminal state, worktree-isolated agent tasks, attention
-detection — but there is no UI shell yet. See [ROADMAP.md](ROADMAP.md) for
-where things stand.
+**Status: pre-alpha, but real.** The daemon runs sessions, PTY panes,
+worktree-isolated agent tasks and attention detection; the macOS app renders
+panes on GPU libghostty surfaces over a cmux-style sidebar. Panes live in the
+daemon, so they survive the app. Missing: splits, agent-task UI, the editor,
+Linux. See [ROADMAP.md](ROADMAP.md).
+
+```sh
+zig build && ./macos/build.sh && open macos/out/Zide.app
+```
 
 ## What it will be
 

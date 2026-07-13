@@ -377,6 +377,15 @@ pub const Server = struct {
         return h.pane.snapshot(alloc);
     }
 
+    /// Whether a pane's child has exited. Clients that connect after the
+    /// fact (a shell restarting onto a live daemon) have missed the
+    /// pane_exit event, so this state must be queryable, not just
+    /// broadcast.
+    pub fn paneExited(self: *Server, id: PaneId) bool {
+        const h = self.panes.get(id) orelse return false;
+        return h.exited;
+    }
+
     /// Resize a pane's PTY and terminal grid (an attached client's
     /// window changed). The new size joins the persisted spawn recipe.
     pub fn paneResize(self: *Server, id: PaneId, rows: u16, cols: u16) !void {

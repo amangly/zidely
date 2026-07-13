@@ -13,15 +13,16 @@ what exists today. Delivery status lives in [ROADMAP.md](ROADMAP.md).
 
 An AI-agent-multitasking terminal growing into an AI-native IDE
 (cmux + terax combined), built as a Zig core with native platform
-shells. macOS first, Linux second. Pre-alpha: the core library works,
-no UI shell yet.
+shells. macOS first, Linux second. Pre-alpha: the core library and the
+macOS shell both work; panes live in the daemon and survive the app.
 
 Verification commands (run before every commit):
 
 ```sh
 zig build test              # all tests, both module and CLI
 zig fmt src build.zig       # formatting (CI enforces --check)
-zig build run               # event-loop demo: two shells, one loop
+./macos/build.sh            # the macOS shell (builds GhosttyKit if needed)
+open macos/out/Zide.app     # the app; auto-starts the daemon
 ```
 
 ## Toolchain
@@ -51,10 +52,21 @@ shells will consume it as a library and stay thin.
 | `src/editor.zig` | Editor engine — empty until phase 3 |
 | `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride |
 
+The macOS shell (`macos/`, built by `macos/build.sh` with swiftc — no
+Xcode project):
+
+| Path | Responsibility |
+|---|---|
+| `macos/Sources/main.swift` | Entry point: finds the `zide` binary, auto-starts the daemon, `ghostty_init`, hands off to the controller |
+| `macos/Sources/GhosttyRuntime.swift` | The process-wide `ghostty_app_t` + runtime callbacks (wakeup/tick, clipboard, close); loads the user's own ghostty config so terminals look like their ghostty |
+| `macos/Sources/TerminalSurfaceView.swift` | One libghostty surface per pane; its child command is `zide attach <pane>`. Minimal port of Ghostty's SurfaceView input handling (keys, mouse, scroll, focus, resize) |
+| `macos/Sources/ShellController.swift` | The window: cmux-style sidebar (sessions, panes, attention dots), pane hosting, browser panes, menu/shortcuts |
+| `macos/Sources/SocketClient.swift` | JSON-lines client for the control socket |
+
 Support directories: `docs/` (decision record), `assets/` (logo +
-macOS iconset), `hosts/` (native prototypes built with swiftc only —
-`macos-shell/` is a windowed proto-shell over the socket protocol,
-`macos-browser/` a standalone WKWebView host; see their READMEs),
+macOS iconset), `hosts/macos-browser/` (standalone WKWebView host
+prototype, superseded by the shell's browser panes but kept as a
+minimal reference), `scripts/` (GhosttyKit build),
 `.github/workflows/` (CI).
 
 ## Conventions
@@ -126,6 +138,19 @@ macOS iconset), `hosts/` (native prototypes built with swiftc only —
   reply a connection is a raw byte pipe — `broadcast` must skip it (one
   JSON line corrupts the stream) and the pane-exit path half-closes it
   with `shutdown(2)` so the client sees EOF.
+- **Ghostty surfaces swallow ⌘-shortcuts**: libghostty has its own
+  keybindings (⌘T = new_tab) and consumes them in
+  `performKeyEquivalent` before the menu ever sees them — our action
+  callback then drops them, so the shortcut silently does nothing.
+  Shell-owned shortcuts must be refused explicitly
+  (`TerminalSurfaceView.shellShortcuts`).
+- **Late clients missed every event**: a shell connecting to a live
+  daemon never saw the `pane_exit` broadcasts that already happened.
+  Any state a client renders must be *queryable*, not broadcast-only —
+  that's why `list-sessions` reports `exited`.
+- **The app finds `zide` by walking up from the bundle**: running
+  `macos/out/Zide.app` from the dev tree works; a copy elsewhere (e.g.
+  /Applications) needs `ZIDE_BIN` until there's a real install layout.
 - **Never set DEVELOPER_DIR globally for zig**: Zig 0.15.2 cannot link
   under the macOS 26+ SDKs a new Xcode activates (missing-libSystem
   errors; same failure as `macos-latest` CI). GhosttyKit needs full

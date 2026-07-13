@@ -289,16 +289,24 @@ pub const Server = struct {
                 title: []const u8,
                 panes: []const session.PaneId,
                 browsers: []const session.PaneId,
+                /// Subset of `panes` whose child has exited. A client that
+                /// connects late never saw those pane_exit events.
+                exited: []const session.PaneId,
             };
             const infos = try arena.alloc(Info, ss.sessions.count());
             var it = ss.sessions.valueIterator();
             var i: usize = 0;
             while (it.next()) |s| : (i += 1) {
+                var exited: std.ArrayListUnmanaged(session.PaneId) = .empty;
+                for (s.panes.items) |p| {
+                    if (ss.paneExited(p)) try exited.append(arena, p);
+                }
                 infos[i] = .{
                     .id = s.id,
                     .title = s.title,
                     .panes = s.panes.items,
                     .browsers = s.browsers.items,
+                    .exited = exited.items,
                 };
             }
             self.reply(client, .{ .id = req.id, .ok = true, .sessions = infos });
