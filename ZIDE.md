@@ -63,11 +63,11 @@ Xcode project):
 | `macos/Sources/main.swift` | Entry point: finds the `zide` binary, auto-starts the daemon, `ghostty_init`, hands off to the controller; `ZIDE_UI_DEMO=1` enables chrome fixtures |
 | `macos/Sources/GhosttyRuntime.swift` | The process-wide `ghostty_app_t` + runtime callbacks (wakeup/tick, clipboard, close); loads the user's own ghostty config so terminals look like their ghostty |
 | `macos/Sources/TerminalSurfaceView.swift` | One libghostty surface per pane; its child command is `zide attach <pane>`. Minimal port of Ghostty's SurfaceView input handling (keys, mouse, scroll, focus, resize) |
-| `macos/Sources/ShellController.swift` | Window glue: view-model ↔ sidebar/host, review bar, menus/shortcuts (sidebar toggle, notifications, workspace jump), socket events; live panes attach into host panel slots |
+| `macos/Sources/ShellController.swift` | Window glue: view-model ↔ sidebar/host, menus/shortcuts (sidebar toggle, notifications, workspace jump), socket events, agent-pane detection; live panes attach into host panel slots |
 | `macos/Sources/ShellViewModel.swift` | Workspace/layout/notification view state; collapse, unread, surface selection, split ratio; `.demo()` fixtures, live `applyLive` + `applyPaneMeta` (cwd/branch/ports) |
 | `macos/Sources/ShellTheme.swift` | Chrome tokens (colors, fonts, spacing) |
 | `macos/Sources/SidebarView.swift` | Translucent sidebar, collapsible groups, footer actions |
-| `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, meta, status chips, pin, attention ring, unread badge |
+| `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, snippet, meta, pin, status dot, unread badge |
 | `macos/Sources/WorkspaceHostView.swift` | Surface tabs, draggable splits, panel slots, browser omnibar (live URL + Enter navigates) |
 | `macos/Sources/NotificationPanelView.swift` | Notification list panel (⌘⇧I) |
 | `macos/Sources/RightSidebarView.swift` | Right sidebar stub (⌘⌥B) |
