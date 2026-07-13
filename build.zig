@@ -6,8 +6,8 @@ pub fn build(b: *std.Build) void {
 
     // Core library: the UI-agnostic "session server" that platform shells
     // (macOS Swift app, Linux GTK app, dev CLI) link against.
-    const core = b.addModule("zidely", .{
-        .root_source_file = b.path("src/zidely.zig"),
+    const core = b.addModule("zide", .{
+        .root_source_file = b.path("src/zide.zig"),
         .target = target,
         .optimize = optimize,
         // PTY layer uses libc (openpty, ioctl); ghostty-vt's SIMD needs it too.
@@ -36,13 +36,13 @@ pub fn build(b: *std.Build) void {
     // Dev CLI: temporary entry point for exercising the core before the
     // native shells exist.
     const exe = b.addExecutable(.{
-        .name = "zidely",
+        .name = "zide",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zidely", .module = core },
+                .{ .name = "zide", .module = core },
             },
         }),
     });

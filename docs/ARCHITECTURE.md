@@ -1,4 +1,4 @@
-# zidely architecture
+# zide architecture
 
 Decision record from the founding design interview (2026-07-13). These are
 settled decisions; revisit deliberately, not accidentally.
@@ -39,7 +39,7 @@ not an MVP experiment.
 
 ## Dependency notes
 
-- **ghostty** is pinned to `amangly/ghostty@zidely-v1.3.1` — upstream
+- **ghostty** is pinned to `amangly/ghostty@zide-v1.3.1` — upstream
   v1.3.1 plus one build patch gating Darwin xcframework/app step
   *construction* behind the emit options (upstream main already has this
   fix). Without it, consuming the `ghostty-vt` module on a Mac without
@@ -64,7 +64,7 @@ not an MVP experiment.
 
 ```
 src/            Zig core (the product)
-  zidely.zig    library root
+  zide.zig    library root
   session.zig   session server — sessions, panes, the future daemon/API seam
   term.zig      PTY + libghostty surface wrapper
   agent.zig     agent task orchestration

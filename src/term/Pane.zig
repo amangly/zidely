@@ -154,7 +154,7 @@ pub fn snapshot(self: *Pane, alloc: std.mem.Allocator) ![]const u8 {
 test "pane captures child output through the vt engine" {
     const alloc = std.testing.allocator;
     var pane = try Pane.create(alloc, .{
-        .argv = &.{ "/bin/sh", "-c", "printf 'zidely\\033[1;32m-pty\\033[0m-ok\\n'" },
+        .argv = &.{ "/bin/sh", "-c", "printf 'zide\\033[1;32m-pty\\033[0m-ok\\n'" },
     });
     defer pane.destroy();
 
@@ -164,7 +164,7 @@ test "pane captures child output through the vt engine" {
     const snap = try pane.snapshot(alloc);
     defer alloc.free(snap);
     // SGR color sequences must have been consumed as styling, not text.
-    try std.testing.expect(std.mem.indexOf(u8, snap, "zidely-pty-ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "zide-pty-ok") != null);
 }
 
 test "child sees the requested terminal size" {

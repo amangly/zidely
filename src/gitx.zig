@@ -8,7 +8,7 @@
 
 const std = @import("std");
 
-pub const branch_prefix = "zidely/";
+pub const branch_prefix = "zide/";
 
 pub const Error = error{
     GitFailed,
@@ -19,7 +19,7 @@ pub const Error = error{
 /// A provisioned task worktree. Strings are owned by the creating
 /// allocator; release with deinit().
 pub const Worktree = struct {
-    /// Task branch, e.g. "zidely/fix-flaky-auth-tests".
+    /// Task branch, e.g. "zide/fix-flaky-auth-tests".
     branch: []const u8,
     /// Absolute path of the worktree directory.
     path: []const u8,
@@ -160,7 +160,7 @@ pub fn removeTaskWorktree(
 }
 
 /// Derive a branch name from a task description:
-/// "Fix flaky auth tests!" -> "zidely/fix-flaky-auth-tests".
+/// "Fix flaky auth tests!" -> "zide/fix-flaky-auth-tests".
 pub fn branchNameForTask(buf: []u8, description: []const u8) ![]const u8 {
     if (buf.len < branch_prefix.len) return error.NoSpaceLeft;
     @memcpy(buf[0..branch_prefix.len], branch_prefix);
@@ -190,7 +190,7 @@ pub fn branchNameForTask(buf: []u8, description: []const u8) ![]const u8 {
 test "branch name slugification" {
     var buf: [64]u8 = undefined;
     const name = try branchNameForTask(&buf, "Fix flaky auth tests!");
-    try std.testing.expectEqualStrings("zidely/fix-flaky-auth-tests", name);
+    try std.testing.expectEqualStrings("zide/fix-flaky-auth-tests", name);
 }
 
 test "branch name rejects empty descriptions" {
@@ -203,7 +203,7 @@ test "branch name rejects empty descriptions" {
 pub fn setupTestRepo(alloc: std.mem.Allocator, path: []const u8) !void {
     inline for (.{
         .{ "init", "-q", "-b", "main" },
-        .{ "-c", "user.name=zidely-test", "-c", "user.email=test@zidely.invalid", "commit", "-q", "--allow-empty", "-m", "init" },
+        .{ "-c", "user.name=zide-test", "-c", "user.email=test@zide.invalid", "commit", "-q", "--allow-empty", "-m", "init" },
     }) |args| {
         const out = try git(alloc, path, &args);
         alloc.free(out);
@@ -220,24 +220,24 @@ test "worktree lifecycle: create, collide, remove" {
     defer alloc.free(repo);
     try setupTestRepo(alloc, repo);
 
-    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
     defer alloc.free(wt_dir);
 
     var wt1 = try createTaskWorktree(alloc, repo, "Fix auth bug", .{ .worktrees_dir = wt_dir });
     defer wt1.deinit(alloc);
-    try std.testing.expectEqualStrings("zidely/fix-auth-bug", wt1.branch);
+    try std.testing.expectEqualStrings("zide/fix-auth-bug", wt1.branch);
     try std.fs.accessAbsolute(wt1.path, .{});
 
     // Same description again: branch and directory must not collide.
     var wt2 = try createTaskWorktree(alloc, repo, "Fix auth bug", .{ .worktrees_dir = wt_dir });
     defer wt2.deinit(alloc);
-    try std.testing.expectEqualStrings("zidely/fix-auth-bug-2", wt2.branch);
+    try std.testing.expectEqualStrings("zide/fix-auth-bug-2", wt2.branch);
     try std.fs.accessAbsolute(wt2.path, .{});
 
     // The worktree is a real checkout on the task branch.
     const head = try git(alloc, wt1.path, &.{ "rev-parse", "--abbrev-ref", "HEAD" });
     defer alloc.free(head);
-    try std.testing.expectEqualStrings("zidely/fix-auth-bug", head);
+    try std.testing.expectEqualStrings("zide/fix-auth-bug", head);
 
     try removeTaskWorktree(alloc, repo, wt1, .{ .delete_branch = true });
     try std.testing.expectError(error.FileNotFound, std.fs.accessAbsolute(wt1.path, .{}));

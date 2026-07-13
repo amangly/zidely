@@ -1,11 +1,11 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/logo-white-256.png">
-    <img src="assets/logo-256.png" alt="zidely logo" width="128">
+    <img src="assets/logo-256.png" alt="zide logo" width="128">
   </picture>
 </p>
 
-# zidely
+# zide
 
 A terminal built for running many AI coding agents in parallel, growing into
 a full AI-native development workspace. One app: multiplexer-grade terminal,
@@ -56,7 +56,7 @@ zig build run    # dev CLI (event-loop demo)
 
 | Doc | What's in it |
 |---|---|
-| [ZIDELY.md](ZIDELY.md) | Living project map: modules, conventions, gotchas |
+| [ZIDE.md](ZIDE.md) | Living project map: modules, conventions, gotchas |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions and their rationale |
 | [ROADMAP.md](ROADMAP.md) | Phase plan and status |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Environment setup and workflow |

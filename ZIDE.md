@@ -1,4 +1,4 @@
-# ZIDELY.md
+# ZIDE.md
 
 Living project document: architecture map, conventions, and gotchas.
 Written for both human contributors and AI agents (`CLAUDE.md` and
@@ -38,14 +38,14 @@ shells will consume it as a library and stay thin.
 
 | Path | Responsibility |
 |---|---|
-| `src/zidely.zig` | Library root; re-exports the modules below |
+| `src/zide.zig` | Library root; re-exports the modules below |
 | `src/session.zig` | Session server: owns the xev event loop, sessions, panes; emits `pane_output` / `pane_bell` / `pane_exit` through `EventHandler`. The seam that later becomes the daemon + automation socket |
 | `src/term.zig` | Terminal namespace: re-exports Pty, Pane, BellScanner |
 | `src/term/Pty.zig` | POSIX pseudo-terminal: openpty, sizing ioctls, child pre-exec setup |
 | `src/term/Pane.zig` | PTY-attached child process feeding a ghostty-vt Terminal (queryable screen state, no rendering) |
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
-| `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zidely/<slug>`), shells out to `git` |
+| `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), shells out to `git` |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
 | `src/main.zig` | Dev CLI (temporary; becomes the automation CLI) |
 
@@ -70,7 +70,7 @@ macOS iconset), `.github/workflows/` (CI).
 
 ## Known gotchas
 
-- **ghostty is a fork pin**: `amangly/ghostty` branch `zidely-v1.3.1` —
+- **ghostty is a fork pin**: `amangly/ghostty` branch `zide-v1.3.1` —
   upstream v1.3.1 plus a build patch gating Darwin xcframework/app step
   construction (needs full Xcode otherwise; upstream main already has
   the fix). Repin to upstream at the next Ghostty release.

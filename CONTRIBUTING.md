@@ -1,12 +1,12 @@
 # Contributing
 
-Pre-alpha: expect churn. Read [ZIDELY.md](ZIDELY.md) first — it's the
+Pre-alpha: expect churn. Read [ZIDE.md](ZIDE.md) first — it's the
 project map and lists the gotchas that will otherwise cost you an hour.
 
 ## Environment
 
 The only requirement for the core is **Zig 0.15.2, exactly** (it must
-match the ghostty dependency's pin — see ZIDELY.md):
+match the ghostty dependency's pin — see ZIDE.md):
 
 ```sh
 # macOS (arm64); adjust the tarball for your platform
@@ -36,11 +36,11 @@ zig build run           # sanity-check the demo when touching core I/O
 - Conventional Commits, short subjects.
 - Tests accompany the change, in the same module, preferring the
   existing integration style (real PTYs, real scratch git repos).
-- If your change invalidates ZIDELY.md, docs/ARCHITECTURE.md, or
+- If your change invalidates ZIDE.md, docs/ARCHITECTURE.md, or
   ROADMAP.md, update them in the same commit.
 
 ## CI
 
 GitHub Actions runs `zig build test` and `zig fmt --check` on
 `macos-15` and `ubuntu-latest`. The macOS runner is pinned — see the
-CI gotcha in ZIDELY.md before touching it.
+CI gotcha in ZIDE.md before touching it.

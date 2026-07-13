@@ -10,7 +10,7 @@ foundation first, pixels when the core deserves them.
 - [x] PTY layer (openpty, sizing, controlling-terminal child setup)
 - [x] Panes: PTY child feeding ghostty-vt terminal state
 - [x] Event-loop session server (libxev) with pane event stream
-- [x] Worktree-per-task provisioning (`zidely/<slug>` branches)
+- [x] Worktree-per-task provisioning (`zide/<slug>` branches)
 - [x] Agent task manager: task → worktree → pane → status
 - [x] Attention detection: bell (parser-aware) + output quiescence
 - [ ] macOS Swift/AppKit shell: libghostty rendering, vertical tabs,
@@ -20,7 +20,7 @@ foundation first, pixels when the core deserves them.
 ## Phase 2 — Automation & reach
 
 - [ ] Socket API (the session server's event/command stream, exposed)
-- [ ] `zidely` CLI against the socket
+- [ ] `zide` CLI against the socket
 - [ ] Embedded browser pane (WKWebView) with programmable API
 - [ ] Daemon mode: live session survival across UI restarts
 - [ ] SSH / remote workspaces

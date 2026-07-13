@@ -292,7 +292,7 @@ test "agent task runs in its own worktree and reports finish" {
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
     try gitx.setupTestRepo(alloc, repo);
-    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
     defer alloc.free(wt_dir);
 
     var server = try session.Server.init(alloc);
@@ -317,7 +317,7 @@ test "agent task runs in its own worktree and reports finish" {
     {
         const task = manager.get(task_id).?;
         try std.testing.expectEqual(Status.working, task.status);
-        try std.testing.expectEqualStrings("zidely/add-feature-x", task.worktree.branch);
+        try std.testing.expectEqualStrings("zide/add-feature-x", task.worktree.branch);
     }
 
     try server.run();
@@ -328,7 +328,7 @@ test "agent task runs in its own worktree and reports finish" {
 
     const snap = try server.paneSnapshot(task.pane, alloc);
     defer alloc.free(snap);
-    try std.testing.expect(std.mem.indexOf(u8, snap, "zidely/add-feature-x") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snap, "zide/add-feature-x") != null);
     try std.testing.expect(std.mem.indexOf(u8, snap, "agent-finished") != null);
 
     // The agent's commit landed on the task branch, not on main.
@@ -337,7 +337,7 @@ test "agent task runs in its own worktree and reports finish" {
     defer count_out.deinit(alloc);
     const res = try std.process.Child.run(.{
         .allocator = alloc,
-        .argv = &.{ "git", "-C", repo, "rev-list", "--count", "zidely/add-feature-x" },
+        .argv = &.{ "git", "-C", repo, "rev-list", "--count", "zide/add-feature-x" },
     });
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
@@ -353,7 +353,7 @@ test "cleanup refuses while the agent is still running" {
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
     try gitx.setupTestRepo(alloc, repo);
-    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
     defer alloc.free(wt_dir);
 
     var server = try session.Server.init(alloc);
@@ -405,7 +405,7 @@ test "quiet task flips to needs_attention and back on output" {
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
     try gitx.setupTestRepo(alloc, repo);
-    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
     defer alloc.free(wt_dir);
 
     var server = try session.Server.init(alloc);
@@ -457,7 +457,7 @@ test "bell flips to needs_attention immediately" {
     const repo = try tmp.dir.realpathAlloc(alloc, "repo");
     defer alloc.free(repo);
     try gitx.setupTestRepo(alloc, repo);
-    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zidely-worktrees" });
+    const wt_dir = try std.fs.path.join(alloc, &.{ repo, ".zide-worktrees" });
     defer alloc.free(wt_dir);
 
     var server = try session.Server.init(alloc);

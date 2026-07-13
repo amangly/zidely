@@ -1,4 +1,4 @@
-//! zidely core — UI-agnostic session server.
+//! zide core — UI-agnostic session server.
 //!
 //! Everything that is not pixels lives here: sessions, panes, PTYs, agent
 //! task orchestration, git worktree management, and (later) the editor
