@@ -1,9 +1,9 @@
 //! The `zide` CLI.
 //!
 //! `zide serve` hosts the session server and its control socket in the
-//! foreground (daemon mode later detaches this same thing). Every other
-//! subcommand is a client speaking the JSON-lines protocol from ipc.zig
-//! to a running server.
+//! foreground; `zide daemon` detaches the same thing so sessions survive
+//! the terminal. Every other subcommand is a client speaking the
+//! JSON-lines protocol from ipc.zig, auto-starting the daemon on demand.
 
 const std = @import("std");
 const posix = std.posix;
@@ -15,10 +15,12 @@ const usage =
     \\usage: zide <command> [args] [--socket PATH]
     \\
     \\server:
-    \\  serve [--state PATH]     host the session server on the socket;
+    \\  serve [--state PATH]     host the session server in the foreground;
     \\                           restores state on start, saves on shutdown
+    \\  daemon [--state PATH]    same, detached — sessions survive your
+    \\                           terminal (state/log/pid in ~/.zide)
     \\
-    \\client:
+    \\client (auto-starts the daemon, except ping/shutdown):
     \\  ping                     check the server is up
     \\  ls                       list sessions and their panes
     \\  new <title>              create a session, print its id
@@ -79,10 +81,13 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, cmd, "serve"))
         return cmdServe(gpa.allocator(), socket_path, state_opt);
+    if (std.mem.eql(u8, cmd, "daemon"))
+        return cmdDaemon(arena, gpa.allocator(), socket_path, state_opt);
 
-    // Everything else talks to a running server.
-    var client = zide.ipc.Client.connect(socket_path) catch
-        return fail("cannot connect to {s} — is `zide serve` running?\n", .{socket_path});
+    // Everything else talks to a running server, auto-starting the
+    // daemon for commands that imply one should exist.
+    const autostart = !(std.mem.eql(u8, cmd, "ping") or std.mem.eql(u8, cmd, "shutdown"));
+    var client = try connectOrStart(arena, socket_path, autostart);
     defer client.close();
 
     if (std.mem.eql(u8, cmd, "ping")) {
@@ -154,6 +159,105 @@ pub fn main() !void {
     }
 }
 
+extern "c" fn setsid() std.c.pid_t;
+
+/// Start the server detached: double-fork + setsid, stdio to the log
+/// file, pidfile written, then the ordinary serve loop. Runs before any
+/// event loop exists — kqueue descriptors do not survive fork. The
+/// launching process waits until the socket accepts, so a zero exit
+/// really means "ready".
+fn cmdDaemon(
+    arena: std.mem.Allocator,
+    alloc: std.mem.Allocator,
+    socket_path: []const u8,
+    state_opt: ?[]const u8,
+) !void {
+    const home = std.process.getEnvVarOwned(arena, "HOME") catch
+        return fail("daemon needs $HOME for ~/.zide\n", .{});
+    const dir = try std.fs.path.join(arena, &.{ home, ".zide" });
+    try std.fs.cwd().makePath(dir);
+
+    // The daemon chdirs to /; everything must be absolute before then.
+    const cwd = try std.process.getCwdAlloc(arena);
+    const state_path = if (state_opt) |sp|
+        try std.fs.path.resolve(arena, &.{ cwd, sp })
+    else
+        try std.fs.path.join(arena, &.{ dir, "state.json" });
+    const abs_socket = try std.fs.path.resolve(arena, &.{ cwd, socket_path });
+    const log_path = try std.fs.path.join(arena, &.{ dir, "daemon.log" });
+    const pid_path = try std.fs.path.join(arena, &.{ dir, "daemon.pid" });
+
+    const pid = try posix.fork();
+    if (pid != 0) {
+        // Launcher: report ready only once the socket accepts.
+        var attempts: usize = 0;
+        while (attempts < 60) : (attempts += 1) {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            var probe = zide.ipc.Client.connect(abs_socket) catch continue;
+            probe.close();
+            return stdout("daemon ready on {s} (log: {s})\n", .{ abs_socket, log_path });
+        }
+        return fail("daemon did not become ready; check {s}\n", .{log_path});
+    }
+
+    // Child: fully detach before any event-loop state exists.
+    if (setsid() < 0) posix.exit(1);
+    const pid2 = posix.fork() catch posix.exit(1);
+    if (pid2 != 0) posix.exit(0);
+    posix.chdir("/") catch {};
+
+    const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
+    posix.dup2(devnull, 0) catch posix.exit(1);
+    const log_fd = posix.open(log_path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+    }, 0o644) catch posix.exit(1);
+    posix.dup2(log_fd, 1) catch posix.exit(1);
+    posix.dup2(log_fd, 2) catch posix.exit(1);
+    if (devnull > 2) posix.close(devnull);
+    if (log_fd > 2) posix.close(log_fd);
+
+    if (std.fs.createFileAbsolute(pid_path, .{})) |pf| {
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}\n", .{std.c.getpid()}) catch unreachable;
+        pf.writeAll(s) catch {};
+        pf.close();
+    } else |_| {}
+
+    cmdServe(alloc, abs_socket, state_path) catch |err| {
+        std.debug.print("daemon error: {}\n", .{err});
+        posix.exit(1);
+    };
+    std.fs.deleteFileAbsolute(pid_path) catch {};
+    posix.exit(0);
+}
+
+/// Connect, optionally auto-starting the daemon tmux-style.
+fn connectOrStart(
+    arena: std.mem.Allocator,
+    socket_path: []const u8,
+    autostart: bool,
+) !zide.ipc.Client {
+    return zide.ipc.Client.connect(socket_path) catch {
+        if (!autostart)
+            return fail("cannot connect to {s} — is the zide daemon running?\n", .{socket_path});
+
+        const self_exe = try std.fs.selfExePathAlloc(arena);
+        var child = std.process.Child.init(&.{ self_exe, "daemon", "--socket", socket_path }, arena);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        // The launcher only exits 0 once the socket accepts.
+        const term = try child.wait();
+        if (term != .Exited or term.Exited != 0)
+            return fail("failed to auto-start the daemon on {s}\n", .{socket_path});
+        return zide.ipc.Client.connect(socket_path) catch
+            fail("daemon started but {s} is not accepting\n", .{socket_path});
+    };
+}
+
 fn cmdServe(alloc: std.mem.Allocator, socket_path: []const u8, state_path: ?[]const u8) !void {
     var server = try zide.session.Server.init(alloc);
     defer server.deinit();
@@ -201,9 +305,9 @@ fn stdout(comptime fmt: []const u8, fmt_args: anytype) !void {
     try std.fs.File.stdout().writeAll(s);
 }
 
-fn fail(comptime fmt: []const u8, fmt_args: anytype) error{CommandFailed} {
+fn fail(comptime fmt: []const u8, fmt_args: anytype) noreturn {
     std.debug.print(fmt, fmt_args);
-    return error.CommandFailed;
+    std.process.exit(1);
 }
 
 test {

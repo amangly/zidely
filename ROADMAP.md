@@ -22,7 +22,7 @@ foundation first, pixels when the core deserves them.
 - [x] Socket API (the session server's event/command stream, exposed)
 - [x] `zide` CLI against the socket
 - [ ] Embedded browser pane (WKWebView) with programmable API
-- [ ] Daemon mode: live session survival across UI restarts
+- [x] Daemon mode: live session survival across UI restarts
 - [ ] SSH / remote workspaces
 
 ## Phase 3 — Editor & git UI

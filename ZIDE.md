@@ -49,7 +49,7 @@ shells will consume it as a library and stay thin.
 | `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses |
 | `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
-| `src/main.zig` | The `zide` CLI: `serve` hosts the server+socket (restores/saves state), everything else is a client command |
+| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start |
 
 Support directories: `docs/` (decision record), `assets/` (logo +
 macOS iconset), `.github/workflows/` (CI).
@@ -109,6 +109,13 @@ macOS iconset), `.github/workflows/` (CI).
 - **`std.fs.File.writer()` is positional**: every fresh writer starts at
   offset 0 and overwrites redirected output. Use `writeAll` (or
   `writerStreaming`) for stdout.
+- **std posix wrappers panic on "impossible" errno**: e.g. macOS returns
+  EINVAL from setsockopt on a socket whose peer already disconnected,
+  which `std.posix.setsockopt` treats as unreachable. In server paths
+  that touch client-controlled sockets, call `std.c` directly and handle
+  errno yourself.
+- **Daemonize before the event loop exists**: kqueue descriptors do not
+  survive fork; `zide daemon` double-forks first, then builds the server.
 
 ## Further reading
 

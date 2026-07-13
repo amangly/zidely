@@ -175,9 +175,13 @@ pub const Server = struct {
         }
 
         // Writes to a vanished client must error, not raise SIGPIPE.
+        // Raw libc call: std's setsockopt treats EINVAL as unreachable,
+        // but macOS returns EINVAL when the peer already disconnected
+        // (e.g. a probe that connects and instantly closes) — a state
+        // any client can put us in, which must never panic the server.
         if (comptime builtin.os.tag.isDarwin()) {
             const one: c_int = 1;
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, std.mem.asBytes(&one)) catch {};
+            _ = std.c.setsockopt(fd, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, &one, @sizeOf(c_int));
         }
 
         const client = self.alloc.create(Connection) catch {
