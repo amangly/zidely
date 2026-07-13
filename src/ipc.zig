@@ -36,7 +36,6 @@ const posix = std.posix;
 const xev = @import("xev").Dynamic;
 const session = @import("session.zig");
 const persist = @import("persist.zig");
-const agent = @import("agent.zig");
 const gitx = @import("gitx.zig");
 const procinfo = @import("procinfo.zig");
 
@@ -57,11 +56,6 @@ const Request = struct {
     url: ?[]const u8 = null,
     seq: ?u64 = null,
     loading: ?bool = null,
-    repo: ?[]const u8 = null,
-    description: ?[]const u8 = null,
-    task: ?agent.TaskId = null,
-    delete_branch: ?bool = null,
-    force: ?bool = null,
 };
 
 const Connection = struct {
@@ -145,17 +139,10 @@ pub const Server = struct {
     /// The connection that renders webviews, if one registered.
     host: ?*Connection = null,
     downstream: ?session.EventHandler,
-    /// One agent manager per repo, created lazily on first task-create.
-    /// Ordered: their event handlers chain onto the session server and
-    /// must unwind LIFO on destroy.
-    managers: std.ArrayListUnmanaged(RepoManager) = .empty,
-    /// Task ids are global across repos: handed to each manager before
-    /// every startTask so shells never see colliding ids.
-    next_task_id: agent.TaskId = 1,
-    /// Bounded history of notification-worthy events (task attention /
-    /// finish, bells, exits). Broadcasts only reach clients that were
-    /// connected when they fired; a shell relaunching later rebuilds
-    /// its notification panel from this via the `notices` command.
+    /// Bounded history of notification-worthy events (bells, exits).
+    /// Broadcasts only reach clients that were connected when they
+    /// fired; a shell relaunching later rebuilds its notification
+    /// panel from this via the `notices` command.
     notices: std.ArrayListUnmanaged(Notice) = .empty,
     next_notice_seq: u64 = 1,
     shutting_down: bool = false,
@@ -167,20 +154,10 @@ pub const Server = struct {
         seq: u64,
         /// Unix milliseconds, so clients can render "5m ago".
         ts: i64,
-        /// "task_status" | "pane_bell" | "pane_exit" (static strings).
+        /// "pane_bell" | "pane_exit" (static strings).
         kind: []const u8,
         pane: ?session.PaneId = null,
-        task: ?agent.TaskId = null,
-        /// Static @tagName of the task status, for kind "task_status".
-        status: ?[]const u8 = null,
-        /// Owned copy of the task description.
-        description: ?[]const u8 = null,
         exit_code: ?u8 = null,
-    };
-
-    const RepoManager = struct {
-        repo: []const u8,
-        manager: *agent.Manager,
     };
 
     /// Create the socket at `socket_path` (an existing file there is
@@ -222,15 +199,6 @@ pub const Server = struct {
     /// Tear down bookkeeping. Only call once the event loop is drained
     /// (after `shutdown` ran, or when the loop will never run again).
     pub fn destroy(self: *Server) void {
-        // Managers chained their handlers after ours: unwind LIFO first.
-        while (self.managers.pop()) |rm| {
-            rm.manager.destroy();
-            self.alloc.free(rm.repo);
-        }
-        self.managers.deinit(self.alloc);
-        for (self.notices.items) |n| {
-            if (n.description) |d| self.alloc.free(d);
-        }
         self.notices.deinit(self.alloc);
         self.session_server.handler = self.downstream;
         for (self.clients.items) |client| {
@@ -605,110 +573,6 @@ pub const Server = struct {
             }
 
             self.reply(client, .{ .id = req.id, .ok = true, .panes = metas.items });
-        } else if (eql(u8, req.cmd, "task-create")) {
-            const repo = req.repo orelse return error.MissingRepo;
-            const desc = req.description orelse return error.MissingDescription;
-            const mgr = try self.managerFor(repo);
-
-            // Default agent: interactive Claude Code seeded with the task.
-            const default_argv = [_][]const u8{ "claude", desc };
-            const argv: []const []const u8 = req.argv orelse &default_argv;
-
-            mgr.next_task_id = self.next_task_id;
-            const tid = try mgr.startTask(.{
-                .description = desc,
-                .argv = argv,
-                .rows = req.rows orelse 24,
-                .cols = req.cols orelse 80,
-            });
-            self.next_task_id = mgr.next_task_id;
-
-            const task = mgr.get(tid).?;
-            self.reply(client, .{
-                .id = req.id,
-                .ok = true,
-                .task = tid,
-                .pane = task.pane,
-                .branch = task.worktree.branch,
-            });
-            self.broadcast(.{
-                .event = "task_status",
-                .task = tid,
-                .status = @tagName(task.status),
-                .pane = task.pane,
-                .description = desc,
-            });
-        } else if (eql(u8, req.cmd, "task-list")) {
-            var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena_state.deinit();
-            const arena = arena_state.allocator();
-
-            const TaskInfo = struct {
-                id: agent.TaskId,
-                description: []const u8,
-                status: []const u8,
-                /// Null for tasks restored after a daemon restart: no
-                /// live agent process, review/merge/discard only.
-                pane: ?session.PaneId,
-                repo: []const u8,
-                branch: []const u8,
-                exit_code: ?u8,
-            };
-            var infos: std.ArrayListUnmanaged(TaskInfo) = .empty;
-            for (self.managers.items) |rm| {
-                var it = rm.manager.tasks.valueIterator();
-                while (it.next()) |task_ptr| {
-                    const t = task_ptr.*;
-                    try infos.append(arena, .{
-                        .id = t.id,
-                        .description = t.description,
-                        .status = @tagName(t.status),
-                        .pane = t.pane,
-                        .repo = rm.repo,
-                        .branch = t.worktree.branch,
-                        .exit_code = t.exit_code,
-                    });
-                }
-            }
-            self.reply(client, .{ .id = req.id, .ok = true, .tasks = infos.items });
-        } else if (eql(u8, req.cmd, "task-cleanup")) {
-            const tid = req.task orelse return error.MissingTask;
-            const mgr = for (self.managers.items) |rm| {
-                if (rm.manager.get(tid) != null) break rm.manager;
-            } else return error.NoSuchTask;
-            try mgr.cleanupTask(tid, .{
-                .delete_branch = req.delete_branch orelse false,
-                .force = req.force orelse false,
-            });
-            self.reply(client, .{ .id = req.id, .ok = true });
-            self.broadcast(.{ .event = "task_removed", .task = tid });
-        } else if (eql(u8, req.cmd, "task-diff")) {
-            const tid = req.task orelse return error.MissingTask;
-            const mgr = for (self.managers.items) |rm| {
-                if (rm.manager.get(tid) != null) break rm.manager;
-            } else return error.NoSuchTask;
-            var review = try mgr.reviewTask(tid, self.alloc);
-            defer review.deinit(self.alloc);
-            // One diff line must fit the synchronous client's buffer
-            // (with JSON-escaping overhead on top).
-            const cap = 400 * 1024;
-            const diff = if (review.diff.len <= cap) review.diff else review.diff[0..cap];
-            self.reply(client, .{
-                .id = req.id,
-                .ok = true,
-                .diff = diff,
-                .truncated = review.diff.len > cap,
-                .commits = review.commits,
-                .dirty = review.dirty,
-            });
-        } else if (eql(u8, req.cmd, "task-merge")) {
-            const tid = req.task orelse return error.MissingTask;
-            const mgr = for (self.managers.items) |rm| {
-                if (rm.manager.get(tid) != null) break rm.manager;
-            } else return error.NoSuchTask;
-            try mgr.mergeTask(tid);
-            self.reply(client, .{ .id = req.id, .ok = true });
-            self.broadcast(.{ .event = "task_removed", .task = tid, .merged = true });
         } else if (eql(u8, req.cmd, "shutdown")) {
             self.reply(client, .{ .id = req.id, .ok = true });
             self.beginShutdown(client);
@@ -717,153 +581,26 @@ pub const Server = struct {
         }
     }
 
-    /// Save layout + agent-task records to `path`.
+    /// Save the session layout to `path`.
     pub fn saveState(self: *Server, path: []const u8) !void {
-        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        var records: std.ArrayListUnmanaged(persist.TaskRecord) = .empty;
-        var task_panes: std.ArrayListUnmanaged(session.PaneId) = .empty;
-        var agents_sessions: std.ArrayListUnmanaged(session.SessionId) = .empty;
-        for (self.managers.items) |rm| {
-            var it = rm.manager.tasks.valueIterator();
-            while (it.next()) |task_ptr| {
-                const t = task_ptr.*;
-                try records.append(arena, .{
-                    .repo = rm.repo,
-                    .description = t.description,
-                    .branch = t.worktree.branch,
-                    .path = t.worktree.path,
-                    .base = t.worktree.base,
-                });
-                if (t.pane) |p| try task_panes.append(arena, p);
-            }
-            // The manager's agents session is recreated by managerFor on
-            // the next adopt; persisting it too would duplicate it —
-            // unless the user parked non-task panes or browsers there.
-            if (self.session_server.sessions.get(rm.manager.session_id)) |sess| {
-                var only_tasks = sess.browsers.items.len == 0;
-                if (only_tasks) for (sess.panes.items) |p| {
-                    if (rm.manager.by_pane.get(p) == null) {
-                        only_tasks = false;
-                        break;
-                    }
-                };
-                if (only_tasks) try agents_sessions.append(arena, rm.manager.session_id);
-            }
-        }
-
-        try persist.save(self.alloc, self.session_server, path, .{
-            .tasks = records.items,
-            .exclude_panes = task_panes.items,
-            .exclude_sessions = agents_sessions.items,
-        });
+        try persist.save(self.alloc, self.session_server, path);
     }
 
-    /// Restore a layout and re-adopt agent tasks whose worktrees still
-    /// exist on disk (as pane-less, review-only tasks — their agent
-    /// processes died with the previous daemon).
+    /// Restore a layout saved by saveState.
     pub fn restoreState(self: *Server, path: []const u8) !persist.RestoreResult {
-        const parsed = try persist.load(self.alloc, path);
-        defer parsed.deinit();
-        const result = try persist.apply(self.session_server, parsed.value);
-
-        for (parsed.value.tasks) |rec| {
-            std.fs.accessAbsolute(rec.path, .{}) catch continue; // worktree gone
-            const mgr = try self.managerFor(rec.repo);
-            mgr.next_task_id = self.next_task_id;
-            _ = try mgr.adoptTask(.{
-                .description = rec.description,
-                .branch = rec.branch,
-                .path = rec.path,
-                .base = rec.base,
-            });
-            self.next_task_id = mgr.next_task_id;
-        }
-        return result;
+        return persist.restore(self.alloc, self.session_server, path);
     }
 
-    /// The agent manager for a repo, created on first use along with the
-    /// session its task panes live in.
-    fn managerFor(self: *Server, repo: []const u8) !*agent.Manager {
-        for (self.managers.items) |rm| {
-            if (std.mem.eql(u8, rm.repo, repo)) return rm.manager;
-        }
-
-        const title = try std.fmt.allocPrint(self.alloc, "agents: {s}", .{std.fs.path.basename(repo)});
-        defer self.alloc.free(title);
-        const sid = try self.session_server.createSession(title);
-
-        const wt_dir = try std.fs.path.join(self.alloc, &.{ repo, ".zide-worktrees" });
-        defer self.alloc.free(wt_dir);
-        const mgr = try agent.Manager.create(self.alloc, self.session_server, sid, .{
-            .repo = repo,
-            .worktrees_dir = wt_dir,
-        });
-        errdefer mgr.destroy();
-        mgr.task_handler = .{ .userdata = self, .func = onTaskEvent };
-
-        const repo_owned = try self.alloc.dupe(u8, repo);
-        errdefer self.alloc.free(repo_owned);
-        try self.managers.append(self.alloc, .{ .repo = repo_owned, .manager = mgr });
-        return mgr;
-    }
-
-    fn onTaskEvent(ud: ?*anyopaque, manager: *agent.Manager, event: agent.TaskEvent) void {
-        const self: *Server = @ptrCast(@alignCast(ud.?));
-        const task = manager.get(event.task) orelse return;
-        self.broadcast(.{
-            .event = "task_status",
-            .task = event.task,
-            .status = @tagName(event.status),
-            .pane = task.pane,
-            .description = task.description,
-            .exit_code = task.exit_code,
-        });
-        // History keeps only the notification-worthy states — `working`
-        // is live state (task-list), and recording it would let the
-        // constant working↔needs_attention flapping churn the ring.
-        if (event.status == .working) return;
-        // Same task, same status as its latest entry: a flap, not news.
-        var i = self.notices.items.len;
-        while (i > 0) {
-            i -= 1;
-            const n = self.notices.items[i];
-            if (n.task != event.task) continue;
-            if (n.status) |s| if (std.mem.eql(u8, s, @tagName(event.status))) return;
-            break;
-        }
-        self.addNotice(.{
-            .seq = 0,
-            .ts = 0,
-            .kind = "task_status",
-            .task = event.task,
-            .pane = task.pane,
-            .status = @tagName(event.status),
-            .description = task.description,
-            .exit_code = task.exit_code,
-        });
-    }
-
-    /// Append to the notice ring: stamps seq + time, deep-copies the
-    /// description, evicts the oldest entry past capacity.
+    /// Append to the notice ring: stamps seq + time, evicts the oldest
+    /// entry past capacity.
     fn addNotice(self: *Server, notice: Notice) void {
         var n = notice;
         n.seq = self.next_notice_seq;
         n.ts = std.time.milliTimestamp();
-        n.description = if (notice.description) |d|
-            self.alloc.dupe(u8, d) catch return
-        else
-            null;
         if (self.notices.items.len >= max_notices) {
-            const old = self.notices.orderedRemove(0);
-            if (old.description) |d| self.alloc.free(d);
+            _ = self.notices.orderedRemove(0);
         }
-        self.notices.append(self.alloc, n) catch {
-            if (n.description) |d| self.alloc.free(d);
-            return;
-        };
+        self.notices.append(self.alloc, n) catch return;
         self.next_notice_seq += 1;
     }
 
@@ -968,8 +705,7 @@ pub const Server = struct {
 /// lines interleave with responses and are surfaced by readLine too.
 pub const Client = struct {
     fd: posix.socket_t,
-    /// Sized for a whole task-diff response on one JSON line (the
-    /// server caps diffs at 400 KiB before escaping).
+    /// Sized for large single-line JSON responses (snapshots, metas).
     buf: [1024 * 1024]u8 = undefined,
     start: usize = 0,
     end: usize = 0,
@@ -1072,6 +808,7 @@ const TestClient = struct {
     saw_exit_event: bool = false,
     snapshot_ok: bool = false,
     kill_remove_ok: bool = false,
+    notices_ok: bool = false,
 
     fn run(self: *TestClient) void {
         self.runInner() catch |err| {
@@ -1123,6 +860,15 @@ const TestClient = struct {
         try client.sendLine("{\"id\":10,\"cmd\":\"list-sessions\"}");
         const r10 = try waitFor(&client, "\"id\":10");
         self.kill_remove_ok = std.mem.indexOf(u8, r10, "\"panes\":[1]") != null;
+
+        // Notice history: exits are queryable by clients that connect
+        // after the broadcasts fired; `seq` filters to newer entries.
+        try client.sendLine("{\"id\":11,\"cmd\":\"notices\"}");
+        const r11 = try waitFor(&client, "\"id\":11");
+        try client.sendLine("{\"id\":12,\"cmd\":\"notices\",\"seq\":999999}");
+        const r12 = try waitFor(&client, "\"id\":12");
+        self.notices_ok = std.mem.indexOf(u8, r11, "\"pane_exit\"") != null and
+            std.mem.indexOf(u8, r12, "\"notices\":[]") != null;
 
         var save_buf: [512]u8 = undefined;
         const save_req = try std.fmt.bufPrint(&save_buf, "{{\"id\":4,\"cmd\":\"save\",\"path\":\"{s}\"}}", .{self.state_path});
@@ -1349,156 +1095,6 @@ test "attach: raw passthrough, live resize, exit EOF" {
     try std.testing.expect(tc.late_replay_ok);
 }
 
-/// Drives the agent-task protocol end to end: create a task (fake
-/// agent in a real scratch repo), see it in task-list, watch the
-/// task_status stream to finished, clean it up, see task_removed.
-const TaskTestClient = struct {
-    socket_path: []const u8,
-    repo: []const u8,
-    err: ?anyerror = null,
-    listed_ok: bool = false,
-    finished_ok: bool = false,
-    removed_ok: bool = false,
-    diff_ok: bool = false,
-    merged_ok: bool = false,
-    panes_gone: bool = false,
-    notices_ok: bool = false,
-    notices_since_ok: bool = false,
-
-    fn run(self: *TaskTestClient) void {
-        self.runInner() catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn runInner(self: *TaskTestClient) !void {
-        var client = try Client.connect(self.socket_path);
-        defer client.close();
-
-        var buf: [1024]u8 = undefined;
-        const create = try std.fmt.bufPrint(&buf, "{{\"id\":1,\"cmd\":\"task-create\"," ++
-            "\"repo\":\"{s}\",\"description\":\"prove the harness\"," ++
-            "\"argv\":[\"/bin/sh\",\"-c\",\"git rev-parse --abbrev-ref HEAD; echo task-done\"]}}", .{self.repo});
-        try client.sendLine(create);
-        const r1 = try waitFor(&client, "\"id\":1");
-        if (std.mem.indexOf(u8, r1, "\"ok\":true") == null) return error.CreateFailed;
-        if (std.mem.indexOf(u8, r1, "zide/prove-the-harness") == null) return error.NoBranch;
-
-        try client.sendLine("{\"id\":2,\"cmd\":\"task-list\"}");
-        const r2 = try waitFor(&client, "\"id\":2");
-        self.listed_ok = std.mem.indexOf(u8, r2, "prove the harness") != null and
-            std.mem.indexOf(u8, r2, self.repo) != null;
-
-        // The agent exits on its own; status must reach finished.
-        while (true) {
-            const line = try client.readLine();
-            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
-            if (std.mem.indexOf(u8, line, "\"finished\"") == null) continue;
-            self.finished_ok = true;
-            break;
-        }
-
-        try client.sendLine("{\"id\":3,\"cmd\":\"task-cleanup\",\"task\":1," ++
-            "\"delete_branch\":true,\"force\":true}");
-        _ = try waitFor(&client, "\"id\":3");
-        _ = try waitFor(&client, "\"task_removed\"");
-        try client.sendLine("{\"id\":4,\"cmd\":\"task-list\"}");
-        const r4 = try waitFor(&client, "\"id\":4");
-        self.removed_ok = std.mem.indexOf(u8, r4, "prove the harness") == null;
-
-        // Second task commits work; review it and merge it over the socket.
-        const create2 = try std.fmt.bufPrint(&buf, "{{\"id\":5,\"cmd\":\"task-create\"," ++
-            "\"repo\":\"{s}\",\"description\":\"commit some work\"," ++
-            "\"argv\":[\"/bin/sh\",\"-c\",\"echo diffable-content > agent.txt && git add . && " ++
-            "git -c user.name=t -c user.email=t@t.invalid commit -qm work\"]}}", .{self.repo});
-        try client.sendLine(create2);
-        _ = try waitFor(&client, "\"id\":5");
-        while (true) {
-            const line = try client.readLine();
-            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
-            if (std.mem.indexOf(u8, line, "\"finished\"") != null) break;
-        }
-
-        try client.sendLine("{\"id\":6,\"cmd\":\"task-diff\",\"task\":2}");
-        const r6 = try waitFor(&client, "\"id\":6");
-        self.diff_ok = std.mem.indexOf(u8, r6, "diffable-content") != null and
-            std.mem.indexOf(u8, r6, "\"commits\":1") != null and
-            std.mem.indexOf(u8, r6, "\"dirty\":false") != null;
-
-        try client.sendLine("{\"id\":7,\"cmd\":\"task-merge\",\"task\":2}");
-        const r7 = try waitFor(&client, "\"id\":7");
-        self.merged_ok = std.mem.indexOf(u8, r7, "\"ok\":true") != null;
-        _ = try waitFor(&client, "\"task_removed\"");
-
-        // Cleanup removed the dead agent panes from their session too.
-        try client.sendLine("{\"id\":8,\"cmd\":\"list-sessions\"}");
-        const r8 = try waitFor(&client, "\"id\":8");
-        self.panes_gone = std.mem.indexOf(u8, r8, "\"panes\":[]") != null;
-
-        // Notice history: a client connecting only now — the app
-        // relaunching — still sees what happened, even for the task
-        // that was already cleaned up.
-        try client.sendLine("{\"id\":10,\"cmd\":\"notices\"}");
-        const r10 = try waitFor(&client, "\"id\":10");
-        self.notices_ok = std.mem.indexOf(u8, r10, "\"finished\"") != null and
-            std.mem.indexOf(u8, r10, "prove the harness") != null and
-            std.mem.indexOf(u8, r10, "commit some work") != null and
-            std.mem.indexOf(u8, r10, "pane_exit") != null;
-
-        // `seq` filters to entries newer than the given sequence.
-        try client.sendLine("{\"id\":11,\"cmd\":\"notices\",\"seq\":999999}");
-        const r11 = try waitFor(&client, "\"id\":11");
-        self.notices_since_ok = std.mem.indexOf(u8, r11, "\"notices\":[]") != null;
-
-        try client.sendLine("{\"id\":9,\"cmd\":\"shutdown\"}");
-        _ = try waitFor(&client, "\"id\":9");
-    }
-};
-
-test "agent tasks over the socket: create, list, status stream, cleanup" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir);
-    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
-    defer alloc.free(socket_path);
-
-    try tmp.dir.makeDir("repo");
-    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
-    defer alloc.free(repo);
-    try gitx.setupTestRepo(alloc, repo);
-
-    var server = try session.Server.init(alloc);
-    defer server.deinit();
-    var ipc_server = try Server.create(alloc, &server, socket_path);
-    defer ipc_server.destroy();
-
-    var tc: TaskTestClient = .{ .socket_path = socket_path, .repo = repo };
-    const thread = try std.Thread.spawn(.{}, TaskTestClient.run, .{&tc});
-    try server.run();
-    thread.join();
-
-    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
-    try std.testing.expect(tc.listed_ok);
-    try std.testing.expect(tc.finished_ok);
-    try std.testing.expect(tc.removed_ok);
-    try std.testing.expect(tc.diff_ok);
-    try std.testing.expect(tc.merged_ok);
-    try std.testing.expect(tc.panes_gone);
-    try std.testing.expect(tc.notices_ok);
-    try std.testing.expect(tc.notices_since_ok);
-
-    // The merged task's work is on the repo's branch.
-    const res = try std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = &.{ "git", "-C", repo, "show", "main:agent.txt" },
-    });
-    defer alloc.free(res.stdout);
-    defer alloc.free(res.stderr);
-    try std.testing.expectEqualStrings("diffable-content\n", res.stdout);
-}
-
 const MetaTestClient = struct {
     socket_path: []const u8,
     repo: []const u8,
@@ -1568,137 +1164,6 @@ test "panes-meta reports cwd and git status over the socket" {
     try std.testing.expect(tc.meta_ok);
 }
 
-/// Phase 1 of the restart test: run a committing agent task, save, quit.
-const RestartPhase1 = struct {
-    socket_path: []const u8,
-    repo: []const u8,
-    state_path: []const u8,
-    err: ?anyerror = null,
-
-    fn run(self: *RestartPhase1) void {
-        self.runInner() catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn runInner(self: *RestartPhase1) !void {
-        var client = try Client.connect(self.socket_path);
-        defer client.close();
-
-        var buf: [1024]u8 = undefined;
-        const create = try std.fmt.bufPrint(&buf, "{{\"id\":1,\"cmd\":\"task-create\"," ++
-            "\"repo\":\"{s}\",\"description\":\"survive the restart\"," ++
-            "\"argv\":[\"/bin/sh\",\"-c\",\"echo persistent-work > survivor.txt && git add . && " ++
-            "git -c user.name=t -c user.email=t@t.invalid commit -qm work\"]}}", .{self.repo});
-        try client.sendLine(create);
-        _ = try waitFor(&client, "\"id\":1");
-        while (true) {
-            const line = try client.readLine();
-            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
-            if (std.mem.indexOf(u8, line, "\"finished\"") != null) break;
-        }
-
-        const save_req = try std.fmt.bufPrint(&buf, "{{\"id\":2,\"cmd\":\"save\",\"path\":\"{s}\"}}", .{self.state_path});
-        try client.sendLine(save_req);
-        _ = try waitFor(&client, "\"id\":2");
-        try client.sendLine("{\"id\":3,\"cmd\":\"shutdown\"}");
-        _ = try waitFor(&client, "\"id\":3");
-    }
-};
-
-/// Phase 2: against the restarted daemon, the task is back — pane-less
-/// but mergeable.
-const RestartPhase2 = struct {
-    socket_path: []const u8,
-    err: ?anyerror = null,
-    restored_ok: bool = false,
-    merged_ok: bool = false,
-
-    fn run(self: *RestartPhase2) void {
-        self.runInner() catch |err| {
-            self.err = err;
-        };
-    }
-
-    fn runInner(self: *RestartPhase2) !void {
-        var client = try Client.connect(self.socket_path);
-        defer client.close();
-
-        try client.sendLine("{\"id\":1,\"cmd\":\"task-list\"}");
-        const r1 = try waitFor(&client, "\"id\":1");
-        self.restored_ok = std.mem.indexOf(u8, r1, "survive the restart") != null and
-            std.mem.indexOf(u8, r1, "\"pane\":null") != null and
-            std.mem.indexOf(u8, r1, "\"finished\"") != null;
-
-        try client.sendLine("{\"id\":2,\"cmd\":\"task-merge\",\"task\":1}");
-        const r2 = try waitFor(&client, "\"id\":2");
-        self.merged_ok = std.mem.indexOf(u8, r2, "\"ok\":true") != null;
-
-        try client.sendLine("{\"id\":3,\"cmd\":\"shutdown\"}");
-        _ = try waitFor(&client, "\"id\":3");
-    }
-};
-
-test "agent tasks survive a daemon restart as reviewable orphans" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(dir);
-    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
-    defer alloc.free(socket_path);
-    const state_path = try std.fs.path.join(alloc, &.{ dir, "state.json" });
-    defer alloc.free(state_path);
-
-    try tmp.dir.makeDir("repo");
-    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
-    defer alloc.free(repo);
-    try gitx.setupTestRepo(alloc, repo);
-
-    // First daemon generation: task runs, state saves, daemon dies.
-    {
-        var server = try session.Server.init(alloc);
-        defer server.deinit();
-        var ipc_server = try Server.create(alloc, &server, socket_path);
-        defer ipc_server.destroy();
-
-        var p1: RestartPhase1 = .{ .socket_path = socket_path, .repo = repo, .state_path = state_path };
-        const thread = try std.Thread.spawn(.{}, RestartPhase1.run, .{&p1});
-        try server.run();
-        thread.join();
-        try std.testing.expectEqual(@as(?anyerror, null), p1.err);
-    }
-
-    // Second generation restores: the agents session must not be
-    // duplicated, the task must be back without a pane.
-    var server = try session.Server.init(alloc);
-    defer server.deinit();
-    var ipc_server = try Server.create(alloc, &server, socket_path);
-    defer ipc_server.destroy();
-    _ = try ipc_server.restoreState(state_path);
-
-    try std.testing.expectEqual(@as(usize, 1), server.sessions.count());
-    try std.testing.expectEqual(@as(usize, 0), server.panes.count());
-
-    var p2: RestartPhase2 = .{ .socket_path = socket_path };
-    const thread = try std.Thread.spawn(.{}, RestartPhase2.run, .{&p2});
-    try server.run();
-    thread.join();
-
-    try std.testing.expectEqual(@as(?anyerror, null), p2.err);
-    try std.testing.expect(p2.restored_ok);
-    try std.testing.expect(p2.merged_ok);
-
-    // The orphaned task's work landed on main; nothing left behind.
-    const res = try std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = &.{ "git", "-C", repo, "show", "main:survivor.txt" },
-    });
-    defer alloc.free(res.stdout);
-    defer alloc.free(res.stderr);
-    try std.testing.expectEqualStrings("persistent-work\n", res.stdout);
-}
-
 test "socket api: commands, events, save, shutdown" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1726,6 +1191,7 @@ test "socket api: commands, events, save, shutdown" {
     try std.testing.expect(client.saw_exit_event);
     try std.testing.expect(client.snapshot_ok);
     try std.testing.expect(client.kill_remove_ok);
+    try std.testing.expect(client.notices_ok);
 
     // The save command persisted a restorable layout.
     var restored = try session.Server.init(alloc);

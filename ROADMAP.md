@@ -4,15 +4,21 @@ Phases from the founding design (see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)). Order is deliberate:
 foundation first, pixels when the core deserves them.
 
-## Phase 1 — Multiplexer core + agent orchestration
+> **Pivot (2026-07-14):** the managed agent-task machinery
+> (worktree-per-task provisioning, task manager, review → merge flow,
+> task persistence) was removed. AI agents — claude, codex, and
+> friends — run as ordinary processes in ordinary panes; the shell
+> detects them (foreground command), surfaces their live status line
+> in the sidebar, and treats their bells as attention. The removed
+> implementation lives in git history if it is ever wanted back.
+
+## Phase 1 — Multiplexer core
 
 - [x] Repo, toolchain pin (Zig 0.15.2), CI (macOS + Linux)
 - [x] PTY layer (openpty, sizing, controlling-terminal child setup)
 - [x] Panes: PTY child feeding ghostty-vt terminal state
 - [x] Event-loop session server (libxev) with pane event stream
-- [x] Worktree-per-task provisioning (`zide/<slug>` branches)
-- [x] Agent task manager: task → worktree → pane → status
-- [x] Attention detection: bell (parser-aware) + output quiescence
+- [x] Attention detection: parser-aware bell
 - [x] macOS Swift/AppKit shell (`macos/`, cmux-style): GPU libghostty
       surfaces, sidebar of sessions/panes with attention dots, browser
       panes, daemon-owned panes that survive the app
@@ -22,18 +28,13 @@ foundation first, pixels when the core deserves them.
         every attachment — new surfaces and late attachers start from
         the real screen, not blank
   - [x] GhosttyKit.xcframework builds (scripts/build-ghosttykit.sh)
-  - [x] agent tasks end-to-end: socket surface (`task-create/list/cleanup`,
-        `task_status` stream), `zide task/tasks/task-rm` CLI, sidebar
-        AGENT TASKS section with attention rings (verified with a real
-        Claude Code agent in a worktree)
-  - [x] task review → merge → cleanup: `task-diff`/`task-merge` on the
-        socket, `zide task-diff`/`task-merge` CLI, and a review bar in
-        the app (colored diff, Merge & Remove, Discard) — merge refuses
-        dirty worktrees and aborts cleanly on conflicts
-  - [ ] splits, vertical tabs per workspace, IME/preedit
-  - [x] agent tasks persist across daemon restarts: saved as records,
-        re-adopted pane-less (review/merge/discard only — re-running an
-        agent command fresh could redo or undo work)
+  - [x] agent-aware sidebar: panes running claude/codex/… light up
+        (working / needs-attention) and show the pane's live status
+        line, driven by `panes-meta` (foreground command + last
+        screen line)
+  - [x] real splits (⌘D/⌘⇧D spawn daemon panes), close-on-exit panes
+  - [ ] daemon-side split layout (splits surviving app restarts),
+        IME/preedit
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach
@@ -43,21 +44,21 @@ foundation first, pixels when the core deserves them.
 - [x] Embedded browser pane (WKWebView) with programmable API
       (prototype host; moves into the Swift shell when it lands)
 - [x] Daemon mode: live session survival across UI restarts
-- [x] `panes-meta`: per-pane cwd, git branch/dirty, listening ports
-      (the sidebar metadata the shell shows)
+- [x] `panes-meta`: per-pane cwd, git branch/dirty, listening ports,
+      foreground command, last screen line (the sidebar metadata the
+      shell shows)
 - [x] `notices`: daemon-side history of attention-worthy events
-      (task attention/finished, bells, exits) — the shell's
-      notification panel can survive app restarts
+      (bells, exits) — the shell's notification panel survives app
+      restarts
+- [x] `kill-pane` / `remove-pane`: real close semantics for panes
 - [ ] SSH / remote workspaces
 
 ## Phase 3 — Editor & git UI
 
 - [ ] Editor core: rope buffers, tree-sitter, LSP client, Vim emulation
 - [ ] GPU text renderer (CoreText/HarfBuzz shaping)
-- [ ] Git UI: commit graph, hunk staging, worktree review/merge flow
+- [ ] Git UI: commit graph, hunk staging
 
-## Phase 4 — Native agent & Linux
+## Phase 4 — Linux
 
-- [ ] Native agent loop (provider-abstracted, local-LLM support)
-- [ ] AI edit diffs inline in the editor
 - [ ] GTK shell + Linux packaging

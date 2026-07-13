@@ -1,16 +1,10 @@
-//! Session persistence: layout + cwd respawn, and agent-task records.
+//! Session persistence: layout + cwd respawn.
 //!
 //! Saves every session's title and each pane's spawn recipe (argv, cwd,
 //! size) as versioned JSON; restore recreates the sessions and respawns
 //! the panes fresh. Processes are not checkpointed. A saved cwd that no
 //! longer exists makes that pane's child exit immediately (code 125);
 //! the pane still restores.
-//!
-//! Agent tasks are the exception to respawning: re-running an agent
-//! command from scratch could redo (or undo) work, so task panes are
-//! excluded from the layout and tasks are saved as records instead —
-//! the ipc layer re-adopts them as pane-less, review-only tasks (see
-//! agent.Manager.adoptTask).
 
 const std = @import("std");
 const session = @import("session.zig");
@@ -34,43 +28,16 @@ const SavedSession = struct {
     browsers: []const SavedBrowser = &.{},
 };
 
-/// An agent task's durable identity: enough to re-adopt its worktree
-/// for review/merge/discard after a restart.
-pub const TaskRecord = struct {
-    repo: []const u8,
-    description: []const u8,
-    branch: []const u8,
-    path: []const u8,
-    base: []const u8,
-};
-
 pub const SavedState = struct {
     version: u32 = format_version,
     sessions: []const SavedSession = &.{},
-    tasks: []const TaskRecord = &.{},
 };
 
-pub const SaveOptions = struct {
-    /// Agent-task records to persist alongside the layout.
-    tasks: []const TaskRecord = &.{},
-    /// Panes to leave out of the layout (live agent panes).
-    exclude_panes: []const session.PaneId = &.{},
-    /// Sessions to leave out entirely (agents sessions that would
-    /// serialize empty once their task panes are excluded).
-    exclude_sessions: []const session.SessionId = &.{},
-};
-
-fn contains(comptime T: type, haystack: []const T, needle: T) bool {
-    for (haystack) |h| if (h == needle) return true;
-    return false;
-}
-
-/// Write the server's current layout (and task records) to `path`.
+/// Write the server's current layout to `path`.
 pub fn save(
     alloc: std.mem.Allocator,
     server: *session.Server,
     path: []const u8,
-    opts: SaveOptions,
 ) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
@@ -79,11 +46,8 @@ pub fn save(
     var sessions: std.ArrayListUnmanaged(SavedSession) = .empty;
     var it = server.sessions.valueIterator();
     while (it.next()) |s| {
-        if (contains(session.SessionId, opts.exclude_sessions, s.id)) continue;
-
         var panes: std.ArrayListUnmanaged(SavedPane) = .empty;
         for (s.panes.items) |pane_id| {
-            if (contains(session.PaneId, opts.exclude_panes, pane_id)) continue;
             const h = server.panes.get(pane_id) orelse continue;
             try panes.append(arena, .{ .argv = h.argv, .cwd = h.cwd, .rows = h.rows, .cols = h.cols });
         }
@@ -99,7 +63,7 @@ pub fn save(
         });
     }
 
-    const state: SavedState = .{ .sessions = sessions.items, .tasks = opts.tasks };
+    const state: SavedState = .{ .sessions = sessions.items };
     const json = try std.fmt.allocPrint(arena, "{f}\n", .{
         std.json.fmt(state, .{ .whitespace = .indent_2 }),
     });
@@ -131,8 +95,7 @@ pub fn load(alloc: std.mem.Allocator, path: []const u8) !std.json.Parsed(SavedSt
 }
 
 /// Recreate a loaded layout into `server`: sessions are created and
-/// panes respawned with their saved argv/cwd/size. Task records are the
-/// caller's to re-adopt (the ipc layer owns agent managers).
+/// panes respawned with their saved argv/cwd/size.
 pub fn apply(server: *session.Server, state: SavedState) !RestoreResult {
     var result: RestoreResult = .{ .sessions = 0, .panes = 0 };
     for (state.sessions) |s| {
@@ -155,7 +118,7 @@ pub fn apply(server: *session.Server, state: SavedState) !RestoreResult {
     return result;
 }
 
-/// Load + apply, for callers with no agent managers (tests, embedding).
+/// Load + apply.
 pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const u8) !RestoreResult {
     const parsed = try load(alloc, path);
     defer parsed.deinit();
@@ -181,7 +144,7 @@ test "save and restore session layout" {
             .cols = 90,
         });
         try server.run();
-        try save(alloc, &server, state_path, .{});
+        try save(alloc, &server, state_path);
     }
 
     var server = try session.Server.init(alloc);

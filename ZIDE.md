@@ -13,8 +13,11 @@ what exists today. Delivery status lives in [ROADMAP.md](ROADMAP.md).
 
 An AI-agent-multitasking terminal growing into an AI-native IDE
 (cmux + terax combined), built as a Zig core with native platform
-shells. macOS first, Linux second. Pre-alpha: the core library and the
-macOS shell both work; panes live in the daemon and survive the app.
+shells. AI agents (claude, codex, ...) run as ordinary processes in
+ordinary panes; the shell detects and surfaces them — there is no
+managed task machinery (removed 2026-07-14; it lives in git history).
+macOS first, Linux second. Pre-alpha: the core library and the macOS
+shell both work; panes live in the daemon and survive the app.
 
 Verification commands (run before every commit):
 
@@ -45,13 +48,12 @@ shells will consume it as a library and stay thin.
 | `src/term/Pty.zig` | POSIX pseudo-terminal: openpty, sizing ioctls, child pre-exec setup |
 | `src/term/Pane.zig` | PTY-attached child process feeding a ghostty-vt Terminal (queryable screen state, no rendering); `replayBytes` serializes that state back to VT bytes for attach repaints |
 | `src/term/bell.zig` | Parser-aware BEL detection (ignores OSC/DCS string terminators) |
-| `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
-| `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), review (diff vs the recorded base *commit*, including uncommitted work via intent-to-add) and merge (refuses dirty worktrees; aborts on conflict). Shells out to `git` |
-| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing), the `attach` command (raw PTY passthrough for terminal renderers, plus `resize`; every attachment opens with a state replay — VT bytes reconstructing the pane's content, colors, cursor, and modes — so renderers never start blank), and the agent-task surface: `task-create`/`task-list`/`task-cleanup` with `task_status`/`task_removed` events — one lazily created `agent.Manager` (+ its `agents: <repo>` session) per repo, task ids kept globally unique by the socket layer. `panes-meta` returns per-pane cwd / git branch+dirty / listening ports for status displays. `kill-pane` HUPs a pane's child and `remove-pane` drops the *finished* pane from its session (`pane_removed` event) — two steps because removal must come from request context, never from inside the pane's own event callback. `notices` returns a bounded history (256) of attention-worthy events — task needs_attention/finished (flap-deduped), bells, pane exits, each with seq + unix-ms timestamp — so a shell relaunching after the broadcasts fired rebuilds its notification panel (`{"cmd":"notices","seq":<last-seen>}` returns only newer entries) |
-| `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) and agent-task records as versioned JSON (v2). Task panes are excluded from respawn; the ipc layer re-adopts tasks as pane-less review-only orphans (`restoreState`/`saveState`) |
+| `src/gitx.zig` | Git introspection: repo status (branch, dirty) for pane metadata. Shells out to `git` |
+| `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing), the `attach` command (raw PTY passthrough for terminal renderers, plus `resize`; every attachment opens with a state replay — VT bytes reconstructing the pane's content, colors, cursor, and modes — so renderers never start blank), `panes-meta` returns per-pane cwd / git branch+dirty / listening ports / foreground command / last screen line for status displays. `kill-pane` HUPs a pane's child and `remove-pane` drops the *finished* pane from its session (`pane_removed` event) — two steps because removal must come from request context, never from inside the pane's own event callback. `notices` returns a bounded history (256) of attention-worthy events — bells and pane exits, each with seq + unix-ms timestamp — so a shell relaunching after the broadcasts fired rebuilds its notification panel (`{"cmd":"notices","seq":<last-seen>}` returns only newer entries) |
+| `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
 | `src/procinfo.zig` | Live process introspection: child cwd (libproc / /proc), process-tree snapshot via `ps`, listening TCP ports via `lsof` — descendants matter because shells put jobs in their own process groups |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
-| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride. `zide task <desc>` starts an agent task in the cwd's repo (default agent: `claude`) and attaches; `tasks` / `task-rm` list and clean up |
+| `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride. |
 
 The macOS shell (`macos/`, built by `macos/build.sh` with swiftc — no
 Xcode project):
@@ -89,9 +91,9 @@ minimal reference), `scripts/` (GhosttyKit build),
   pattern throughout: integration-style tests that spawn real processes
   on real PTYs and real scratch git repos (`std.testing.tmpDir`).
 - Heap-pin anything the kernel or a callback holds a pointer to
-  (Pane, PaneHandle, Manager are `create()`/`destroy()` for this reason).
+  (Pane and PaneHandle are `create()`/`destroy()` for this reason).
 - Event handlers chain: install yours, keep the previous one as
-  `downstream`, forward everything (see `agent.Manager.onEvent`).
+  `downstream`, forward everything (see `ipc.Server.onSessionEvent`).
 - New dependencies need a pin rationale in docs/ARCHITECTURE.md's
   dependency notes. Prefer the exact versions Ghostty pins (libxev is).
 
@@ -165,16 +167,6 @@ minimal reference), `scripts/` (GhosttyKit build),
   auto-starts is `zig-out/bin/zide`, so run plain `zig build` before
   manual testing or you will debug a stale daemon (an auto-started one
   outlives the app, too — `zide shutdown` between runs).
-- **Diffing untracked files dirties the index**: `git diff` ignores
-  untracked files, so review intent-to-adds everything, then `git reset`
-  to undo it — otherwise the worktree stays permanently "dirty" and
-  merge refuses forever.
-- **Attach replay bursts are not small**: the state replay that opens
-  every attachment includes all scrollback content as escape sequences
-  — test buffers and readers must not assume the first read is pane
-  output, or that it fits in 4 KiB. The replay deliberately skips the
-  palette (OSC 4): indexes must resolve against the *renderer's* theme,
-  and a palette override would outlive detach in a real terminal.
 - **Never set DEVELOPER_DIR globally for zig**: Zig 0.15.2 cannot link
   under the macOS 26+ SDKs a new Xcode activates (missing-libSystem
   errors; same failure as `macos-latest` CI). GhosttyKit needs full

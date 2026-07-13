@@ -1,13 +1,13 @@
 //! zide core — UI-agnostic session server.
 //!
-//! Everything that is not pixels lives here: sessions, panes, PTYs, agent
-//! task orchestration, git worktree management, and (later) the editor
-//! engine. Platform shells (macOS Swift app, Linux GTK app, the dev CLI)
-//! talk to this library through a message-passing API so that the same
-//! core can later run as a detached daemon.
+//! Everything that is not pixels lives here: sessions, panes, PTYs, git
+//! introspection, and (later) the editor engine. Platform shells (macOS
+//! Swift app, Linux GTK app, the dev CLI) talk to this library through
+//! a message-passing API so that the same core can later run as a
+//! detached daemon. AI agents (claude, codex, ...) run as ordinary
+//! processes in ordinary panes — the shell detects and surfaces them.
 
 pub const session = @import("session.zig");
-pub const agent = @import("agent.zig");
 pub const gitx = @import("gitx.zig");
 pub const term = @import("term.zig");
 pub const ipc = @import("ipc.zig");

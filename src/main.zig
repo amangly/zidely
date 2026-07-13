@@ -27,23 +27,13 @@ const usage =
     \\  spawn <session> <cmd..>  spawn a pane in a session, print its id
     \\  attach <pane>            take over the terminal: raw passthrough
     \\                           to the pane (detach: ctrl-\)
-    \\  task <description..>     start an agent task: worktree + branch +
-    \\                           agent pane in this repo, then attach
-    \\                           (--repo PATH, --agent CMD; default: claude)
-    \\  tasks                    list agent tasks and their status
-    \\  task-diff <id>           show everything a task changed (works
-    \\                           mid-run; pipe it to a pager)
-    \\  task-merge <id>          merge a finished task into the repo's
-    \\                           current branch, then clean it up
-    \\  task-rm <id>             discard a finished task's worktree
-    \\                           (--branch deletes its branch, --force)
     \\  send <pane> <text>       send text + newline to a pane
     \\  snapshot <pane>          print a pane's screen contents
     \\  kill <pane>              hang up a pane's child and remove the
     \\                           pane from its session
     \\  meta                     cwd, git branch, listening ports per pane
-    \\  notices [--since N]      recent attention-worthy events (task
-    \\                           status changes, bells, exits)
+    \\  notices [--since N]      recent attention-worthy events
+    \\                           (bells, exits)
     \\  browse <session> <url>   open a browser pane, print its id
     \\  nav <pane> <url>         navigate a browser pane
     \\  eval <pane> <js>         run JS in a browser pane (needs a host)
@@ -63,8 +53,6 @@ const BaseResponse = struct {
     session: ?u64 = null,
     pane: ?u64 = null,
     snapshot: ?[]const u8 = null,
-    task: ?u64 = null,
-    branch: ?[]const u8 = null,
 };
 
 pub fn main() !void {
@@ -81,10 +69,6 @@ pub fn main() !void {
     // Split trailing args into options and positionals.
     var socket_opt: ?[]const u8 = null;
     var state_opt: ?[]const u8 = null;
-    var repo_opt: ?[]const u8 = null;
-    var agent_opt: ?[]const u8 = null;
-    var branch_flag = false;
-    var force_flag = false;
     var since_opt: u64 = 0;
     var pos: std.ArrayList([]const u8) = .empty;
     var i: usize = 2;
@@ -97,18 +81,6 @@ pub fn main() !void {
             i += 1;
             if (i == args.len) return fail("--state needs a path\n", .{});
             state_opt = args[i];
-        } else if (std.mem.eql(u8, args[i], "--repo")) {
-            i += 1;
-            if (i == args.len) return fail("--repo needs a path\n", .{});
-            repo_opt = args[i];
-        } else if (std.mem.eql(u8, args[i], "--agent")) {
-            i += 1;
-            if (i == args.len) return fail("--agent needs a command\n", .{});
-            agent_opt = args[i];
-        } else if (std.mem.eql(u8, args[i], "--branch")) {
-            branch_flag = true;
-        } else if (std.mem.eql(u8, args[i], "--force")) {
-            force_flag = true;
         } else if (std.mem.eql(u8, args[i], "--since")) {
             i += 1;
             if (i == args.len) return fail("--since needs a sequence number\n", .{});
@@ -177,121 +149,6 @@ pub fn main() !void {
         if (pos.items.len != 1) return fail("usage: zide attach <pane>\n", .{});
         const pane = try std.fmt.parseInt(u64, pos.items[0], 10);
         try cmdAttach(arena, &client, socket_path, pane);
-    } else if (std.mem.eql(u8, cmd, "task")) {
-        if (pos.items.len == 0)
-            return fail("usage: zide task <description..> [--repo PATH] [--agent CMD]\n", .{});
-        const desc = try std.mem.join(arena, " ", pos.items);
-
-        const repo = repo_opt orelse blk: {
-            const res = std.process.Child.run(.{
-                .allocator = arena,
-                .argv = &.{ "git", "rev-parse", "--show-toplevel" },
-            }) catch return fail("cannot run git; use --repo PATH\n", .{});
-            if (res.term != .Exited or res.term.Exited != 0)
-                return fail("not inside a git repository; use --repo PATH\n", .{});
-            break :blk std.mem.trim(u8, res.stdout, " \n");
-        };
-
-        // --agent overrides the server's default (claude). Shell-style
-        // word splitting so quoted sub-commands survive
-        // ("--agent \"sh -c 'a && b'\""); the description is always the
-        // final argument.
-        var argv_override: ?[]const []const u8 = null;
-        if (agent_opt) |a| {
-            const words = shellWords(arena, a) catch
-                return fail("--agent: unbalanced quote\n", .{});
-            if (words.len == 0) return fail("--agent needs a command\n", .{});
-            var list: std.ArrayList([]const u8) = .empty;
-            try list.appendSlice(arena, words);
-            try list.append(arena, desc);
-            argv_override = list.items;
-        }
-
-        const resp = try roundtrip(arena, &client, .{
-            .id = 1,
-            .cmd = "task-create",
-            .repo = repo,
-            .description = desc,
-            .argv = argv_override,
-        });
-        try stdout("task {d} — {s} (pane {d})\n", .{
-            resp.task.?, resp.branch orelse "?", resp.pane.?,
-        });
-        if (posix.isatty(posix.STDOUT_FILENO)) {
-            try cmdAttach(arena, &client, socket_path, resp.pane.?);
-        }
-    } else if (std.mem.eql(u8, cmd, "tasks")) {
-        try client.sendLine("{\"id\":1,\"cmd\":\"task-list\"}");
-        const Tasks = struct {
-            ok: bool = false,
-            @"error": ?[]const u8 = null,
-            tasks: []const struct {
-                id: u64,
-                description: []const u8,
-                status: []const u8,
-                pane: ?u64 = null,
-                repo: []const u8,
-                branch: []const u8,
-                exit_code: ?u8 = null,
-            } = &.{},
-        };
-        const parsed = try client.readResponse(Tasks, arena);
-        if (!parsed.value.ok) return fail("error: {s}\n", .{parsed.value.@"error" orelse "unknown"});
-        if (parsed.value.tasks.len == 0) {
-            try stdout("no agent tasks\n", .{});
-        }
-        for (parsed.value.tasks) |t| {
-            var pane_buf: [32]u8 = undefined;
-            const pane_str = if (t.pane) |p|
-                try std.fmt.bufPrint(&pane_buf, "pane {d}", .{p})
-            else
-                "no pane (restored)";
-            try stdout("{d}  [{s}]  {s}  —  {s}, {s}, {s}\n", .{
-                t.id, t.status, t.description, pane_str, t.branch, t.repo,
-            });
-        }
-    } else if (std.mem.eql(u8, cmd, "task-diff")) {
-        if (pos.items.len != 1) return fail("usage: zide task-diff <id>\n", .{});
-        const tid = try std.fmt.parseInt(u64, pos.items[0], 10);
-        try client.sendLine(try std.fmt.allocPrint(
-            arena,
-            "{{\"id\":1,\"cmd\":\"task-diff\",\"task\":{d}}}",
-            .{tid},
-        ));
-        const Diff = struct {
-            ok: bool = false,
-            @"error": ?[]const u8 = null,
-            diff: []const u8 = "",
-            commits: u32 = 0,
-            dirty: bool = false,
-            truncated: bool = false,
-        };
-        const parsed = try client.readResponse(Diff, arena);
-        if (!parsed.value.ok) return fail("error: {s}\n", .{parsed.value.@"error" orelse "unknown"});
-        try stdout("# task {d}: {d} commit(s){s}{s}\n", .{
-            tid,
-            parsed.value.commits,
-            if (parsed.value.dirty) ", uncommitted changes" else "",
-            if (parsed.value.truncated) ", diff truncated" else "",
-        });
-        try stdout("{s}\n", .{parsed.value.diff});
-    } else if (std.mem.eql(u8, cmd, "task-merge")) {
-        if (pos.items.len != 1) return fail("usage: zide task-merge <id>\n", .{});
-        const tid = try std.fmt.parseInt(u64, pos.items[0], 10);
-        _ = try roundtrip(arena, &client, .{ .id = 1, .cmd = "task-merge", .task = tid });
-        try stdout("task {d} merged and cleaned up\n", .{tid});
-    } else if (std.mem.eql(u8, cmd, "task-rm")) {
-        if (pos.items.len != 1)
-            return fail("usage: zide task-rm <id> [--branch] [--force]\n", .{});
-        const tid = try std.fmt.parseInt(u64, pos.items[0], 10);
-        _ = try roundtrip(arena, &client, .{
-            .id = 1,
-            .cmd = "task-cleanup",
-            .task = tid,
-            .delete_branch = branch_flag,
-            .force = force_flag,
-        });
-        try stdout("task {d} cleaned up\n", .{tid});
     } else if (std.mem.eql(u8, cmd, "notices")) {
         try client.sendLine(try std.fmt.allocPrint(
             arena,
@@ -306,9 +163,6 @@ pub fn main() !void {
                 ts: i64,
                 kind: []const u8,
                 pane: ?u64 = null,
-                task: ?u64 = null,
-                status: ?[]const u8 = null,
-                description: ?[]const u8 = null,
                 exit_code: ?u8 = null,
             } = &.{},
         };
@@ -318,11 +172,7 @@ pub fn main() !void {
             try stdout("no notices\n", .{});
         }
         for (parsed.value.notices) |n| {
-            if (n.task) |t| {
-                try stdout("{d}  task {d} {s}  —  {s}\n", .{
-                    n.seq, t, n.status orelse "?", n.description orelse "",
-                });
-            } else if (std.mem.eql(u8, n.kind, "pane_exit")) {
+            if (std.mem.eql(u8, n.kind, "pane_exit")) {
                 try stdout("{d}  pane {d} exited ({d})\n", .{
                     n.seq, n.pane orelse 0, n.exit_code orelse 0,
                 });
@@ -758,102 +608,6 @@ fn stdout(comptime fmt: []const u8, fmt_args: anytype) !void {
 fn fail(comptime fmt: []const u8, fmt_args: anytype) noreturn {
     std.debug.print(fmt, fmt_args);
     std.process.exit(1);
-}
-
-/// POSIX-shell-style word splitting for `--agent`: single quotes are
-/// literal, double quotes group with backslash escapes, backslash
-/// escapes the next byte outside quotes. No expansion of any kind.
-fn shellWords(arena: std.mem.Allocator, input: []const u8) ![]const []const u8 {
-    var words: std.ArrayList([]const u8) = .empty;
-    var word: std.ArrayList(u8) = .empty;
-    var in_word = false;
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        const c = input[i];
-        switch (c) {
-            ' ', '\t', '\n' => {
-                if (in_word) {
-                    try words.append(arena, try word.toOwnedSlice(arena));
-                    in_word = false;
-                }
-            },
-            '\'' => {
-                in_word = true;
-                const close = std.mem.indexOfScalarPos(u8, input, i + 1, '\'') orelse
-                    return error.UnbalancedQuote;
-                try word.appendSlice(arena, input[i + 1 .. close]);
-                i = close;
-            },
-            '"' => {
-                in_word = true;
-                i += 1;
-                while (true) : (i += 1) {
-                    if (i >= input.len) return error.UnbalancedQuote;
-                    switch (input[i]) {
-                        '"' => break,
-                        '\\' => {
-                            i += 1;
-                            if (i >= input.len) return error.UnbalancedQuote;
-                            try word.append(arena, input[i]);
-                        },
-                        else => try word.append(arena, input[i]),
-                    }
-                }
-            },
-            '\\' => {
-                in_word = true;
-                i += 1;
-                if (i >= input.len) return error.UnbalancedQuote;
-                try word.append(arena, input[i]);
-            },
-            else => {
-                in_word = true;
-                try word.append(arena, c);
-            },
-        }
-    }
-    if (in_word) try words.append(arena, try word.toOwnedSlice(arena));
-    return words.items;
-}
-
-test shellWords {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const simple = try shellWords(arena, "codex --yolo");
-    try std.testing.expectEqual(@as(usize, 2), simple.len);
-    try std.testing.expectEqualStrings("codex", simple[0]);
-    try std.testing.expectEqualStrings("--yolo", simple[1]);
-
-    // The case that used to break: a quoted sub-command stays one word.
-    const quoted = try shellWords(arena, "sh -c 'echo a && echo b'");
-    try std.testing.expectEqual(@as(usize, 3), quoted.len);
-    try std.testing.expectEqualStrings("sh", quoted[0]);
-    try std.testing.expectEqualStrings("-c", quoted[1]);
-    try std.testing.expectEqualStrings("echo a && echo b", quoted[2]);
-
-    const double = try shellWords(arena, "run \"a \\\"b\\\" c\" tail");
-    try std.testing.expectEqual(@as(usize, 3), double.len);
-    try std.testing.expectEqualStrings("a \"b\" c", double[1]);
-
-    // Adjacent quoted/unquoted segments concatenate, shell-style.
-    const glued = try shellWords(arena, "--flag='x y'z");
-    try std.testing.expectEqual(@as(usize, 1), glued.len);
-    try std.testing.expectEqualStrings("--flag=x yz", glued[0]);
-
-    const escaped = try shellWords(arena, "echo one\\ word");
-    try std.testing.expectEqual(@as(usize, 2), escaped.len);
-    try std.testing.expectEqualStrings("one word", escaped[1]);
-
-    // An empty quoted string is a real (empty) argument.
-    const empty_arg = try shellWords(arena, "prog ''");
-    try std.testing.expectEqual(@as(usize, 2), empty_arg.len);
-    try std.testing.expectEqualStrings("", empty_arg[1]);
-
-    try std.testing.expectError(error.UnbalancedQuote, shellWords(arena, "sh -c 'oops"));
-    try std.testing.expectError(error.UnbalancedQuote, shellWords(arena, "sh -c \"oops"));
-    try std.testing.expectEqual(@as(usize, 0), (try shellWords(arena, "   ")).len);
 }
 
 test {

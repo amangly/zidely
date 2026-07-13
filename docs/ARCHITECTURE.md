@@ -27,8 +27,7 @@ not an MVP experiment.
 | Terminal engine | Embed libghostty, pinned to Ghostty v1.3.1 | World-class VT + GPU rendering in Zig; exactly what cmux does. Spend our years on the IDE/agent layer, not a VT parser. Pins us to Zig 0.15.2. |
 | Editor | Own Zig core: rope buffers, tree-sitter (C FFI), LSP client, Vim emulation | The editor is the IDE's identity; owning the buffer model makes AI inline diffs and agent edits first-class. Zed/Helix each walked this path. |
 | Editor rendering | Custom Zig GPU text renderer in core (CoreText/HarfBuzz shaping via FFI) | Written once, identical on both platforms; code is monospace so grid-plus-overlays suffices, no rich-text layout needed. |
-| Agent model | Orchestrate external CLI agents first; native Zig agent later | Orchestration is cheap (agents are PTY processes) and delivers the value now; the native agent needs the editor and competes with Claude Code on day one. Both share pane/workspace plumbing. |
-| Worktrees | First-class managed worktree-per-agent-task with review → merge → clean-up | This is what makes parallel agents safe; worktree-awareness must live in the core data model from day one. Shell out to `git`; libgit2 only if necessary. |
+| Agent model | AI agents (claude, codex, …) run as ordinary processes in ordinary panes; the shell detects them (foreground command) and surfaces status/attention | **Revised 2026-07-14.** The original decision was managed worktree-per-task orchestration with a review → merge flow; it shipped, and was then removed — existing agent CLIs already own that workflow, and the managed layer duplicated them. The implementation lives in git history if it is ever wanted back. Users who want isolation create worktrees themselves and run agents in panes there. |
 | Sessions | Server-shaped core library, in-process now, daemon later | Same library later runs detached → live session survival, SSH workspaces, mobile companion. Early "restore" = layout+cwd respawn, honestly labeled. |
 | Shell pane transport | libghostty surfaces run `zide attach <pane>` (the tmux-client model); attach = raw-passthrough mode on the control socket | Resolves the PTY-ownership tension: panes stay daemon-owned (survival, agents, CLI) while rendering is native ghostty GPU — cmux's remote-tmux-attach pattern. Any terminal can attach, not just our shell. |
 | Automation | The session-server message API doubles as the socket + CLI API | cmux's CLI/socket feature falls out of the architecture for free. |
@@ -56,14 +55,13 @@ not an MVP experiment.
 ## Phases
 
 1. **Multiplexer** — libghostty panes, PTY lifecycle, vertical tabs with
-   git status, splits, managed worktree agent tasks, notification rings,
+   git status, splits, agent-aware panes, notification rings,
    layout/cwd session restore. macOS Swift shell.
 2. **Automation & reach** — socket + CLI API, embedded browser pane,
    daemon mode (live session survival), SSH workspaces.
 3. **Editor & git UI** — Zig editor core, GPU text renderer, tree-sitter,
    LSP, Vim mode; commit graph, hunk staging.
-4. **Native agent & Linux** — provider-abstracted agent loop with inline
-   diffs, local-LLM support; GTK shell, Linux packaging.
+4. **Linux** — GTK shell, Linux packaging.
 
 ## Repo layout
 
@@ -72,8 +70,7 @@ src/            Zig core (the product)
   zide.zig    library root
   session.zig   session server — sessions, panes, the future daemon/API seam
   term.zig      PTY + libghostty surface wrapper
-  agent.zig     agent task orchestration
-  gitx.zig      worktree management, repo status, commit graph (later)
+  gitx.zig      repo status, commit graph (later)
   editor.zig    editor engine (phase 3)
   main.zig      dev CLI (temporary; becomes the automation CLI)
 macos/          Swift/AppKit shell (arrives with the first milestone)
