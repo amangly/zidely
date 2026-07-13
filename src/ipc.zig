@@ -528,6 +528,10 @@ pub const Server = struct {
                 /// Foreground command on the pane's PTY (tmux
                 /// pane_current_command) — pane-tab titles.
                 title: ?[]const u8,
+                /// Last non-blank screen line — live "what is going on
+                /// in there" context for sidebar rows (an AI agent's
+                /// status line, a build's progress, a prompt).
+                last_line: ?[]const u8,
             };
             const PaneScope = struct {
                 meta_index: usize,
@@ -557,6 +561,22 @@ pub const Server = struct {
                 const pids = tree.descendantsOf(arena, h.pane.pid) catch &.{};
                 try scopes.append(arena, .{ .meta_index = metas.items.len, .pids = pids });
                 try all_pids.appendSlice(arena, pids);
+                var last_line: ?[]const u8 = null;
+                if (h.pane.snapshot(arena)) |snap| {
+                    var lines = std.mem.splitBackwardsScalar(u8, snap, '\n');
+                    while (lines.next()) |line| {
+                        const trimmed = std.mem.trim(u8, line, " \t\r");
+                        if (trimmed.len == 0) continue;
+                        // Cap on a UTF-8 boundary: a split codepoint
+                        // would corrupt the whole JSON reply.
+                        var end = @min(trimmed.len, 160);
+                        while (end > 0 and (trimmed[end - 1] & 0xC0) == 0x80) end -= 1;
+                        if (end > 0 and end < trimmed.len and trimmed[end - 1] >= 0xC0) end -= 1;
+                        last_line = trimmed[0..end];
+                        break;
+                    }
+                } else |_| {}
+
                 try metas.append(arena, .{
                     .pane = h.id,
                     .cwd = cwd,
@@ -564,6 +584,7 @@ pub const Server = struct {
                     .dirty = dirty,
                     .ports = &.{},
                     .title = procinfo.foregroundCommand(arena, h.pane.masterFd()),
+                    .last_line = last_line,
                 });
             }
 
@@ -1498,16 +1519,19 @@ const MetaTestClient = struct {
         _ = try waitFor(&client, "\"id\":1");
         var buf: [512]u8 = undefined;
         const spawn = try std.fmt.bufPrint(&buf, "{{\"id\":2,\"cmd\":\"spawn-pane\",\"session\":1," ++
-            "\"argv\":[\"/bin/sh\",\"-c\",\"read _\"],\"cwd\":\"{s}\"}}", .{self.repo});
+            "\"argv\":[\"/bin/sh\",\"-c\",\"printf 'agent-line-42\\\\n'; read _\"],\"cwd\":\"{s}\"}}", .{self.repo});
         try client.sendLine(spawn);
         _ = try waitFor(&client, "\"id\":2");
+        // The marker must be on screen before meta reads it back.
+        _ = try waitFor(&client, "\"event\":\"pane_output\"");
 
         try client.sendLine("{\"id\":3,\"cmd\":\"panes-meta\"}");
         const r3 = try waitFor(&client, "\"id\":3");
         self.meta_ok = std.mem.indexOf(u8, r3, self.repo) != null and
             std.mem.indexOf(u8, r3, "\"branch\":\"main\"") != null and
             std.mem.indexOf(u8, r3, "\"dirty\":false") != null and
-            std.mem.indexOf(u8, r3, "\"title\":\"sh\"") != null;
+            std.mem.indexOf(u8, r3, "\"title\":\"sh\"") != null and
+            std.mem.indexOf(u8, r3, "\"last_line\":\"agent-line-42\"") != null;
 
         try client.sendLine("{\"id\":4,\"cmd\":\"write\",\"pane\":1,\"data\":\"\\n\"}");
         _ = try waitFor(&client, "\"id\":4");
