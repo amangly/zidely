@@ -52,8 +52,10 @@ shells will consume it as a library and stay thin.
 | `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start |
 
 Support directories: `docs/` (decision record), `assets/` (logo +
-macOS iconset), `hosts/macos-browser/` (WKWebView host prototype,
-built with swiftc only — see its README), `.github/workflows/` (CI).
+macOS iconset), `hosts/` (native prototypes built with swiftc only —
+`macos-shell/` is a windowed proto-shell over the socket protocol,
+`macos-browser/` a standalone WKWebView host; see their READMEs),
+`.github/workflows/` (CI).
 
 ## Conventions
 

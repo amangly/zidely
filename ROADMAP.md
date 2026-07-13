@@ -14,7 +14,8 @@ foundation first, pixels when the core deserves them.
 - [x] Agent task manager: task → worktree → pane → status
 - [x] Attention detection: bell (parser-aware) + output quiescence
 - [ ] macOS Swift/AppKit shell: libghostty rendering, vertical tabs,
-      splits, notification rings (blocked on: full Xcode install)
+      splits, notification rings (blocked on: full Xcode install;
+      a CLT-only proto-shell exists at hosts/macos-shell)
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

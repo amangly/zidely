@@ -3,3 +3,4 @@ zig-cache/
 zig-out/
 .DS_Store
 hosts/macos-browser/zide-browser-host
+hosts/macos-shell/zide-shell
