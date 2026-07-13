@@ -25,6 +25,8 @@ pub const Options = struct {
     cols: u16 = 80,
     /// Program and arguments, resolved via PATH.
     argv: []const []const u8,
+    /// Working directory for the child; inherits ours when null.
+    cwd: ?[]const u8 = null,
 };
 
 pub fn create(alloc: std.mem.Allocator, opts: Options) !*Pane {
@@ -39,7 +41,7 @@ pub fn create(alloc: std.mem.Allocator, opts: Options) !*Pane {
         pty.deinit();
     }
 
-    const pid = try spawn(alloc, pty, opts.argv);
+    const pid = try spawn(alloc, pty, opts);
 
     // The child owns the slave end now.
     posix.close(pty.slave);
@@ -66,18 +68,20 @@ pub fn destroy(self: *Pane) void {
     alloc.destroy(self);
 }
 
-/// Fork + exec `argv` with the PTY slave as its controlling terminal.
+/// Fork + exec with the PTY slave as the child's controlling terminal.
 /// Everything the child needs is allocated before fork; the child must
 /// not touch the allocator.
-fn spawn(alloc: std.mem.Allocator, pty: Pty, argv: []const []const u8) !posix.pid_t {
-    std.debug.assert(argv.len > 0);
+fn spawn(alloc: std.mem.Allocator, pty: Pty, opts: Options) !posix.pid_t {
+    std.debug.assert(opts.argv.len > 0);
 
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const argv_z = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, 0..) |arg, i| argv_z[i] = (try arena.dupeZ(u8, arg)).ptr;
+    const argv_z = try arena.allocSentinel(?[*:0]const u8, opts.argv.len, null);
+    for (opts.argv, 0..) |arg, i| argv_z[i] = (try arena.dupeZ(u8, arg)).ptr;
+
+    const cwd_z: ?[*:0]const u8 = if (opts.cwd) |c| (try arena.dupeZ(u8, c)).ptr else null;
 
     var env = try std.process.getEnvMap(arena);
     try env.put("TERM", "xterm-256color");
@@ -87,6 +91,7 @@ fn spawn(alloc: std.mem.Allocator, pty: Pty, argv: []const []const u8) !posix.pi
     if (pid == 0) {
         // Child. Only async-signal-safe operations from here on.
         pty.childPreExec() catch posix.exit(125);
+        if (cwd_z) |c| posix.chdirZ(c) catch posix.exit(125);
         posix.dup2(pty.slave, 0) catch posix.exit(125);
         posix.dup2(pty.slave, 1) catch posix.exit(125);
         posix.dup2(pty.slave, 2) catch posix.exit(125);

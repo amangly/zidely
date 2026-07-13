@@ -190,6 +190,7 @@ pub const Server = struct {
         rows: u16 = 24,
         cols: u16 = 80,
         argv: []const []const u8,
+        cwd: ?[]const u8 = null,
     };
 
     /// Spawn a child on a new PTY pane inside a session and register it
@@ -201,6 +202,7 @@ pub const Server = struct {
             .rows = opts.rows,
             .cols = opts.cols,
             .argv = opts.argv,
+            .cwd = opts.cwd,
         });
         errdefer pane.destroy();
 
