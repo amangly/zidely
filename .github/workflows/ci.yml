@@ -8,6 +8,10 @@ on:
 jobs:
   test:
     strategy:
+      # macOS is the primary target: never let a Linux failure cancel
+      # the macOS job (and vice versa) — each platform reports its own
+      # real status.
+      fail-fast: false
       matrix:
         # macos-15, not -latest: since 2026-06 "latest" is macOS 26 beta,
         # whose SDK Zig 0.15.2 cannot link against (missing libSystem).
