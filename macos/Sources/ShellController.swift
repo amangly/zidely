@@ -84,21 +84,25 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         root.addSubview(sidebar)
 
         // Below the traffic lights (the titlebar is transparent and the
-        // content view spans it).
+        // sidebar spans it).
         let titlebar: CGFloat = 28
         let buttons = NSStackView(frame: NSRect(x: 10, y: H - titlebar - 30, width: sw - 20, height: 24))
         buttons.orientation = .horizontal
-        buttons.spacing = 6
+        buttons.spacing = 8
         buttons.autoresizingMask = [.minYMargin]
-        // New-session lives in the menu (⌘N); three buttons is the limit
-        // of the sidebar width.
-        for (title, action) in [("＋ task", #selector(addTask)),
-                                ("＋ term", #selector(addTerm)),
-                                ("＋ web", #selector(addWeb))] {
-            let b = NSButton(title: title, target: self, action: action)
+        // Icon buttons (new-session lives in the menu, ⌘N).
+        for (symbol, tip, action) in [
+            ("sparkles", "New agent task (⌘K)", #selector(addTask)),
+            ("apple.terminal", "New terminal (⌘T)", #selector(addTerm)),
+            ("globe", "New browser pane (⌘B)", #selector(addWeb)),
+        ] {
+            let b = NSButton(
+                image: NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!,
+                target: self, action: action)
             b.bezelStyle = .accessoryBarAction
             b.controlSize = .small
-            b.font = .systemFont(ofSize: 11)
+            b.isBordered = true
+            b.toolTip = tip
             buttons.addArrangedSubview(b)
         }
         sidebar.addSubview(buttons)
@@ -119,9 +123,12 @@ final class ShellController: NSObject, NSTableViewDataSource, NSTableViewDelegat
         sideScroll.documentView = table
         sidebar.addSubview(sideScroll)
 
-        // Content area: the selected pane fills it edge to edge, with a
-        // thin status strip at the bottom.
-        content.frame = NSRect(x: sw + 1, y: 22, width: W - sw - 1, height: H - 22)
+        // Content area: the selected pane fills it, with a thin status
+        // strip at the bottom. It stops BELOW the titlebar: the strip
+        // above must stay clickable as a real titlebar (drag,
+        // double-click to zoom) and the window title must not overlap
+        // pane content.
+        content.frame = NSRect(x: sw + 1, y: 22, width: W - sw - 1, height: H - 22 - titlebar)
         content.autoresizingMask = [.width, .height]
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor(calibratedRed: 0.09, green: 0.09, blue: 0.11, alpha: 1).cgColor
