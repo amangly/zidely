@@ -37,6 +37,17 @@ not an MVP experiment.
 | Toolchain | Zig 0.15.2 exactly | Must match Ghostty v1.3.1's `minimum_zig_version`. Bump only together with the Ghostty pin. |
 | License | Apache-2.0 | Open like both references (terax is Apache-2.0; libghostty is MIT, compatible). |
 
+## Dependency notes
+
+- **ghostty** is pinned to `amangly/ghostty@zidely-v1.3.1` — upstream
+  v1.3.1 plus one build patch gating Darwin xcframework/app step
+  *construction* behind the emit options (upstream main already has this
+  fix). Without it, consuming the `ghostty-vt` module on a Mac without
+  full Xcode fails at build-graph time needing the iOS SDK. Drop the fork
+  and repin to the next upstream release (v1.4+) when it ships.
+- Consumers must pass `emit-xcframework=false` and `emit-macos-app=false`
+  to the dependency: their defaults are *true* on Darwin hosts.
+
 ## Phases
 
 1. **Multiplexer** — libghostty panes, PTY lifecycle, vertical tabs with

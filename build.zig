@@ -10,7 +10,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zidely.zig"),
         .target = target,
         .optimize = optimize,
+        // PTY layer uses libc (openpty, ioctl); ghostty-vt's SIMD needs it too.
+        .link_libc = true,
     });
+
+    // Ghostty's VT engine (terminal state machine), pinned to v1.3.1.
+    // The emit flags must be false: their Darwin defaults are true, which
+    // makes Ghostty's build construct xcframework/app steps that require
+    // full Xcode (iOS SDK) even when only the vt module is consumed.
+    const ghostty_dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
+    });
+    core.addImport("ghostty-vt", ghostty_dep.module("ghostty-vt"));
 
     // Dev CLI: temporary entry point for exercising the core before the
     // native shells exist.

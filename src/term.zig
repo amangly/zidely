@@ -1,14 +1,16 @@
 //! Terminal surfaces.
 //!
-//! Terminal emulation and rendering are provided by embedding libghostty
-//! (pinned to Ghostty v1.3.1, which is why this repo pins Zig 0.15.2).
-//! This module owns the PTY lifecycle and wraps libghostty surfaces
-//! behind a core-owned Pane type; the platform shells only ever see our
-//! API, never libghostty's.
-//!
-//! Integration lands in the first real milestone; nothing to see yet.
+//! The core owns the PTY lifecycle (Pty) and terminal state (Pane wraps
+//! a ghostty-vt Terminal fed by the PTY). Ghostty v1.3.1 exports its VT
+//! engine as the `ghostty-vt` Zig module — that is what lives here, in
+//! the core. GPU rendering via full libghostty (GhosttyKit) happens in
+//! the platform shells; they read terminal state through our API and
+//! never see libghostty types directly.
 
 const std = @import("std");
+
+pub const Pty = @import("term/Pty.zig");
+pub const Pane = @import("term/Pane.zig");
 
 pub const PaneId = u64;
 
