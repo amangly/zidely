@@ -15,9 +15,10 @@ git UI, and native agent with inline diffs.
 Think [cmux](https://cmux.com) + [terax](https://terax.app), combined, with
 the core written in Zig.
 
-**Status: pre-alpha scaffold.** Nothing usable yet. The design is settled
-(see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)); the code is being built
-foundation-first.
+**Status: pre-alpha.** The core library works — event-loop session server,
+PTY panes with real terminal state, worktree-isolated agent tasks, attention
+detection — but there is no UI shell yet. See [ROADMAP.md](ROADMAP.md) for
+where things stand.
 
 ## What it will be
 
@@ -43,12 +44,22 @@ socket/CLI — without a rewrite.
 ## Building
 
 Requires **Zig 0.15.2** exactly (pinned to match Ghostty v1.3.1, our
-terminal engine dependency).
+terminal engine dependency). Setup details in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```sh
 zig build test   # run tests
-zig build run    # dev CLI (exercises the core library)
+zig build run    # dev CLI (event-loop demo)
 ```
+
+## Documentation
+
+| Doc | What's in it |
+|---|---|
+| [ZIDELY.md](ZIDELY.md) | Living project map: modules, conventions, gotchas |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions and their rationale |
+| [ROADMAP.md](ROADMAP.md) | Phase plan and status |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Environment setup and workflow |
 
 ## License
 
