@@ -374,6 +374,7 @@ pub fn main() !void {
                 branch: ?[]const u8 = null,
                 dirty: ?bool = null,
                 ports: []const u16 = &.{},
+                title: ?[]const u8 = null,
             } = &.{},
         };
         const parsed = try client.readResponse(Metas, arena);
@@ -381,7 +382,9 @@ pub fn main() !void {
         if (parsed.value.panes.len == 0) try stdout("no panes\n", .{});
         for (parsed.value.panes) |m| {
             var line: std.ArrayList(u8) = .empty;
-            try line.writer(arena).print("{d}  {s}", .{ m.pane, m.cwd orelse "?" });
+            try line.writer(arena).print("{d}  [{s}]  {s}", .{
+                m.pane, m.title orelse "?", m.cwd orelse "?",
+            });
             if (m.branch) |b| {
                 try line.writer(arena).print("  ({s}{s})", .{ b, if (m.dirty orelse false) "*" else "" });
             }

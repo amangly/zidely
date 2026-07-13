@@ -33,6 +33,31 @@ pub fn cwdOfPid(alloc: std.mem.Allocator, pid: std.posix.pid_t) ?[]const u8 {
     }
 }
 
+// Zig 0.15.2's std.c doesn't declare tcgetpgrp; both libcs have it.
+extern "c" fn tcgetpgrp(fd: std.c.fd_t) std.c.pid_t;
+
+/// Command name of the PTY's foreground process group leader — what
+/// tmux calls pane_current_command ("vim", "sleep", "zsh"). Null when
+/// nothing can be reported (dead fd, ps failure). Caller owns the
+/// result.
+pub fn foregroundCommand(alloc: std.mem.Allocator, master_fd: std.posix.fd_t) ?[]const u8 {
+    const pgid = tcgetpgrp(master_fd);
+    if (pgid <= 0) return null;
+    var buf: [16]u8 = undefined;
+    const pid_s = std.fmt.bufPrint(&buf, "{d}", .{pgid}) catch return null;
+    const res = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "ps", "-o", "comm=", "-p", pid_s },
+    }) catch return null;
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    if (res.term != .Exited or res.term.Exited != 0) return null;
+    // "-zsh" for login shells, "/bin/zsh" when ps reports a path.
+    const trimmed = std.mem.trim(u8, res.stdout, " \t\n-");
+    if (trimmed.len == 0) return null;
+    return alloc.dupe(u8, std.fs.path.basename(trimmed)) catch null;
+}
+
 /// A point-in-time snapshot of the process table (pid → parent).
 pub const ProcessTree = struct {
     entries: []const Entry,

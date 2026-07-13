@@ -525,6 +525,9 @@ pub const Server = struct {
                 branch: ?[]const u8,
                 dirty: ?bool,
                 ports: []const u16,
+                /// Foreground command on the pane's PTY (tmux
+                /// pane_current_command) — pane-tab titles.
+                title: ?[]const u8,
             };
             const PaneScope = struct {
                 meta_index: usize,
@@ -560,6 +563,7 @@ pub const Server = struct {
                     .branch = branch,
                     .dirty = dirty,
                     .ports = &.{},
+                    .title = procinfo.foregroundCommand(arena, h.pane.masterFd()),
                 });
             }
 
@@ -1502,7 +1506,8 @@ const MetaTestClient = struct {
         const r3 = try waitFor(&client, "\"id\":3");
         self.meta_ok = std.mem.indexOf(u8, r3, self.repo) != null and
             std.mem.indexOf(u8, r3, "\"branch\":\"main\"") != null and
-            std.mem.indexOf(u8, r3, "\"dirty\":false") != null;
+            std.mem.indexOf(u8, r3, "\"dirty\":false") != null and
+            std.mem.indexOf(u8, r3, "\"title\":\"sh\"") != null;
 
         try client.sendLine("{\"id\":4,\"cmd\":\"write\",\"pane\":1,\"data\":\"\\n\"}");
         _ = try waitFor(&client, "\"id\":4");
