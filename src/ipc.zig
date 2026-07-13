@@ -148,6 +148,11 @@ pub const Server = struct {
     /// panel from this via the `notices` command.
     notices: std.ArrayListUnmanaged(Notice) = .empty,
     next_notice_seq: u64 = 1,
+    /// Opaque client-owned stash (the macOS shell keeps its split
+    /// layout here so app relaunches rebuild them). In-memory only:
+    /// a daemon restart respawns panes under new ids, so persisted
+    /// layout would reference ghosts.
+    shell_state: ?[]const u8 = null,
     shutting_down: bool = false,
     listener_closed: bool = false,
 
@@ -203,6 +208,7 @@ pub const Server = struct {
     /// (after `shutdown` ran, or when the loop will never run again).
     pub fn destroy(self: *Server) void {
         self.notices.deinit(self.alloc);
+        if (self.shell_state) |ss_data| self.alloc.free(ss_data);
         self.session_server.handler = self.downstream;
         for (self.clients.items) |client| {
             posix.close(client.fd);
@@ -434,6 +440,14 @@ pub const Server = struct {
                 .ok = true,
                 .notices = self.notices.items[start..],
             });
+        } else if (eql(u8, req.cmd, "set-shell-state")) {
+            const data = req.data orelse return error.MissingData;
+            const owned = try self.alloc.dupe(u8, data);
+            if (self.shell_state) |old| self.alloc.free(old);
+            self.shell_state = owned;
+            self.reply(client, .{ .id = req.id, .ok = true });
+        } else if (eql(u8, req.cmd, "get-shell-state")) {
+            self.reply(client, .{ .id = req.id, .ok = true, .data = self.shell_state });
         } else if (eql(u8, req.cmd, "save")) {
             const path = req.path orelse return error.MissingPath;
             try self.saveState(path);
@@ -830,6 +844,7 @@ const TestClient = struct {
     snapshot_ok: bool = false,
     kill_remove_ok: bool = false,
     notices_ok: bool = false,
+    shell_state_ok: bool = false,
 
     fn run(self: *TestClient) void {
         self.runInner() catch |err| {
@@ -881,6 +896,15 @@ const TestClient = struct {
         try client.sendLine("{\"id\":10,\"cmd\":\"list-sessions\"}");
         const r10 = try waitFor(&client, "\"id\":10");
         self.kill_remove_ok = std.mem.indexOf(u8, r10, "\"panes\":[1]") != null;
+
+        // The shell-state stash round-trips opaque client data, so an
+        // app relaunch can rebuild its split layout.
+        try client.sendLine("{\"id\":13,\"cmd\":\"set-shell-state\",\"data\":\"{\\\"splits\\\":[7]}\"}");
+        _ = try waitFor(&client, "\"id\":13");
+        try client.sendLine("{\"id\":14,\"cmd\":\"get-shell-state\"}");
+        const r14 = try waitFor(&client, "\"id\":14");
+        self.shell_state_ok = std.mem.indexOf(u8, r14, "splits") != null and
+            std.mem.indexOf(u8, r14, "[7]") != null;
 
         // Notice history: exits are queryable by clients that connect
         // after the broadcasts fired; `seq` filters to newer entries.
@@ -1227,6 +1251,7 @@ test "socket api: commands, events, save, shutdown" {
     try std.testing.expect(client.snapshot_ok);
     try std.testing.expect(client.kill_remove_ok);
     try std.testing.expect(client.notices_ok);
+    try std.testing.expect(client.shell_state_ok);
 
     // The save command persisted a restorable layout.
     var restored = try session.Server.init(alloc);
