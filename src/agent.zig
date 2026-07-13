@@ -28,7 +28,10 @@ pub const Task = struct {
     /// Short human description, e.g. "fix flaky auth tests". Owned.
     description: []const u8,
     worktree: gitx.Worktree,
-    pane: session.PaneId,
+    /// The agent's pane. Null for tasks restored after a daemon restart:
+    /// the process died with the old daemon, the work in the worktree
+    /// didn't — such tasks are review/merge/discard-only.
+    pane: ?session.PaneId,
     status: Status,
     exit_code: ?u8 = null,
     /// Wall clock (ms) of the last PTY output, for quiescence detection.
@@ -183,6 +186,43 @@ pub const Manager = struct {
         return task.*;
     }
 
+    pub const AdoptOptions = struct {
+        description: []const u8,
+        branch: []const u8,
+        path: []const u8,
+        base: []const u8,
+    };
+
+    /// Re-register a task from persisted state. Its agent process is
+    /// gone (it died with the previous daemon); its worktree isn't.
+    /// Restored tasks have no pane and are immediately reviewable,
+    /// mergeable, and discardable.
+    pub fn adoptTask(self: *Manager, opts: AdoptOptions) !TaskId {
+        const task = try self.alloc.create(Task);
+        errdefer self.alloc.destroy(task);
+        const id = self.next_task_id;
+
+        const description = try self.alloc.dupe(u8, opts.description);
+        errdefer self.alloc.free(description);
+        const branch = try self.alloc.dupe(u8, opts.branch);
+        errdefer self.alloc.free(branch);
+        const path = try self.alloc.dupe(u8, opts.path);
+        errdefer self.alloc.free(path);
+        const base = try self.alloc.dupe(u8, opts.base);
+        errdefer self.alloc.free(base);
+
+        task.* = .{
+            .id = id,
+            .description = description,
+            .worktree = .{ .branch = branch, .path = path, .base = base },
+            .pane = null,
+            .status = .finished,
+        };
+        try self.tasks.put(self.alloc, id, task);
+        self.next_task_id += 1;
+        return id;
+    }
+
     /// What the task changed so far: full diff vs its base plus commit
     /// count and dirtiness. Works mid-run too (peeking at a working
     /// agent is legitimate review).
@@ -223,10 +263,12 @@ pub const Manager = struct {
         // The agent's pane is exited (status is finished); drop it from
         // its session rather than leaving a dead pane behind. Best
         // effort: a still-draining PTY keeps the pane until later.
-        self.server.removePane(task.pane) catch {};
+        if (task.pane) |pane| {
+            self.server.removePane(pane) catch {};
+            _ = self.by_pane.remove(pane);
+        }
 
         _ = self.tasks.remove(id);
-        _ = self.by_pane.remove(task.pane);
         self.destroyTask(task);
     }
 
@@ -349,7 +391,7 @@ test "agent task runs in its own worktree and reports finish" {
     try std.testing.expectEqual(Status.finished, task.status);
     try std.testing.expectEqual(@as(?u8, 0), task.exit_code);
 
-    const snap = try server.paneSnapshot(task.pane, alloc);
+    const snap = try server.paneSnapshot(task.pane.?, alloc);
     defer alloc.free(snap);
     try std.testing.expect(std.mem.indexOf(u8, snap, "zide/add-feature-x") != null);
     try std.testing.expect(std.mem.indexOf(u8, snap, "agent-finished") != null);
@@ -447,7 +489,7 @@ test "cleanup refuses while the agent is still running" {
     try std.testing.expectError(error.TaskStillRunning, manager.cleanupTask(task_id, .{}));
 
     // Unblock the child so the loop can drain and the test can end.
-    try server.paneWrite(manager.get(task_id).?.pane, "\n");
+    try server.paneWrite(manager.get(task_id).?.pane.?, "\n");
     try server.run();
     try std.testing.expectEqual(Status.finished, manager.get(task_id).?.status);
 }
@@ -552,7 +594,7 @@ test "bell flips to needs_attention immediately" {
         .description = "asks a question",
         .argv = &.{ "/bin/sh", "-c", "printf '\\aproceed? '; read _; echo ok" },
     });
-    try server.paneWrite(manager.get(task_id).?.pane, "y\n");
+    try server.paneWrite(manager.get(task_id).?.pane.?, "y\n");
     try server.run();
 
     const events = recorder.statuses();

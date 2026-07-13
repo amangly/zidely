@@ -1,15 +1,21 @@
-//! Session persistence: layout + cwd respawn.
+//! Session persistence: layout + cwd respawn, and agent-task records.
 //!
 //! Saves every session's title and each pane's spawn recipe (argv, cwd,
 //! size) as versioned JSON; restore recreates the sessions and respawns
-//! the panes fresh. Processes are not checkpointed — that's daemon-mode
-//! territory (phase 2). A saved cwd that no longer exists makes that
-//! pane's child exit immediately (code 125); the pane still restores.
+//! the panes fresh. Processes are not checkpointed. A saved cwd that no
+//! longer exists makes that pane's child exit immediately (code 125);
+//! the pane still restores.
+//!
+//! Agent tasks are the exception to respawning: re-running an agent
+//! command from scratch could redo (or undo) work, so task panes are
+//! excluded from the layout and tasks are saved as records instead —
+//! the ipc layer re-adopts them as pane-less, review-only tasks (see
+//! agent.Manager.adoptTask).
 
 const std = @import("std");
 const session = @import("session.zig");
 
-pub const format_version: u32 = 1;
+pub const format_version: u32 = 2;
 
 const SavedPane = struct {
     argv: []const []const u8,
@@ -28,35 +34,72 @@ const SavedSession = struct {
     browsers: []const SavedBrowser = &.{},
 };
 
-const SavedState = struct {
-    version: u32 = format_version,
-    sessions: []const SavedSession = &.{},
+/// An agent task's durable identity: enough to re-adopt its worktree
+/// for review/merge/discard after a restart.
+pub const TaskRecord = struct {
+    repo: []const u8,
+    description: []const u8,
+    branch: []const u8,
+    path: []const u8,
+    base: []const u8,
 };
 
-/// Write the server's current layout to `path` as JSON.
-pub fn save(alloc: std.mem.Allocator, server: *session.Server, path: []const u8) !void {
+pub const SavedState = struct {
+    version: u32 = format_version,
+    sessions: []const SavedSession = &.{},
+    tasks: []const TaskRecord = &.{},
+};
+
+pub const SaveOptions = struct {
+    /// Agent-task records to persist alongside the layout.
+    tasks: []const TaskRecord = &.{},
+    /// Panes to leave out of the layout (live agent panes).
+    exclude_panes: []const session.PaneId = &.{},
+    /// Sessions to leave out entirely (agents sessions that would
+    /// serialize empty once their task panes are excluded).
+    exclude_sessions: []const session.SessionId = &.{},
+};
+
+fn contains(comptime T: type, haystack: []const T, needle: T) bool {
+    for (haystack) |h| if (h == needle) return true;
+    return false;
+}
+
+/// Write the server's current layout (and task records) to `path`.
+pub fn save(
+    alloc: std.mem.Allocator,
+    server: *session.Server,
+    path: []const u8,
+    opts: SaveOptions,
+) !void {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const sessions = try arena.alloc(SavedSession, server.sessions.count());
+    var sessions: std.ArrayListUnmanaged(SavedSession) = .empty;
     var it = server.sessions.valueIterator();
-    var i: usize = 0;
-    while (it.next()) |s| : (i += 1) {
-        const panes = try arena.alloc(SavedPane, s.panes.items.len);
-        for (s.panes.items, 0..) |pane_id, j| {
+    while (it.next()) |s| {
+        if (contains(session.SessionId, opts.exclude_sessions, s.id)) continue;
+
+        var panes: std.ArrayListUnmanaged(SavedPane) = .empty;
+        for (s.panes.items) |pane_id| {
+            if (contains(session.PaneId, opts.exclude_panes, pane_id)) continue;
             const h = server.panes.get(pane_id) orelse continue;
-            panes[j] = .{ .argv = h.argv, .cwd = h.cwd, .rows = h.rows, .cols = h.cols };
+            try panes.append(arena, .{ .argv = h.argv, .cwd = h.cwd, .rows = h.rows, .cols = h.cols });
         }
-        const browsers = try arena.alloc(SavedBrowser, s.browsers.items.len);
-        for (s.browsers.items, 0..) |pane_id, j| {
+        var browsers: std.ArrayListUnmanaged(SavedBrowser) = .empty;
+        for (s.browsers.items) |pane_id| {
             const b = server.browser_panes.get(pane_id) orelse continue;
-            browsers[j] = .{ .url = b.url };
+            try browsers.append(arena, .{ .url = b.url });
         }
-        sessions[i] = .{ .title = s.title, .panes = panes, .browsers = browsers };
+        try sessions.append(arena, .{
+            .title = s.title,
+            .panes = panes.items,
+            .browsers = browsers.items,
+        });
     }
 
-    const state: SavedState = .{ .sessions = sessions };
+    const state: SavedState = .{ .sessions = sessions.items, .tasks = opts.tasks };
     const json = try std.fmt.allocPrint(arena, "{f}\n", .{
         std.json.fmt(state, .{ .whitespace = .indent_2 }),
     });
@@ -68,9 +111,9 @@ pub fn save(alloc: std.mem.Allocator, server: *session.Server, path: []const u8)
 
 pub const RestoreResult = struct { sessions: usize, panes: usize };
 
-/// Recreate the layout saved at `path` into `server`: sessions are
-/// created and panes respawned with their saved argv/cwd/size.
-pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const u8) !RestoreResult {
+/// Parse a state file. Older versions load fine (new fields default);
+/// newer ones are refused rather than silently misread.
+pub fn load(alloc: std.mem.Allocator, path: []const u8) !std.json.Parsed(SavedState) {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
     const bytes = try file.readToEndAlloc(alloc, 16 * 1024 * 1024);
@@ -78,12 +121,21 @@ pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const 
 
     const parsed = try std.json.parseFromSlice(SavedState, alloc, bytes, .{
         .ignore_unknown_fields = true,
+        // The returned value outlives `bytes` — escape-free strings must
+        // not be served as slices into the input buffer.
+        .allocate = .alloc_always,
     });
-    defer parsed.deinit();
-    if (parsed.value.version != format_version) return error.UnsupportedStateVersion;
+    errdefer parsed.deinit();
+    if (parsed.value.version > format_version) return error.UnsupportedStateVersion;
+    return parsed;
+}
 
+/// Recreate a loaded layout into `server`: sessions are created and
+/// panes respawned with their saved argv/cwd/size. Task records are the
+/// caller's to re-adopt (the ipc layer owns agent managers).
+pub fn apply(server: *session.Server, state: SavedState) !RestoreResult {
     var result: RestoreResult = .{ .sessions = 0, .panes = 0 };
-    for (parsed.value.sessions) |s| {
+    for (state.sessions) |s| {
         const sid = try server.createSession(s.title);
         result.sessions += 1;
         for (s.panes) |p| {
@@ -101,6 +153,13 @@ pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const 
         }
     }
     return result;
+}
+
+/// Load + apply, for callers with no agent managers (tests, embedding).
+pub fn restore(alloc: std.mem.Allocator, server: *session.Server, path: []const u8) !RestoreResult {
+    const parsed = try load(alloc, path);
+    defer parsed.deinit();
+    return apply(server, parsed.value);
 }
 
 test "save and restore session layout" {
@@ -122,7 +181,7 @@ test "save and restore session layout" {
             .cols = 90,
         });
         try server.run();
-        try save(alloc, &server, state_path);
+        try save(alloc, &server, state_path, .{});
     }
 
     var server = try session.Server.init(alloc);

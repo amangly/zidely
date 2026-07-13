@@ -27,8 +27,9 @@ foundation first, pixels when the core deserves them.
         the app (colored diff, Merge & Remove, Discard) — merge refuses
         dirty worktrees and aborts cleanly on conflicts
   - [ ] splits, vertical tabs per workspace, IME/preedit
-  - [ ] persist agent tasks across daemon restarts (today only their
-        panes are restored, orphaned from the task)
+  - [x] agent tasks persist across daemon restarts: saved as records,
+        re-adopted pane-less (review/merge/discard only — re-running an
+        agent command fresh could redo or undo work)
 - [x] Session restore (layout + cwd respawn)
 
 ## Phase 2 — Automation & reach

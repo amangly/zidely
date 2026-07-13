@@ -216,7 +216,7 @@ pub fn main() !void {
                 id: u64,
                 description: []const u8,
                 status: []const u8,
-                pane: u64,
+                pane: ?u64 = null,
                 repo: []const u8,
                 branch: []const u8,
                 exit_code: ?u8 = null,
@@ -228,8 +228,13 @@ pub fn main() !void {
             try stdout("no agent tasks\n", .{});
         }
         for (parsed.value.tasks) |t| {
-            try stdout("{d}  [{s}]  {s}  —  pane {d}, {s}, {s}\n", .{
-                t.id, t.status, t.description, t.pane, t.branch, t.repo,
+            var pane_buf: [32]u8 = undefined;
+            const pane_str = if (t.pane) |p|
+                try std.fmt.bufPrint(&pane_buf, "pane {d}", .{p})
+            else
+                "no pane (restored)";
+            try stdout("{d}  [{s}]  {s}  —  {s}, {s}, {s}\n", .{
+                t.id, t.status, t.description, pane_str, t.branch, t.repo,
             });
         }
     } else if (std.mem.eql(u8, cmd, "task-diff")) {
@@ -608,7 +613,7 @@ fn cmdServe(alloc: std.mem.Allocator, socket_path: []const u8, state_path: ?[]co
     defer ipc_server.destroy();
 
     if (state_path) |sp| {
-        if (zide.persist.restore(alloc, &server, sp)) |restored| {
+        if (ipc_server.restoreState(sp)) |restored| {
             try stdout("restored {d} session(s), {d} pane(s) from {s}\n", .{
                 restored.sessions, restored.panes, sp,
             });
@@ -622,7 +627,7 @@ fn cmdServe(alloc: std.mem.Allocator, socket_path: []const u8, state_path: ?[]co
     try server.run();
 
     if (state_path) |sp| {
-        try zide.persist.save(alloc, &server, sp);
+        try ipc_server.saveState(sp);
         try stdout("state saved to {s}\n", .{sp});
     }
 }

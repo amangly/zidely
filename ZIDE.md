@@ -48,7 +48,7 @@ shells will consume it as a library and stay thin.
 | `src/agent.zig` | Agent orchestration: `Manager` ties task → worktree → pane → status; attention detection; `TaskEventHandler` stream |
 | `src/gitx.zig` | Git layer: worktree-per-task provisioning (branch `zide/<slug>`), review (diff vs the recorded base *commit*, including uncommitted work via intent-to-add) and merge (refuses dirty worktrees; aborts on conflict). Shells out to `git` |
 | `src/ipc.zig` | Control socket: JSON-lines protocol over a Unix socket — commands in, events broadcast to every client; `Client` is the synchronous consumer the CLI uses. Also the browser/host protocol (`host-register` + browser-open/navigate/eval routing), the `attach` command (raw PTY passthrough for terminal renderers, plus `resize`), and the agent-task surface: `task-create`/`task-list`/`task-cleanup` with `task_status`/`task_removed` events — one lazily created `agent.Manager` (+ its `agents: <repo>` session) per repo, task ids kept globally unique by the socket layer |
-| `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) as versioned JSON |
+| `src/persist.zig` | Session persistence: save/restore of layout (titles + pane spawn recipes) and agent-task records as versioned JSON (v2). Task panes are excluded from respawn; the ipc layer re-adopts tasks as pane-less review-only orphans (`restoreState`/`saveState`) |
 | `src/editor.zig` | Editor engine — empty until phase 3 |
 | `src/main.zig` | The `zide` CLI: `serve`/`daemon` host the server+socket (state restore/save, detach, pidfile), everything else is a client command with tmux-style daemon auto-start. `zide attach <pane>` turns the calling terminal into the pane (raw mode, SIGWINCH → resize, ctrl-\ detaches) — the transport the shell's libghostty surfaces ride. `zide task <desc>` starts an agent task in the cwd's repo (default agent: `claude`) and attaches; `tasks` / `task-rm` list and clean up |
 
@@ -57,10 +57,16 @@ Xcode project):
 
 | Path | Responsibility |
 |---|---|
-| `macos/Sources/main.swift` | Entry point: finds the `zide` binary, auto-starts the daemon, `ghostty_init`, hands off to the controller |
+| `macos/Sources/main.swift` | Entry point: finds the `zide` binary, auto-starts the daemon, `ghostty_init`, hands off to the controller; `ZIDE_UI_DEMO=1` enables chrome fixtures |
 | `macos/Sources/GhosttyRuntime.swift` | The process-wide `ghostty_app_t` + runtime callbacks (wakeup/tick, clipboard, close); loads the user's own ghostty config so terminals look like their ghostty |
 | `macos/Sources/TerminalSurfaceView.swift` | One libghostty surface per pane; its child command is `zide attach <pane>`. Minimal port of Ghostty's SurfaceView input handling (keys, mouse, scroll, focus, resize) |
-| `macos/Sources/ShellController.swift` | The window: cmux-style sidebar (AGENT TASKS with status rings, sessions, panes), pane hosting, browser panes, menu/shortcuts (⌘K new task). Task panes render under AGENT TASKS only; their host sessions are hidden when they'd be pure duplication |
+| `macos/Sources/ShellController.swift` | Window glue: view-model ↔ sidebar/host, review bar, menus/shortcuts (sidebar toggle, notifications, workspace jump), socket events; live panes attach into host panel slots |
+| `macos/Sources/ShellViewModel.swift` | Workspace/layout/notification view state; collapse, unread, surface selection, split ratio; `.demo()` fixtures and partial live `applyLive` |
+| `macos/Sources/ShellTheme.swift` | Chrome tokens (colors, fonts, spacing) |
+| `macos/Sources/SidebarView.swift` | Translucent sidebar, collapsible groups, footer actions |
+| `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, meta, attention ring, unread badge |
+| `macos/Sources/WorkspaceHostView.swift` | Surface tabs, draggable splits, panel slots |
+| `macos/Sources/NotificationPanelView.swift` | Notification list panel (⌘⇧I) |
 | `macos/Sources/SocketClient.swift` | JSON-lines client for the control socket |
 
 Support directories: `docs/` (decision record), `assets/` (logo +

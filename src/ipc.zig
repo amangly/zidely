@@ -371,7 +371,7 @@ pub const Server = struct {
             self.reply(client, .{ .id = req.id, .ok = true });
         } else if (eql(u8, req.cmd, "save")) {
             const path = req.path orelse return error.MissingPath;
-            try persist.save(self.alloc, ss, path);
+            try self.saveState(path);
             self.reply(client, .{ .id = req.id, .ok = true });
         } else if (eql(u8, req.cmd, "host-register")) {
             self.host = client;
@@ -475,7 +475,9 @@ pub const Server = struct {
                 id: agent.TaskId,
                 description: []const u8,
                 status: []const u8,
-                pane: session.PaneId,
+                /// Null for tasks restored after a daemon restart: no
+                /// live agent process, review/merge/discard only.
+                pane: ?session.PaneId,
                 repo: []const u8,
                 branch: []const u8,
                 exit_code: ?u8,
@@ -541,6 +543,73 @@ pub const Server = struct {
         } else {
             return error.UnknownCommand;
         }
+    }
+
+    /// Save layout + agent-task records to `path`.
+    pub fn saveState(self: *Server, path: []const u8) !void {
+        var arena_state = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var records: std.ArrayListUnmanaged(persist.TaskRecord) = .empty;
+        var task_panes: std.ArrayListUnmanaged(session.PaneId) = .empty;
+        var agents_sessions: std.ArrayListUnmanaged(session.SessionId) = .empty;
+        for (self.managers.items) |rm| {
+            var it = rm.manager.tasks.valueIterator();
+            while (it.next()) |task_ptr| {
+                const t = task_ptr.*;
+                try records.append(arena, .{
+                    .repo = rm.repo,
+                    .description = t.description,
+                    .branch = t.worktree.branch,
+                    .path = t.worktree.path,
+                    .base = t.worktree.base,
+                });
+                if (t.pane) |p| try task_panes.append(arena, p);
+            }
+            // The manager's agents session is recreated by managerFor on
+            // the next adopt; persisting it too would duplicate it —
+            // unless the user parked non-task panes or browsers there.
+            if (self.session_server.sessions.get(rm.manager.session_id)) |sess| {
+                var only_tasks = sess.browsers.items.len == 0;
+                if (only_tasks) for (sess.panes.items) |p| {
+                    if (rm.manager.by_pane.get(p) == null) {
+                        only_tasks = false;
+                        break;
+                    }
+                };
+                if (only_tasks) try agents_sessions.append(arena, rm.manager.session_id);
+            }
+        }
+
+        try persist.save(self.alloc, self.session_server, path, .{
+            .tasks = records.items,
+            .exclude_panes = task_panes.items,
+            .exclude_sessions = agents_sessions.items,
+        });
+    }
+
+    /// Restore a layout and re-adopt agent tasks whose worktrees still
+    /// exist on disk (as pane-less, review-only tasks — their agent
+    /// processes died with the previous daemon).
+    pub fn restoreState(self: *Server, path: []const u8) !persist.RestoreResult {
+        const parsed = try persist.load(self.alloc, path);
+        defer parsed.deinit();
+        const result = try persist.apply(self.session_server, parsed.value);
+
+        for (parsed.value.tasks) |rec| {
+            std.fs.accessAbsolute(rec.path, .{}) catch continue; // worktree gone
+            const mgr = try self.managerFor(rec.repo);
+            mgr.next_task_id = self.next_task_id;
+            _ = try mgr.adoptTask(.{
+                .description = rec.description,
+                .branch = rec.branch,
+                .path = rec.path,
+                .base = rec.base,
+            });
+            self.next_task_id = mgr.next_task_id;
+        }
+        return result;
     }
 
     /// The agent manager for a repo, created on first use along with the
@@ -1125,6 +1194,138 @@ test "agent tasks over the socket: create, list, status stream, cleanup" {
     defer alloc.free(res.stdout);
     defer alloc.free(res.stderr);
     try std.testing.expectEqualStrings("diffable-content\n", res.stdout);
+}
+
+/// Phase 1 of the restart test: run a committing agent task, save, quit.
+const RestartPhase1 = struct {
+    socket_path: []const u8,
+    repo: []const u8,
+    state_path: []const u8,
+    err: ?anyerror = null,
+
+    fn run(self: *RestartPhase1) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *RestartPhase1) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        var buf: [1024]u8 = undefined;
+        const create = try std.fmt.bufPrint(&buf, "{{\"id\":1,\"cmd\":\"task-create\"," ++
+            "\"repo\":\"{s}\",\"description\":\"survive the restart\"," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"echo persistent-work > survivor.txt && git add . && " ++
+            "git -c user.name=t -c user.email=t@t.invalid commit -qm work\"]}}", .{self.repo});
+        try client.sendLine(create);
+        _ = try waitFor(&client, "\"id\":1");
+        while (true) {
+            const line = try client.readLine();
+            if (std.mem.indexOf(u8, line, "\"task_status\"") == null) continue;
+            if (std.mem.indexOf(u8, line, "\"finished\"") != null) break;
+        }
+
+        const save_req = try std.fmt.bufPrint(&buf, "{{\"id\":2,\"cmd\":\"save\",\"path\":\"{s}\"}}", .{self.state_path});
+        try client.sendLine(save_req);
+        _ = try waitFor(&client, "\"id\":2");
+        try client.sendLine("{\"id\":3,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":3");
+    }
+};
+
+/// Phase 2: against the restarted daemon, the task is back — pane-less
+/// but mergeable.
+const RestartPhase2 = struct {
+    socket_path: []const u8,
+    err: ?anyerror = null,
+    restored_ok: bool = false,
+    merged_ok: bool = false,
+
+    fn run(self: *RestartPhase2) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *RestartPhase2) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        try client.sendLine("{\"id\":1,\"cmd\":\"task-list\"}");
+        const r1 = try waitFor(&client, "\"id\":1");
+        self.restored_ok = std.mem.indexOf(u8, r1, "survive the restart") != null and
+            std.mem.indexOf(u8, r1, "\"pane\":null") != null and
+            std.mem.indexOf(u8, r1, "\"finished\"") != null;
+
+        try client.sendLine("{\"id\":2,\"cmd\":\"task-merge\",\"task\":1}");
+        const r2 = try waitFor(&client, "\"id\":2");
+        self.merged_ok = std.mem.indexOf(u8, r2, "\"ok\":true") != null;
+
+        try client.sendLine("{\"id\":3,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":3");
+    }
+};
+
+test "agent tasks survive a daemon restart as reviewable orphans" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+    const state_path = try std.fs.path.join(alloc, &.{ dir, "state.json" });
+    defer alloc.free(state_path);
+
+    try tmp.dir.makeDir("repo");
+    const repo = try tmp.dir.realpathAlloc(alloc, "repo");
+    defer alloc.free(repo);
+    const gitx = @import("gitx.zig");
+    try gitx.setupTestRepo(alloc, repo);
+
+    // First daemon generation: task runs, state saves, daemon dies.
+    {
+        var server = try session.Server.init(alloc);
+        defer server.deinit();
+        var ipc_server = try Server.create(alloc, &server, socket_path);
+        defer ipc_server.destroy();
+
+        var p1: RestartPhase1 = .{ .socket_path = socket_path, .repo = repo, .state_path = state_path };
+        const thread = try std.Thread.spawn(.{}, RestartPhase1.run, .{&p1});
+        try server.run();
+        thread.join();
+        try std.testing.expectEqual(@as(?anyerror, null), p1.err);
+    }
+
+    // Second generation restores: the agents session must not be
+    // duplicated, the task must be back without a pane.
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+    _ = try ipc_server.restoreState(state_path);
+
+    try std.testing.expectEqual(@as(usize, 1), server.sessions.count());
+    try std.testing.expectEqual(@as(usize, 0), server.panes.count());
+
+    var p2: RestartPhase2 = .{ .socket_path = socket_path };
+    const thread = try std.Thread.spawn(.{}, RestartPhase2.run, .{&p2});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), p2.err);
+    try std.testing.expect(p2.restored_ok);
+    try std.testing.expect(p2.merged_ok);
+
+    // The orphaned task's work landed on main; nothing left behind.
+    const res = try std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "git", "-C", repo, "show", "main:survivor.txt" },
+    });
+    defer alloc.free(res.stdout);
+    defer alloc.free(res.stderr);
+    try std.testing.expectEqualStrings("persistent-work\n", res.stdout);
 }
 
 test "socket api: commands, events, save, shutdown" {
