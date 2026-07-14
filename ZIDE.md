@@ -70,6 +70,7 @@ Xcode project):
 | `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, snippet, meta, pin, status dot, unread badge |
 | `macos/Sources/WorkspaceHostView.swift` | Renders the selected workspace's split tree recursively (path-addressed draggable dividers), panel slots, browser omnibar (live URL, history suggestions dropdown, load progress, stop/reload) |
 | `macos/Sources/BrowserEngine.swift` | WKWebView factory following cmux's: Safari UA (sites serve modern UIs, no bot checks), persistent data store, inspectable, swipe gestures, theme-matched under-page color; external-scheme test; zoom bounds |
+| `macos/Sources/BrowserImport.swift` | Import cookies from installed browsers (Chrome/Arc/Brave/Edge/Vivaldi/Chromium) so zide opens signed-in: reads the source SQLite cookie DB, decrypts via the Keychain "<Browser> Safe Storage" key (PBKDF2+AES-128-CBC), injects into the shared WKWebView cookie store. Local-only; Safari unsupported (TCC). "Import Logins from Browser…" in the Shell menu |
 | `macos/Sources/BrowserErrorPage.swift` | In-page navigation error UI (cmux port): per-error copy + retry link instead of a blank webview |
 | `macos/Sources/BrowserHistory.swift` | Browser history + omnibar frecency scoring (cmux's suggestion engine); JSON file in Application Support |
 | `macos/Sources/BrowserSuggestionsView.swift` | Omnibar dropdown: ↑/↓ selects, Enter opens, click opens, Esc dismisses |

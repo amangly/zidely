@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Passkeys / Touch ID sign-in in the embedded WKWebView.
+
+      WKWebView reports isUserVerifyingPlatformAuthenticatorAvailable()
+      as false — and refuses platform passkeys — unless the embedding
+      app carries the web-browser public-key-credential entitlement.
+      These two are RESTRICTED (managed) entitlements: they only take
+      effect when the app is signed with an Apple Team ID and a
+      provisioning profile that Apple has granted the "WebKit /
+      Web Browser Public Key Credential" capability for. An ad-hoc /
+      unsigned build ignores them.
+
+      Request the capability at developer.apple.com (Certificates,
+      Identifiers & Profiles → your App ID → additional capabilities),
+      then build with CODESIGN_IDENTITY set (see macos/build.sh).
+    -->
+    <key>com.apple.developer.web-browser.public-key-credential</key>
+    <true/>
+    <key>com.apple.developer.web-browser</key>
+    <true/>
+</dict>
+</plist>

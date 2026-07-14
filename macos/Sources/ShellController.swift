@@ -611,6 +611,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         let collapse = NSMenuItem(title: "Collapse Focused Group", action: #selector(collapseFocusedGroup), keyEquivalent: ".")
         collapse.keyEquivalentModifierMask = [.command, .control]
         shellMenu.addItem(collapse)
+        shellMenu.addItem(NSMenuItem.separator())
+        shellMenu.addItem(withTitle: "Import Logins from Browser…", action: #selector(importBrowserLogins), keyEquivalent: "")
+        shellMenu.addItem(NSMenuItem.separator())
         let notifItem = NSMenuItem(title: "Show Notifications", action: #selector(toggleNotifications), keyEquivalent: "i")
         notifItem.keyEquivalentModifierMask = [.command, .shift]
         shellMenu.addItem(notifItem)
@@ -1517,6 +1520,50 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// The selected pane's webview, when the selection is a browser.
     var selectedWebView: WKWebView? {
         selectedPane.flatMap { webviews[$0] }
+    }
+
+    /// Import cookies from an installed browser so zide's browser opens
+    /// already signed in. cmux-style browser import — cookies stay on
+    /// this machine (source store → zide's local WKWebView store).
+    @objc func importBrowserLogins() {
+        let browsers = BrowserImport.detectChromium()
+        guard !browsers.isEmpty else {
+            let alert = NSAlert()
+            alert.messageText = "No importable browsers found"
+            alert.informativeText = "zide can import cookies from Chrome, Arc, Brave, Edge, Vivaldi, or Chromium. Safari isn't supported — its cookies are locked by macOS privacy protection."
+            alert.beginSheetModal(for: window)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Import logins from a browser"
+        alert.informativeText = "Copies cookies (your signed-in sessions) into zide's browser so pages open already logged in. macOS will ask permission to read the browser's key from your Keychain — that's expected. Nothing leaves this machine."
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
+        popup.addItems(withTitles: browsers.map(\.displayName))
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn, let self else { return }
+            let browser = browsers[popup.indexOfSelectedItem]
+            self.runBrowserImport(browser)
+        }
+    }
+
+    private func runBrowserImport(_ browser: ImportableBrowser) {
+        BrowserImport.importCookies(from: browser) { [weak self] result in
+            guard let self else { return }
+            let done = NSAlert()
+            switch result {
+            case let .success(count):
+                done.messageText = "Imported \(count) cookies from \(browser.displayName)"
+                done.informativeText = "Reload a page or open a new browser panel — you should be signed in. Refresh the page if it doesn't take effect immediately."
+            case let .failure(error):
+                done.alertStyle = .warning
+                done.messageText = "Couldn't import from \(browser.displayName)"
+                done.informativeText = "\(error)"
+            }
+            done.beginSheetModal(for: self.window)
+        }
     }
 
     @objc func zoomInBrowser() { adjustBrowserZoom(BrowserEngine.pageZoomStep) }

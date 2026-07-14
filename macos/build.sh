@@ -33,11 +33,25 @@ swiftc -O \
     -framework Carbon \
     -framework UniformTypeIdentifiers \
     -framework UserNotifications \
-    -lc++ -lz
+    -framework Security \
+    -lc++ -lz -lsqlite3
 
 cp Info.plist "$APP/Contents/"
 cp ../assets/macos/zide.icns "$APP/Contents/Resources/"
 cp -R ../vendor/ghostty/zig-out/share/ghostty "$APP/Contents/Resources/ghostty"
 cp -R ../vendor/ghostty/zig-out/share/terminfo "$APP/Contents/Resources/terminfo"
+
+# Passkey/Touch-ID sign-in in the browser needs the web-browser
+# public-key-credential entitlement, which only takes effect when the
+# app is signed with a real Apple Team ID + granted provisioning
+# profile. Set CODESIGN_IDENTITY (e.g. "Developer ID Application: You
+# (TEAMID)") to sign with the entitlements; otherwise the app is
+# ad-hoc signed and passkeys stay unavailable (everything else works).
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --deep --options runtime \
+        --entitlements zide.entitlements \
+        --sign "$CODESIGN_IDENTITY" "$APP"
+    echo "signed $APP with $CODESIGN_IDENTITY (entitlements applied)"
+fi
 
 echo "built $APP"
