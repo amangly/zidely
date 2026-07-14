@@ -246,11 +246,33 @@ final class WorkspaceHostView: NSView {
         return bar
     }
 
+    /// The pane whose focus pulse already played — chrome rebuilds must
+    /// not re-fire it; only genuine focus changes do.
+    private var lastPulsedPaneId: String?
+
     private func applyFocusBorder(_ host: NSView, focused: Bool) {
         if focused {
+            // cmux-style: the ring pulses in softly to show where focus
+            // landed, then fades out — the pane itself is the focus
+            // indicator, not a permanent frame.
             host.layer?.borderWidth = ShellTheme.focusBorder
-            host.layer?.borderColor = ShellTheme.accent.cgColor
+            host.layer?.borderColor = ShellTheme.accent.withAlphaComponent(0).cgColor
+            let id = host.identifier?.rawValue
+            if id != lastPulsedPaneId {
+                lastPulsedPaneId = id
+                let pulse = CAKeyframeAnimation(keyPath: "borderColor")
+                pulse.values = [
+                    ShellTheme.accent.withAlphaComponent(0).cgColor,
+                    ShellTheme.accent.withAlphaComponent(0.55).cgColor,
+                    ShellTheme.accent.withAlphaComponent(0.55).cgColor,
+                    ShellTheme.accent.withAlphaComponent(0).cgColor,
+                ]
+                pulse.keyTimes = [0, 0.15, 0.55, 1]
+                pulse.duration = 1.1
+                host.layer?.add(pulse, forKey: "focus-pulse")
+            }
         } else {
+            host.layer?.removeAnimation(forKey: "focus-pulse")
             host.layer?.borderWidth = 0
             host.layer?.borderColor = nil
         }
