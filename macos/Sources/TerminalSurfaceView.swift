@@ -122,7 +122,7 @@ final class TerminalSurfaceView: NSView {
     /// Shortcuts the shell owns are refused outright: ghostty binds some
     /// of them itself (cmd+t is its new_tab) and would swallow them —
     /// but zide's layout is daemon state, so the menu must win.
-    static let shellShortcuts: Set<String> = ["t", "n", "b", "k", "q", "h", "i", "u", "d", "p", "r", "g", "w", ".", "[", "]", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    static let shellShortcuts: Set<String> = ["t", "n", "b", "k", "l", "q", "h", "i", "u", "d", "p", "r", "g", "w", ".", "[", "]", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.type == .keyDown, window?.firstResponder === self else { return false }

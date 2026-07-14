@@ -34,7 +34,7 @@ final class TitlebarToolbar: NSView {
     }
 }
 
-final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDelegate, NotificationPanelDelegate, WorkspaceSwitcherDelegate, CommandPaletteDelegate, WKNavigationDelegate, NSWindowDelegate {
+final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDelegate, NotificationPanelDelegate, WorkspaceSwitcherDelegate, CommandPaletteDelegate, WKNavigationDelegate, WKUIDelegate, NSWindowDelegate {
     let client: SocketClient
     let runtime: GhosttyRuntime
     let zideBin: String
@@ -59,6 +59,8 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// Live browser page titles for sidebar rows (pane id → title).
     var browserTitles: [UInt64: String] = [:]
     var paneOfWebView: [ObjectIdentifier: UInt64] = [:]
+    /// KVO on each webview's url/title/nav state — live browser chrome.
+    var webObservations: [UInt64: [NSKeyValueObservation]] = [:]
     var selectedPane: UInt64?
     /// Last live session list, for spawn-into-current-session.
     var sessionIds: [UInt64] = []
@@ -574,6 +576,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         closeWs.keyEquivalentModifierMask = [.command, .shift]
         shellMenu.addItem(closeWs)
         shellMenu.addItem(withTitle: "Close Surface", action: #selector(closeSurface), keyEquivalent: "w")
+        shellMenu.addItem(withTitle: "Open Location", action: #selector(openLocation), keyEquivalent: "l")
         let focusNext = NSMenuItem(title: "Focus Next Pane", action: #selector(focusNextPane), keyEquivalent: "]")
         focusNext.keyEquivalentModifierMask = [.command, .option]
         shellMenu.addItem(focusNext)
@@ -1111,6 +1114,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             refresh()
             pushShellState()
         case "browser_removed":
+            webObservations.removeValue(forKey: pane)
             if let web = webviews.removeValue(forKey: pane) {
                 paneOfWebView.removeValue(forKey: ObjectIdentifier(web))
             }
@@ -1275,9 +1279,62 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         guard webviews[pane] == nil else { return }
         let web = WKWebView(frame: .zero)
         web.navigationDelegate = self
+        web.uiDelegate = self
         webviews[pane] = web
         paneOfWebView[ObjectIdentifier(web)] = pane
+        // Live browser chrome: the address bar, nav buttons, and the
+        // daemon's stored URL/title follow every navigation — not just
+        // page-load completion.
+        webObservations[pane] = [
+            web.observe(\.url) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+            web.observe(\.title) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+            web.observe(\.canGoBack) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+            web.observe(\.canGoForward) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+        ]
         if let u = URL(string: url) { web.load(URLRequest(url: u)) }
+    }
+
+    func browserStateChanged(_ web: WKWebView) {
+        guard let pane = paneOfWebView[ObjectIdentifier(web)] else { return }
+        if let title = web.title, !title.isEmpty, browserTitles[pane] != title {
+            browserTitles[pane] = title
+            viewModel.setBrowserTitle(pane: pane, title: title)
+            sidebar.apply(
+                items: viewModel.items,
+                selectedWorkspaceId: viewModel.selectedWorkspaceId,
+                collapsedGroups: viewModel.collapsedGroups)
+        }
+        host.updateBrowserChrome(
+            pane: pane,
+            url: web.url?.absoluteString,
+            canGoBack: web.canGoBack,
+            canGoForward: web.canGoForward)
+    }
+
+    /// target=_blank and window.open land in the same pane — zide is a
+    /// single-surface browser, like cmux's panel.
+    func webView(
+        _ webView: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        webView.load(navigationAction.request)
+        return nil
+    }
+
+    @objc func openLocation() {
+        if !host.focusOmnibar() {
+            statusLabel.stringValue = "no browser pane selected — ⌘⇧B opens one"
+        }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

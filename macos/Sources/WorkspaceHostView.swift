@@ -295,10 +295,56 @@ final class WorkspaceHostView: NSView {
         guard let raw = sender.identifier?.rawValue, raw.hasPrefix("omnibar:") else { return }
         let paneNodeId = String(raw.dropFirst("omnibar:".count))
         guard let surface = selectedSurface(paneId: paneNodeId), let paneId = surface.paneId else { return }
-        var url = sender.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !url.isEmpty else { return }
-        if !url.contains("://") { url = "https://" + url }
-        delegate?.workspaceHost(self, navigateBrowser: paneId, to: url)
+        // Omnibox semantics: URLs load, host-looking input gets a
+        // scheme, free text becomes a web search.
+        guard let url = BrowserURLResolver.resolve(sender.stringValue) else { return }
+        delegate?.workspaceHost(self, navigateBrowser: paneId, to: url.absoluteString)
+    }
+
+    /// Live address-bar/nav updates for a browser pane, without
+    /// rebuilding the header. The omnibar is left alone while the user
+    /// is editing it.
+    func updateBrowserChrome(pane: UInt64, url: String?, canGoBack: Bool, canGoForward: Bool) {
+        guard let workspace else { return }
+        let nodes: [ShellPaneNode]
+        switch workspace.layout {
+        case let .single(p): nodes = [p]
+        case let .split(_, a, b, _): nodes = [a, b]
+        }
+        for node in nodes {
+            guard let surface = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
+                ?? node.surfaces.first,
+                surface.kind == .browser, surface.paneId == pane
+            else { continue }
+            guard let host = subviews.first(where: { $0.identifier?.rawValue == "pane:\(node.id)" }),
+                  let header = host.subviews.first(where: { $0.identifier?.rawValue == "header" }),
+                  let bar = header.subviews.first(where: { $0.identifier?.rawValue == "browserBar" })
+            else { continue }
+            if let field = bar.subviews.first(where: { $0.tag == 4 }) as? NSTextField,
+               field.currentEditor() == nil, let url {
+                field.stringValue = url
+            }
+            (bar.subviews.first { $0.tag == 1 } as? NSButton)?.isEnabled = canGoBack
+            (bar.subviews.first { $0.tag == 2 } as? NSButton)?.isEnabled = canGoForward
+        }
+    }
+
+    /// Focus the selected browser pane's address bar (⌘L).
+    func focusOmnibar() -> Bool {
+        func walk(_ v: NSView) -> NSTextField? {
+            for sub in v.subviews {
+                if let field = sub as? NSTextField,
+                   sub.identifier?.rawValue.hasPrefix("omnibar:") == true {
+                    return field
+                }
+                if let found = walk(sub) { return found }
+            }
+            return nil
+        }
+        guard let field = walk(self) else { return false }
+        window?.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
+        return true
     }
 
     @objc private func browserBack(_ sender: NSButton) {
