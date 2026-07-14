@@ -25,6 +25,30 @@ Linux. See [ROADMAP.md](ROADMAP.md).
 zig build && ./macos/build.sh && open macos/out/Zide.app
 ```
 
+## Install (macOS)
+
+Build and install a self-contained `Zide.app` into `/Applications` — the
+`zide` daemon binary and all resources are bundled, so nothing else is
+needed afterward:
+
+```sh
+./macos/install.sh                       # → /Applications/Zide.app
+PREFIX=~/Applications ./macos/install.sh # install elsewhere
+```
+
+Or build a drag-to-Applications disk image to share:
+
+```sh
+./macos/make-dmg.sh                      # → macos/out/Zide-<version>.dmg
+```
+
+The dev build is ad-hoc signed. To sign (and enable browser passkey /
+Touch ID sign-in) pass a Developer ID:
+
+```sh
+CODESIGN_IDENTITY="Developer ID Application: You (TEAMID)" ./macos/install.sh
+```
+
 ## What it will be
 
 - **Agent multitasking** — spawn CLI agents (Claude Code, Codex, Aider, …)

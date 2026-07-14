@@ -41,6 +41,16 @@ cp ../assets/macos/zide.icns "$APP/Contents/Resources/"
 cp -R ../vendor/ghostty/zig-out/share/ghostty "$APP/Contents/Resources/ghostty"
 cp -R ../vendor/ghostty/zig-out/share/terminfo "$APP/Contents/Resources/terminfo"
 
+# Bundle the daemon binary so an installed app is self-contained:
+# main.swift finds `zide` next to its own executable, so a copy in
+# /Applications needs no ZIDE_BIN and no dev tree. Built by `zig build`.
+if [ -x ../zig-out/bin/zide ]; then
+    cp ../zig-out/bin/zide "$APP/Contents/MacOS/zide"
+else
+    echo "note: ../zig-out/bin/zide not found — run 'zig build' first for a" >&2
+    echo "      self-contained app; otherwise it falls back to the dev tree." >&2
+fi
+
 # Passkey/Touch-ID sign-in in the browser needs the web-browser
 # public-key-credential entitlement, which only takes effect when the
 # app is signed with a real Apple Team ID + granted provisioning

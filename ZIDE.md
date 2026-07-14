@@ -28,6 +28,15 @@ zig fmt src build.zig       # formatting (CI enforces --check)
 open macos/out/Zide.app     # the app; auto-starts the daemon
 ```
 
+Install / distribute (self-contained — the `zide` daemon binary is
+bundled into the app, so `main.swift` finds it next to its own
+executable; no dev tree or `ZIDE_BIN` needed once installed):
+
+```sh
+./macos/install.sh          # build + install to /Applications
+./macos/make-dmg.sh         # drag-to-Applications DMG in macos/out/
+```
+
 ## Toolchain
 
 - **Zig 0.15.2 exactly** — pinned to Ghostty v1.3.1's

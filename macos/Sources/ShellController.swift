@@ -521,7 +521,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             view = cached
         } else {
             guard let app = runtime.app else { return }
-            let command = "\(zideBin) attach \(pane) --socket \(socketPath)"
+            // Quote the paths: an installed app can live under a path
+            // with spaces (e.g. "/Users/Jane Doe/Applications").
+            let command = "'\(zideBin)' attach \(pane) --socket '\(socketPath)'"
             view = TerminalSurfaceView(app: app, command: command)
             view.onClose = { [weak self, weak view] in
                 guard let self else { return }
