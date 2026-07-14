@@ -31,7 +31,6 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     private var workspace: ShellWorkspace?
     private var focusedPaneId: String?
     private let emptyLabel = NSTextField(labelWithString: "no workspace — ⌘T new workspace · ⌘⇧P commands · j/k in sidebar")
-    private let attentionRing = NSView()
     /// Omnibar history dropdown — one shared overlay, floated above
     /// whichever browser panel's address bar is being typed in.
     private let suggestionsView = BrowserSuggestionsView(frame: .zero)
@@ -55,15 +54,8 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             self?.noteClick(event)
             return event
         }
-
-        attentionRing.wantsLayer = true
-        attentionRing.layer?.borderWidth = ShellTheme.attentionFlash
-        attentionRing.layer?.borderColor = ShellTheme.attention.cgColor
-        attentionRing.layer?.cornerRadius = 3
-        attentionRing.isHidden = true
-        attentionRing.identifier = NSUserInterfaceItemIdentifier("attention-ring")
-        attentionRing.layer?.zPosition = 10
-        addSubview(attentionRing)
+        // Attention shows on the sidebar row (dot/badge), cmux-style —
+        // no full-content border here.
     }
 
     @available(*, unavailable)
@@ -104,19 +96,17 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         hideSuggestions()
         self.workspace = workspace
         self.focusedPaneId = focusedPaneId ?? workspace?.layout.leaves.first?.id
-        subviews.filter { $0 !== emptyLabel && $0 !== attentionRing }
+        subviews.filter { $0 !== emptyLabel }
             .forEach { $0.removeFromSuperview() }
         guard let workspace, !workspace.layout.isEmpty else {
             emptyLabel.isHidden = false
             emptyLabel.stringValue = workspace == nil
                 ? "no workspace — ⌘T new workspace · ⌘⇧P commands · j/k in sidebar"
                 : "empty workspace — ⌘D opens a shell here, ⌘⇧W closes it"
-            attentionRing.isHidden = true
             return
         }
         emptyLabel.isHidden = true
         buildViews(for: workspace.layout, path: "")
-        attentionRing.isHidden = workspace.attention != .needsAttention && workspace.unreadCount == 0
         applyFrames(for: workspace)
     }
 
@@ -132,7 +122,7 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     private func buildViews(for layout: ShellLayout, path: String) {
         switch layout {
         case let .leaf(node):
-            addSubview(makePaneHost(node), positioned: .below, relativeTo: attentionRing)
+            addSubview(makePaneHost(node))
         case let .split(orientation, first, second, _):
             buildViews(for: first, path: path.isEmpty ? "0" : "\(path).0")
             let divider = SplitDividerView()
@@ -141,13 +131,12 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             divider.target = self
             divider.action = #selector(dividerDrag(_:))
             divider.identifier = NSUserInterfaceItemIdentifier("divider:\(path)")
-            addSubview(divider, positioned: .below, relativeTo: attentionRing)
+            addSubview(divider)
             buildViews(for: second, path: path.isEmpty ? "1" : "\(path).1")
         }
     }
 
     private func applyFrames(for workspace: ShellWorkspace) {
-        attentionRing.frame = bounds.insetBy(dx: 1, dy: 1)
         placeFrames(for: workspace.layout, in: bounds, path: "")
     }
 

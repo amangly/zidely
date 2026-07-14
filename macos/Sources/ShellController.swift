@@ -46,11 +46,14 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     let rightSidebar = RightSidebarView(frame: .zero)
     let host = WorkspaceHostView(frame: .zero)
     let notifPanel = NotificationPanelView(frame: .zero)
+    /// Notifications live in a real popover anchored to the bell —
+    /// transient (dismisses on outside click), with the system's own
+    /// material, shadow, and arrow.
+    let notifPopover = NSPopover()
     let switcher = WorkspaceSwitcherView(frame: .zero)
     let palette = CommandPaletteView(frame: .zero)
     let statusLabel = NSTextField(labelWithString: "")
     let viewModel: ShellViewModel
-    var notifPanelVisible = false
 
     var exited: Set<UInt64> = []
     var bells: Set<UInt64> = []
@@ -209,15 +212,14 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         rightSidebar.isHidden = true
         root.addSubview(rightSidebar)
 
-        notifPanel.frame = NSRect(
-            x: W - ShellTheme.notifPanelWidth - 20,
-            y: H - ShellTheme.notifPanelHeight - 40,
-            width: ShellTheme.notifPanelWidth,
-            height: ShellTheme.notifPanelHeight)
-        notifPanel.autoresizingMask = [.minXMargin, .minYMargin]
         notifPanel.delegate = self
-        notifPanel.isHidden = true
-        root.addSubview(notifPanel)
+        let notifVC = NSViewController()
+        notifVC.view = notifPanel
+        notifPopover.contentViewController = notifVC
+        notifPopover.behavior = .transient
+        notifPopover.animates = true
+        notifPopover.contentSize = NSSize(
+            width: ShellTheme.notifPanelWidth, height: ShellTheme.notifPanelHeight)
 
         switcher.frame = root.bounds
         switcher.autoresizingMask = [.width, .height]
@@ -358,12 +360,6 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         topBand.frame = NSRect(
             x: frame.origin.x, y: root.bounds.height - top,
             width: frame.width, height: top)
-        notifPanel.frame = NSRect(
-            x: root.bounds.width - ShellTheme.notifPanelWidth - 20
-                - (viewModel.rightSidebarVisible ? ShellTheme.rightSidebarWidth : 0),
-            y: root.bounds.height - ShellTheme.notifPanelHeight - 40,
-            width: ShellTheme.notifPanelWidth,
-            height: ShellTheme.notifPanelHeight)
         switcher.frame = root.bounds
         palette.frame = root.bounds
     }
@@ -832,14 +828,20 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     }
 
     @objc func toggleNotifications() {
-        if notifPanelVisible {
-            notifPanel.isHidden = true
-            notifPanelVisible = false
+        if notifPopover.isShown {
+            notifPopover.close()
             return
         }
         notifPanel.show(viewModel.notifications)
-        notifPanelVisible = true
-        window.contentView?.addSubview(notifPanel, positioned: .above, relativeTo: nil)
+        // Anchor to the bell; fall back to the sidebar's top edge if the
+        // titlebar accessory isn't laid out yet.
+        if bellButton.window != nil {
+            notifPopover.show(relativeTo: bellButton.bounds, of: bellButton, preferredEdge: .maxY)
+        } else {
+            notifPopover.show(
+                relativeTo: NSRect(x: 0, y: sidebar.bounds.height - 1, width: ShellTheme.sidebarWidth, height: 1),
+                of: sidebar, preferredEdge: .maxY)
+        }
     }
 
     @objc func jumpUnread() {
@@ -870,13 +872,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     func notificationPanelDidSelect(_ notification: ShellNotification) {
         viewModel.markNotificationRead(notification.id)
         viewModel.selectWorkspace(notification.workspaceId)
-        notifPanel.isHidden = true
-        notifPanelVisible = false
+        notifPopover.close()
         reloadChrome()
     }
 
     func notificationPanelDidClose() {
-        notifPanelVisible = false
+        notifPopover.close()
     }
 
     // MARK: Workspace switcher
@@ -1047,7 +1048,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             if self.viewModel.notifications.count > 50 {
                 self.viewModel.notifications.removeFirst(self.viewModel.notifications.count - 50)
             }
-            if self.notifPanelVisible { self.notifPanel.show(self.viewModel.notifications) }
+            if self.notifPopover.isShown { self.notifPanel.show(self.viewModel.notifications) }
             // Rows carry the newest notification as their snippet line;
             // they were built before history existed, so rebuild once.
             self.refresh()
@@ -1166,7 +1167,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         if viewModel.notifications.count > 50 {
             viewModel.notifications.removeFirst(viewModel.notifications.count - 50)
         }
-        if notifPanelVisible { notifPanel.show(viewModel.notifications) }
+        if notifPopover.isShown { notifPanel.show(viewModel.notifications) }
         bumpNoticeWatermark()
     }
 

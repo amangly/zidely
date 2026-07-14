@@ -11,7 +11,6 @@ final class NotificationPanelView: NSView, NSTableViewDataSource, NSTableViewDel
     weak var delegate: NotificationPanelDelegate?
 
     private var items: [ShellNotification] = []
-    private let effect = NSVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Notifications")
     private let closeButton = NSButton(title: "Done", target: nil, action: nil)
     private let table = NSTableView()
@@ -20,15 +19,8 @@ final class NotificationPanelView: NSView, NSTableViewDataSource, NSTableViewDel
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        // Native popover material — standard AppKit panel look.
-        wantsLayer = true
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = true
-        effect.material = .popover
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        effect.autoresizingMask = [.width, .height]
-        addSubview(effect)
+        // Hosted in an NSPopover, which supplies the material, arrow,
+        // shadow, and clipping — the content view stays transparent.
 
         titleLabel.font = ShellTheme.uiFontBold
         titleLabel.drawsBackground = false
@@ -69,7 +61,6 @@ final class NotificationPanelView: NSView, NSTableViewDataSource, NSTableViewDel
 
     override func layout() {
         super.layout()
-        effect.frame = bounds
         titleLabel.frame = NSRect(x: 16, y: bounds.height - 36, width: 220, height: 20)
         closeButton.frame = NSRect(x: bounds.width - 78, y: bounds.height - 38, width: 64, height: 26)
         let body = NSRect(x: 10, y: 10, width: bounds.width - 20, height: bounds.height - 52)
