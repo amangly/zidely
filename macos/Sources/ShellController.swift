@@ -63,6 +63,10 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// once per launch, after the first refresh.
     var noticesSeeded = false
     static let noticeSeqKey = "zide.noticeSeq"
+    /// Split layouts live in app memory; the daemon stashes them
+    /// (shell-state) so a relaunch rebuilds splits over live panes.
+    var shellStateRestored = false
+    var shellStateTimer: Timer?
 
     init(client: SocketClient, runtime: GhosttyRuntime, zideBin: String, socketPath: String, demoMode: Bool = false) {
         self.client = client
@@ -388,6 +392,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         guard let wsId = viewModel.selectedWorkspaceId else { return }
         viewModel.setSplitRatio(workspaceId: wsId, ratio: ratio)
         host.updateSplitRatio(ratio)
+        pushShellState()
     }
 
     func workspaceHost(_ host: WorkspaceHostView, didFocusPane paneId: String) {
@@ -599,6 +604,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         }
         if viewModel.closeSelectedWorkspace() {
             reloadChrome()
+            pushShellState()
         } else {
             statusLabel.stringValue = "no workspace to close"
         }
@@ -625,6 +631,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         }
         if viewModel.closeSelectedSurface() {
             reloadChrome()
+            pushShellState()
         } else {
             statusLabel.stringValue = "no surface to close"
         }
@@ -692,6 +699,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             self.paneSession[pane] = sid
             graft(wsId, pane)
             self.reloadChrome()
+            self.pushShellState()
         }
     }
 
@@ -824,6 +832,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             if !self.noticesSeeded {
                 self.noticesSeeded = true
                 self.fetchNoticeHistory()
+            }
+            if !self.shellStateRestored {
+                self.restoreShellState()
             }
         }
     }
@@ -1032,6 +1043,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             surfaces.removeValue(forKey: pane)
             viewModel.removePaneEverywhere(pane)
             refresh()
+            pushShellState()
         case "browser_removed":
             if let web = webviews.removeValue(forKey: pane) {
                 paneOfWebView.removeValue(forKey: ObjectIdentifier(web))
@@ -1116,6 +1128,64 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     func closeBrowserPane(_ pane: UInt64) {
         client.send(["cmd": "browser-close", "pane": pane]) { [weak self] _ in
             self?.refresh()
+        }
+    }
+
+    // MARK: Shell state (split layouts survive app relaunches)
+
+    /// Debounced: stash the current split layouts in the daemon.
+    func pushShellState() {
+        guard !demoMode, shellStateRestored else { return }
+        shellStateTimer?.invalidate()
+        shellStateTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            var splits: [[String: Any]] = []
+            for item in self.viewModel.items {
+                guard case let .workspace(w) = item,
+                      case let .split(o, first, second, ratio) = w.layout,
+                      let f = first.surfaces.first?.paneId,
+                      let s = second.surfaces.first?.paneId
+                else { continue }
+                splits.append([
+                    "f": f, "s": s,
+                    "h": o == ShellLayout.Orientation.horizontal,
+                    "r": Double(ratio),
+                ])
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: ["splits": splits]),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            self.client.send(["cmd": "set-shell-state", "data": json])
+        }
+    }
+
+    /// Rebuild stashed splits over panes that still exist. Runs once,
+    /// after the first refresh has populated rows and paneSession.
+    func restoreShellState() {
+        client.send(["cmd": "get-shell-state"]) { [weak self] resp in
+            guard let self else { return }
+            defer { self.shellStateRestored = true }
+            guard let json = resp["data"] as? String,
+                  let data = json.data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let splits = obj["splits"] as? [[String: Any]]
+            else { return }
+            var changed = false
+            for split in splits {
+                guard let f = (split["f"] as? NSNumber)?.uint64Value,
+                      let s = (split["s"] as? NSNumber)?.uint64Value,
+                      self.paneSession[f] != nil, self.paneSession[s] != nil,
+                      !self.exited.contains(f), !self.exited.contains(s)
+                else { continue }
+                let horizontal = (split["h"] as? Bool) ?? true
+                let ratio = CGFloat((split["r"] as? NSNumber)?.doubleValue ?? 0.5)
+                self.viewModel.graftSplit(
+                    workspaceId: "term-\(f)",
+                    orientation: horizontal ? .horizontal : .vertical,
+                    paneId: s)
+                self.viewModel.setSplitRatio(workspaceId: "term-\(f)", ratio: ratio)
+                changed = true
+            }
+            if changed { self.refresh() }
         }
     }
 
