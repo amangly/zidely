@@ -16,6 +16,16 @@ protocol WorkspaceHostViewDelegate: AnyObject {
 final class WorkspaceHostView: NSView {
     weak var delegate: WorkspaceHostViewDelegate?
 
+    /// Terminal transparency: with a non-opaque window, the canvas and
+    /// pane slots must not paint or they block the see-through
+    /// terminal background.
+    var transparentBackground = false {
+        didSet {
+            layer?.backgroundColor = transparentBackground
+                ? NSColor.clear.cgColor : ShellTheme.contentBg.cgColor
+        }
+    }
+
     private var workspace: ShellWorkspace?
     private var focusedPaneId: String?
     private let emptyLabel = NSTextField(labelWithString: "no workspace — ⌘T terminal · ⌘⇧P commands · j/k in sidebar")
@@ -165,7 +175,8 @@ final class WorkspaceHostView: NSView {
 
         let slot = NSView()
         slot.wantsLayer = true
-        slot.layer?.backgroundColor = ShellTheme.contentBg.cgColor
+        slot.layer?.backgroundColor = transparentBackground
+            ? NSColor.clear.cgColor : ShellTheme.contentBg.cgColor
         slot.identifier = NSUserInterfaceItemIdentifier("slot")
         host.addSubview(slot)
 

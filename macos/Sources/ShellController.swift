@@ -108,6 +108,18 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         window.titlebarAppearsTransparent = true
         buildTitlebar()
         window.minSize = NSSize(width: 860, height: 520)
+
+        // Terminal transparency follows the user's ghostty config
+        // (background-opacity < 1): non-opaque window + the config's
+        // background blur, exactly like ghostty's own window setup.
+        if runtime.backgroundOpacity < 1 {
+            window.isOpaque = false
+            // Ghostty uses near-clear white rather than .clear — it
+            // matches Terminal.app's transparent look more closely.
+            window.backgroundColor = .white.withAlphaComponent(0.001)
+            runtime.applyBackgroundBlur(to: window)
+            host.transparentBackground = true
+        }
         let root = window.contentView!
         let W = root.bounds.width
         let H = root.bounds.height

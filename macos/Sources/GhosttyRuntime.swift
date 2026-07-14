@@ -66,6 +66,22 @@ final class GhosttyRuntime {
         ghostty_app_tick(app)
     }
 
+    /// background-opacity from the user's ghostty config (1.0 = opaque).
+    var backgroundOpacity: Double {
+        guard let config else { return 1 }
+        var v: Double = 1
+        let key = "background-opacity"
+        _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+        return v
+    }
+
+    /// Apply the config's background blur to a window (no-op when the
+    /// config doesn't enable blur).
+    func applyBackgroundBlur(to window: NSWindow) {
+        guard let app else { return }
+        ghostty_set_window_background_blur(app, Unmanaged.passUnretained(window).toOpaque())
+    }
+
     func setFocus(_ focused: Bool) {
         guard let app else { return }
         ghostty_app_set_focus(app, focused)
