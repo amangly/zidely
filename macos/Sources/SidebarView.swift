@@ -69,6 +69,15 @@ final class SidebarView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Terminal-transparency mode: swap the vibrancy material for a
+    /// flat tint so the sidebar synchronizes with the terminal's
+    /// background color (the window-level blur still shows through).
+    func applyTint(_ color: NSColor) {
+        for sub in effect.subviews { addSubview(sub) }
+        effect.removeFromSuperview()
+        layer?.backgroundColor = color.cgColor
+    }
+
     override func layout() {
         super.layout()
         effect.frame = bounds

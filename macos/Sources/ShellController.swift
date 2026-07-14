@@ -130,6 +130,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 v.wantsLayer = true
                 v.layer?.backgroundColor = band.cgColor
             }
+            sidebar.applyTint(band)
         } else {
             topBand.isHidden = true
             bottomBand.isHidden = true
