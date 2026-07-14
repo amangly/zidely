@@ -59,6 +59,11 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     // Titlebar chrome (cmux-style: the titlebar is the toolbar).
     let bellButton = NSButton()
     let titlebarTitle = NSTextField(labelWithString: "")
+    /// With terminal transparency on, the titlebar band and status
+    /// strip tint with the terminal's own background color + opacity —
+    /// otherwise they read as mismatched solid slabs.
+    let topBand = NSView()
+    let bottomBand = NSView()
     /// The daemon's notice history is seeded into the panel exactly
     /// once per launch, after the first refresh.
     var noticesSeeded = false
@@ -119,6 +124,15 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             window.backgroundColor = .white.withAlphaComponent(0.001)
             runtime.applyBackgroundBlur(to: window)
             host.transparentBackground = true
+            let band = runtime.backgroundColor
+                .withAlphaComponent(runtime.backgroundOpacity)
+            for v in [topBand, bottomBand] {
+                v.wantsLayer = true
+                v.layer?.backgroundColor = band.cgColor
+            }
+        } else {
+            topBand.isHidden = true
+            bottomBand.isHidden = true
         }
         let root = window.contentView!
         let W = root.bounds.width
@@ -132,6 +146,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
         let top = ShellTheme.titlebarClearance
         let statusH = ShellTheme.statusHeight
+
+        root.addSubview(topBand)
+        root.addSubview(bottomBand)
 
         host.frame = NSRect(x: sw + 1, y: statusH, width: W - sw - 1, height: H - statusH - top)
         host.autoresizingMask = [.width, .height]
@@ -293,6 +310,11 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             width: root.bounds.width - left - right - (left > 0 ? 1 : 0) - (right > 0 ? 1 : 0),
             height: root.bounds.height - statusH - top)
         host.frame = frame
+        topBand.frame = NSRect(
+            x: frame.origin.x, y: root.bounds.height - top,
+            width: frame.width, height: top)
+        bottomBand.frame = NSRect(
+            x: frame.origin.x, y: 0, width: frame.width, height: statusH)
         statusLabel.frame = NSRect(x: frame.origin.x + 12, y: 5, width: frame.width - 24, height: 18)
         notifPanel.frame = NSRect(
             x: root.bounds.width - ShellTheme.notifPanelWidth - 20
@@ -1312,7 +1334,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         let alert = NSAlert()
         alert.messageText = "Open browser pane"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: ShellTheme.alertFieldHeight))
-        field.stringValue = "https://ziglang.org"
+        field.stringValue = "https://google.com"
         alert.accessoryView = field
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")

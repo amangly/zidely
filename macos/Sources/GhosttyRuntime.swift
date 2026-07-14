@@ -75,6 +75,22 @@ final class GhosttyRuntime {
         return v
     }
 
+    /// The terminal background color from the user's ghostty config —
+    /// chrome bands tint with it so the window reads as one surface.
+    var backgroundColor: NSColor {
+        guard let config else { return .black }
+        var c = ghostty_config_color_s()
+        let key = "background"
+        guard ghostty_config_get(config, &c, key, UInt(key.lengthOfBytes(using: .utf8))) else {
+            return .black
+        }
+        return NSColor(
+            srgbRed: CGFloat(c.r) / 255,
+            green: CGFloat(c.g) / 255,
+            blue: CGFloat(c.b) / 255,
+            alpha: 1)
+    }
+
     /// Apply the config's background blur to a window (no-op when the
     /// config doesn't enable blur).
     func applyBackgroundBlur(to window: NSWindow) {
