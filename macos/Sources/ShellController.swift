@@ -65,6 +65,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// about:blank, but the omnibar must keep showing where the user
     /// was trying to go.
     var browserErrorURL: [UInt64: String] = [:]
+    /// URLs whose browser-open WE initiated from an in-page action
+    /// (target=_blank, cmd-click): the matching browser_open event
+    /// focuses the new pane, like a browser focusing a new tab —
+    /// otherwise the click feels like it did nothing. CLI/daemon opens
+    /// stay background.
+    var pendingBrowserFocus: [String] = []
     var selectedPane: UInt64?
     /// Last live session list, for spawn-into-current-session.
     var sessionIds: [UInt64] = []
@@ -1152,8 +1158,18 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             viewModel.removePaneEverywhere(pane)
             refresh()
         case "browser_open":
-            ensureWebView(pane: pane, url: obj["url"] as? String ?? "about:blank")
+            let url = obj["url"] as? String ?? "about:blank"
+            ensureWebView(pane: pane, url: url)
             refresh()
+            if let idx = pendingBrowserFocus.firstIndex(of: url) {
+                pendingBrowserFocus.remove(at: idx)
+                // refresh() replies async — select once the row exists.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                    guard let self else { return }
+                    self.viewModel.selectWorkspace("web-\(pane)")
+                    self.reloadChrome()
+                }
+            }
         case "browser_nav":
             if let web = webviews[pane], let u = URL(string: obj["url"] as? String ?? "") {
                 web.load(URLRequest(url: u))
@@ -1392,9 +1408,16 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 parent: window, underPageColor: webView.underPageBackgroundColor)
         }
         if let url = navigationAction.request.url, !demoMode {
-            client.send(["cmd": "browser-open", "session": currentSession, "url": url.absoluteString])
+            openBrowserPaneFocused(url.absoluteString)
         }
         return nil
+    }
+
+    /// Open a new browser pane from an in-page action and focus it
+    /// once the daemon's browser_open lands.
+    func openBrowserPaneFocused(_ url: String) {
+        pendingBrowserFocus.append(url)
+        client.send(["cmd": "browser-open", "session": currentSession, "url": url])
     }
 
     /// window.close() on a pane-hosted browser closes the pane.
@@ -1496,9 +1519,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         if navigationAction.navigationType == .linkActivated,
            navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == 2 {
             decisionHandler(.cancel)
-            if !demoMode {
-                client.send(["cmd": "browser-open", "session": currentSession, "url": url.absoluteString])
-            }
+            if !demoMode { openBrowserPaneFocused(url.absoluteString) }
             return
         }
         decisionHandler(.allow)
