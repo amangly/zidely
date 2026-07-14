@@ -564,87 +564,87 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         appMenu.addItem(withTitle: "Quit zide", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
-        let shellItem = NSMenuItem()
-        menu.addItem(shellItem)
-        let shellMenu = NSMenu(title: "Shell")
-        shellMenu.addItem(withTitle: "New Terminal", action: #selector(addTerm), keyEquivalent: "t")
-        shellMenu.addItem(withTitle: "New Session", action: #selector(addSession), keyEquivalent: "n")
-        let browserItem = NSMenuItem(title: "New Browser Pane", action: #selector(addWeb), keyEquivalent: "b")
-        browserItem.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(browserItem)
-        shellMenu.addItem(NSMenuItem.separator())
-        shellMenu.addItem(withTitle: "Split Right", action: #selector(splitRight), keyEquivalent: "d")
-        let splitDown = NSMenuItem(title: "Split Down", action: #selector(splitDown), keyEquivalent: "d")
-        splitDown.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(splitDown)
-        shellMenu.addItem(NSMenuItem.separator())
-        shellMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(toggleSidebar), keyEquivalent: "b")
-        let rightSide = NSMenuItem(title: "Toggle Right Sidebar", action: #selector(toggleRightSidebar), keyEquivalent: "b")
-        rightSide.keyEquivalentModifierMask = [.command, .option]
-        shellMenu.addItem(rightSide)
-        shellMenu.addItem(withTitle: "Go to Workspace…", action: #selector(showSwitcher), keyEquivalent: "p")
-        let paletteItem = NSMenuItem(title: "Command Palette…", action: #selector(showPalette), keyEquivalent: "p")
-        paletteItem.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(paletteItem)
-        let renameItem = NSMenuItem(title: "Rename Workspace…", action: #selector(renameSelected), keyEquivalent: "r")
-        renameItem.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(renameItem)
-        let closeWs = NSMenuItem(title: "Close Workspace", action: #selector(closeWorkspace), keyEquivalent: "w")
-        closeWs.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(closeWs)
-        shellMenu.addItem(withTitle: "Close Surface", action: #selector(closeSurface), keyEquivalent: "w")
-        shellMenu.addItem(withTitle: "Open Location", action: #selector(openLocation), keyEquivalent: "l")
-        // Browser page zoom; in terminal panes ghostty keeps these
-        // keys (font size) since they're not in shellShortcuts.
-        shellMenu.addItem(withTitle: "Zoom In", action: #selector(zoomInBrowser), keyEquivalent: "+")
-        shellMenu.addItem(withTitle: "Zoom Out", action: #selector(zoomOutBrowser), keyEquivalent: "-")
-        shellMenu.addItem(withTitle: "Actual Size", action: #selector(zoomActualBrowser), keyEquivalent: "0")
-        let focusNext = NSMenuItem(title: "Focus Next Pane", action: #selector(focusNextPane), keyEquivalent: "]")
-        focusNext.keyEquivalentModifierMask = [.command, .option]
-        shellMenu.addItem(focusNext)
-        let focusPrev = NSMenuItem(title: "Focus Previous Pane", action: #selector(focusPrevPane), keyEquivalent: "[")
-        focusPrev.keyEquivalentModifierMask = [.command, .option]
-        shellMenu.addItem(focusPrev)
-        let newGroup = NSMenuItem(title: "New Empty Group", action: #selector(newEmptyGroup), keyEquivalent: "g")
-        newGroup.keyEquivalentModifierMask = [.command, .control]
-        shellMenu.addItem(newGroup)
-        let collapse = NSMenuItem(title: "Collapse Focused Group", action: #selector(collapseFocusedGroup), keyEquivalent: ".")
-        collapse.keyEquivalentModifierMask = [.command, .control]
-        shellMenu.addItem(collapse)
-        shellMenu.addItem(NSMenuItem.separator())
-        shellMenu.addItem(withTitle: "Import Logins from Browser…", action: #selector(importBrowserLogins), keyEquivalent: "")
-        shellMenu.addItem(NSMenuItem.separator())
-        let notifItem = NSMenuItem(title: "Show Notifications", action: #selector(toggleNotifications), keyEquivalent: "i")
-        notifItem.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(notifItem)
-        let unreadItem = NSMenuItem(title: "Jump to Unread", action: #selector(jumpUnread), keyEquivalent: "u")
-        unreadItem.keyEquivalentModifierMask = [.command, .shift]
-        shellMenu.addItem(unreadItem)
-        shellMenu.addItem(NSMenuItem.separator())
-        let prev = NSMenuItem(title: "Previous Workspace", action: #selector(prevWorkspace), keyEquivalent: "[")
-        prev.keyEquivalentModifierMask = [.command, .control]
-        shellMenu.addItem(prev)
-        let next = NSMenuItem(title: "Next Workspace", action: #selector(nextWorkspace), keyEquivalent: "]")
-        next.keyEquivalentModifierMask = [.command, .control]
-        shellMenu.addItem(next)
-        for i in 1...9 {
-            let item = NSMenuItem(
-                title: "Workspace \(i)",
-                action: #selector(jumpWorkspace(_:)),
-                keyEquivalent: "\(i)")
-            item.tag = i - 1
-            shellMenu.addItem(item)
+        // One long flat menu is hard to scan; group into standard
+        // macOS parent menus (File / Edit / View / Workspace) with
+        // nested submenus. Same actions and shortcuts, better shape.
+        func item(_ title: String, _ action: Selector, key: String = "",
+                  _ mods: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+            let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            if !key.isEmpty { it.keyEquivalentModifierMask = mods }
+            it.target = self
+            return it
         }
-        shellMenu.items.forEach { $0.target = self }
-        shellItem.submenu = shellMenu
+        func submenu(_ title: String, into parent: NSMenu, _ children: [NSMenuItem]) {
+            let host = NSMenuItem()
+            // Nested submenu items display the item's own title, not the
+            // menu's — set both so blank labels don't appear.
+            host.title = title
+            let m = NSMenu(title: title)
+            children.forEach { m.addItem($0) }
+            host.submenu = m
+            parent.addItem(host)
+        }
 
-        let editItem = NSMenuItem()
-        menu.addItem(editItem)
+        // A one-off setup action belongs in the app menu.
+        appMenu.insertItem(.separator(), at: 0)
+        appMenu.insertItem(item("Import Logins from Browser…", #selector(importBrowserLogins)), at: 0)
+
+        submenu("File", into: menu, [
+            item("New Workspace", #selector(addTerm), key: "t"),
+            item("New Empty Session", #selector(addSession), key: "n"),
+            item("New Browser Panel", #selector(addWeb), key: "b", [.command, .shift]),
+            .separator(),
+            item("Open Location…", #selector(openLocation), key: "l"),
+            .separator(),
+            item("Close Panel", #selector(closeSurface), key: "w"),
+            item("Close Workspace", #selector(closeWorkspace), key: "w", [.command, .shift]),
+        ])
+
+        // Edit: standard responder actions — target stays nil so they
+        // route through the responder chain to the focused view.
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editItem.submenu = editMenu
+        let editItem = NSMenuItem(); editItem.submenu = editMenu; menu.addItem(editItem)
+
+        let viewMenu = NSMenu(title: "View")
+        viewMenu.addItem(item("Toggle Sidebar", #selector(toggleSidebar), key: "b"))
+        viewMenu.addItem(item("Toggle Right Sidebar", #selector(toggleRightSidebar), key: "b", [.command, .option]))
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(item("Show Notifications", #selector(toggleNotifications), key: "i", [.command, .shift]))
+        viewMenu.addItem(item("Jump to Unread", #selector(jumpUnread), key: "u", [.command, .shift]))
+        viewMenu.addItem(.separator())
+        // Browser page zoom; terminal panes keep these keys for ghostty
+        // font size (not in shellShortcuts).
+        submenu("Browser Zoom", into: viewMenu, [
+            item("Zoom In", #selector(zoomInBrowser), key: "+"),
+            item("Zoom Out", #selector(zoomOutBrowser), key: "-"),
+            item("Actual Size", #selector(zoomActualBrowser), key: "0"),
+        ])
+        let viewItem = NSMenuItem(); viewItem.submenu = viewMenu; menu.addItem(viewItem)
+
+        let wsMenu = NSMenu(title: "Workspace")
+        wsMenu.addItem(item("Split Right", #selector(splitRight), key: "d"))
+        wsMenu.addItem(item("Split Down", #selector(splitDown), key: "d", [.command, .shift]))
+        wsMenu.addItem(.separator())
+        wsMenu.addItem(item("Focus Next Pane", #selector(focusNextPane), key: "]", [.command, .option]))
+        wsMenu.addItem(item("Focus Previous Pane", #selector(focusPrevPane), key: "[", [.command, .option]))
+        wsMenu.addItem(.separator())
+        wsMenu.addItem(item("Go to Workspace…", #selector(showSwitcher), key: "p"))
+        wsMenu.addItem(item("Command Palette…", #selector(showPalette), key: "p", [.command, .shift]))
+        wsMenu.addItem(item("Previous Workspace", #selector(prevWorkspace), key: "[", [.command, .control]))
+        wsMenu.addItem(item("Next Workspace", #selector(nextWorkspace), key: "]", [.command, .control]))
+        submenu("Switch to", into: wsMenu, (1...9).map { i in
+            let it = item("Workspace \(i)", #selector(jumpWorkspace(_:)), key: "\(i)")
+            it.tag = i - 1
+            return it
+        })
+        wsMenu.addItem(.separator())
+        wsMenu.addItem(item("Rename Workspace…", #selector(renameSelected), key: "r", [.command, .shift]))
+        wsMenu.addItem(item("New Empty Group", #selector(newEmptyGroup), key: "g", [.command, .control]))
+        wsMenu.addItem(item("Collapse Focused Group", #selector(collapseFocusedGroup), key: ".", [.command, .control]))
+        let wsItem = NSMenuItem(); wsItem.submenu = wsMenu; menu.addItem(wsItem)
 
         NSApp.mainMenu = menu
     }
