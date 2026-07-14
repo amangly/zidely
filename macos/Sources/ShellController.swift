@@ -693,6 +693,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     }
 
     @objc func closeWorkspace() {
+        if closeAuxiliaryKeyWindow() { return }
         if !demoMode, let ws = viewModel.selectedWorkspace {
             // Close daemon-side or the workspace resurrects as a row on
             // the next refresh: terminals get their child killed,
@@ -715,6 +716,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     }
 
     @objc func closeSurface() {
+        if closeAuxiliaryKeyWindow() { return }
         if !demoMode, let ws = viewModel.selectedWorkspace {
             let nodes: [ShellPaneNode]
             switch ws.layout {
@@ -739,6 +741,16 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         } else {
             statusLabel.stringValue = "no surface to close"
         }
+    }
+
+    /// ⌘W (and ⌘⇧W) pressed while a popup or other auxiliary window is
+    /// key must close THAT window — never reach into the main window
+    /// and kill its selected pane. (An OAuth popup's ⌘W once killed
+    /// the user's terminal.)
+    private func closeAuxiliaryKeyWindow() -> Bool {
+        guard let key = NSApp.keyWindow, key !== window else { return false }
+        key.performClose(nil)
+        return true
     }
 
     /// Every surface in a layout.
@@ -939,6 +951,41 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             }
             if !self.shellStateRestored {
                 self.restoreShellState()
+            }
+            // zide is a terminal first: when the last shell dies (exit,
+            // crash, ⌘W), the app must not strand the user in a
+            // browser-only shell — keep at least one live terminal.
+            let liveTerminals = parsed.flatMap(\.panes).filter { !self.exited.contains($0) }
+            if liveTerminals.isEmpty {
+                self.ensureTerminalPane()
+            } else {
+                self.terminalEnsureAttempts = 0
+            }
+        }
+    }
+
+    /// Spawn a fresh default shell without touching the selection.
+    /// Bounded: a shell that dies instantly must not spawn-loop.
+    private var ensuringTerminal = false
+    private var terminalEnsureAttempts = 0
+    private func ensureTerminalPane() {
+        guard !demoMode, !ensuringTerminal, terminalEnsureAttempts < 3 else { return }
+        ensuringTerminal = true
+        terminalEnsureAttempts += 1
+        let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        let spawn: (UInt64) -> Void = { [weak self] sid in
+            guard let self else { return }
+            self.client.send(["cmd": "spawn-pane", "session": sid,
+                              "argv": [shellPath, "-i"], "cwd": NSHomeDirectory()]) { _ in
+                self.ensuringTerminal = false
+                self.refresh()
+            }
+        }
+        if let sid = sessionIds.first {
+            spawn(sid)
+        } else {
+            client.send(["cmd": "create-session", "title": "main"]) { resp in
+                spawn((resp["session"] as? NSNumber)?.uint64Value ?? 1)
             }
         }
     }
