@@ -238,6 +238,34 @@ pub const Server = struct {
         return id;
     }
 
+    /// Retitle a session (shells rename their workspace rows).
+    pub fn renameSession(self: *Server, id: SessionId, title: []const u8) !void {
+        const sess = self.sessions.getPtr(id) orelse return error.NoSuchSession;
+        const owned = try self.alloc.dupe(u8, title);
+        self.alloc.free(sess.title);
+        sess.title = owned;
+    }
+
+    /// Remove a session whose terminal panes are all gone — kill and
+    /// remove them first (their kernel completions must drain from
+    /// request context, same rule as removePane). Browser panes are
+    /// pure state and close with the session; callers broadcast their
+    /// removal.
+    pub fn removeSession(self: *Server, id: SessionId) !void {
+        const sess = self.sessions.getPtr(id) orelse return error.NoSuchSession;
+        if (sess.panes.items.len != 0) return error.SessionNotEmpty;
+        while (sess.browsers.items.len > 0) {
+            const bid = sess.browsers.items[sess.browsers.items.len - 1];
+            self.closeBrowserPane(bid) catch {
+                _ = sess.browsers.pop();
+            };
+        }
+        var removed = self.sessions.fetchRemove(id).?.value;
+        removed.panes.deinit(self.alloc);
+        removed.browsers.deinit(self.alloc);
+        self.alloc.free(removed.title);
+    }
+
     pub fn getSession(self: *Server, id: SessionId) ?Session {
         return self.sessions.get(id);
     }

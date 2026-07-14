@@ -1,5 +1,10 @@
 // View-model for the cmux-look shell chrome.
-// Demo fixtures now; socket mapping fills the same shapes later.
+//
+// The cmux system, mapped onto zide's daemon: a sidebar row is a
+// WORKSPACE (one daemon session), and a workspace contains a recursive
+// split tree of panels — terminal panes on the left, browser panels
+// docked as a right-hand column (cmux's _dockSplit). Browsers never
+// become sidebar rows of their own.
 
 import Foundation
 import CoreGraphics
@@ -24,13 +29,110 @@ struct ShellPaneNode: Equatable, Identifiable {
     var selectedSurfaceId: String
 }
 
-enum ShellLayout: Equatable {
-    case single(ShellPaneNode)
-    case split(orientation: Orientation, first: ShellPaneNode, second: ShellPaneNode, ratio: CGFloat)
+/// cmux-style surface tree: leaves are panels, splits nest arbitrarily.
+indirect enum ShellLayout: Equatable {
+    case leaf(ShellPaneNode)
+    case split(orientation: Orientation, first: ShellLayout, second: ShellLayout, ratio: CGFloat)
 
     enum Orientation: Equatable {
         case horizontal
         case vertical
+    }
+
+    var leaves: [ShellPaneNode] {
+        switch self {
+        case let .leaf(node): return [node]
+        case let .split(_, a, b, _): return a.leaves + b.leaves
+        }
+    }
+
+    var daemonPaneIds: [UInt64] {
+        leaves.flatMap { $0.surfaces.compactMap(\.paneId) }
+    }
+
+    /// A placeholder tree for a workspace with no panels yet.
+    static func empty(_ tag: String) -> ShellLayout {
+        .leaf(ShellPaneNode(id: "empty-\(tag)", surfaces: [], selectedSurfaceId: ""))
+    }
+
+    var isEmpty: Bool {
+        leaves.allSatisfy(\.surfaces.isEmpty)
+    }
+
+    func mapLeaves(_ body: (ShellPaneNode) -> ShellPaneNode) -> ShellLayout {
+        switch self {
+        case let .leaf(node):
+            return .leaf(body(node))
+        case let .split(o, a, b, r):
+            return .split(orientation: o, first: a.mapLeaves(body), second: b.mapLeaves(body), ratio: r)
+        }
+    }
+
+    /// Drop leaves the predicate rejects, collapsing half-empty splits
+    /// to the surviving side. nil when nothing survives.
+    func pruned(keep: (ShellPaneNode) -> Bool) -> ShellLayout? {
+        switch self {
+        case let .leaf(node):
+            return keep(node) ? self : nil
+        case let .split(o, a, b, r):
+            switch (a.pruned(keep: keep), b.pruned(keep: keep)) {
+            case let (first?, second?):
+                return .split(orientation: o, first: first, second: second, ratio: r)
+            case let (first?, nil): return first
+            case let (nil, second?): return second
+            case (nil, nil): return nil
+            }
+        }
+    }
+
+    /// Split the leaf with `id` in place: it keeps the first half, the
+    /// new node takes the second.
+    func splittingLeaf(
+        id: String, orientation: Orientation, with node: ShellPaneNode, ratio: CGFloat = 0.5
+    ) -> ShellLayout {
+        switch self {
+        case let .leaf(existing):
+            guard existing.id == id else { return self }
+            return .split(orientation: orientation, first: self, second: .leaf(node), ratio: ratio)
+        case let .split(o, a, b, r):
+            return .split(
+                orientation: o,
+                first: a.splittingLeaf(id: id, orientation: orientation, with: node, ratio: ratio),
+                second: b.splittingLeaf(id: id, orientation: orientation, with: node, ratio: ratio),
+                ratio: r)
+        }
+    }
+
+    /// Splits are addressed by path from the root: "" is the root
+    /// split, then "0"/"1" per side, "0.1", ... — divider drags name
+    /// the split they belong to.
+    func settingRatio(path: String, ratio: CGFloat) -> ShellLayout {
+        let clamped = min(0.85, max(0.15, ratio))
+        func walk(_ layout: ShellLayout, _ remaining: Substring) -> ShellLayout {
+            guard case let .split(o, a, b, r) = layout else { return layout }
+            if remaining.isEmpty {
+                return .split(orientation: o, first: a, second: b, ratio: clamped)
+            }
+            let head = remaining.prefix(1)
+            let rest = remaining.dropFirst(head == remaining ? 1 : 2)
+            if head == "0" {
+                return .split(orientation: o, first: walk(a, rest), second: b, ratio: r)
+            }
+            return .split(orientation: o, first: a, second: walk(b, rest), ratio: r)
+        }
+        return walk(self, Substring(path))
+    }
+
+    /// The dock: the right side of the root horizontal split when it
+    /// holds only browser panels (cmux's _dockSplit shape).
+    var dock: ShellLayout? {
+        guard case let .split(o, _, second, _) = self, o == .horizontal,
+              !second.isEmpty,
+              second.leaves.allSatisfy({ node in
+                  node.surfaces.allSatisfy { $0.kind == .browser }
+              })
+        else { return nil }
+        return second
     }
 }
 
@@ -44,6 +146,8 @@ enum ShellAttention: Equatable {
 struct ShellWorkspace: Equatable, Identifiable {
     var id: String
     var title: String
+    /// Daemon session backing this workspace; nil in demo fixtures.
+    var sessionId: UInt64?
     var cwd: String?
     var branch: String?
     var branchDirty: Bool
@@ -76,12 +180,6 @@ struct ShellNotification: Equatable, Identifiable {
     var isRead: Bool
 }
 
-struct ClosedSurfaceRecord: Equatable {
-    var workspaceId: String
-    var paneId: String
-    var surface: ShellSurface
-}
-
 final class ShellViewModel {
     var items: [ShellSidebarItem] = []
     var selectedWorkspaceId: String?
@@ -89,10 +187,8 @@ final class ShellViewModel {
     var notifications: [ShellNotification] = []
     var sidebarVisible = true
     var rightSidebarVisible = false
-    /// Which pane host has the cmux focus ring inside the selected workspace.
+    /// Which leaf has the cmux focus ring inside the selected workspace.
     var focusedPaneId: String?
-    /// Recently closed surfaces for ⌘⇧T reopen (local chrome only).
-    var closedSurfaces: [ClosedSurfaceRecord] = []
 
     var selectedWorkspace: ShellWorkspace? {
         guard let selectedWorkspaceId else { return nil }
@@ -109,16 +205,13 @@ final class ShellViewModel {
     /// Visible workspace ids respecting collapsed groups.
     var visibleWorkspaceIds: [String] {
         var out: [String] = []
-        var currentGroup: String?
         var collapsed = false
         for item in items {
             switch item {
             case let .group(id, _):
-                currentGroup = id
                 collapsed = collapsedGroups.contains(id)
             case let .workspace(w):
                 if !collapsed { out.append(w.id) }
-                _ = currentGroup
             }
         }
         return out
@@ -145,9 +238,8 @@ final class ShellViewModel {
     func selectWorkspace(_ id: String) {
         selectedWorkspaceId = id
         markWorkspaceRead(id)
-        // Default focus to the first pane of the workspace.
         if let ws = workspace(id: id) {
-            focusedPaneId = firstPaneId(of: ws.layout)
+            focusedPaneId = ws.layout.leaves.first?.id
         }
     }
 
@@ -157,10 +249,19 @@ final class ShellViewModel {
 
     func focusAdjacentPane(delta: Int) {
         guard let ws = selectedWorkspace else { return }
-        let ids = paneIds(of: ws.layout)
+        let ids = ws.layout.leaves.map(\.id)
         guard !ids.isEmpty else { return }
         let cur = focusedPaneId.flatMap { ids.firstIndex(of: $0) } ?? 0
         focusedPaneId = ids[(cur + delta + ids.count) % ids.count]
+    }
+
+    /// The focused leaf's visible surface in the selected workspace.
+    var focusedSurface: ShellSurface? {
+        guard let ws = selectedWorkspace else { return nil }
+        let leaves = ws.layout.leaves
+        let node = leaves.first { $0.id == focusedPaneId } ?? leaves.first
+        guard let node else { return nil }
+        return node.surfaces.first { $0.id == node.selectedSurfaceId } ?? node.surfaces.first
     }
 
     @discardableResult
@@ -170,148 +271,37 @@ final class ShellViewModel {
             if case let .workspace(w) = $0 { return w.id == id }
             return false
         }
-        // Drop empty trailing groups.
         compactEmptyGroups()
         selectedWorkspaceId = visibleWorkspaceIds.first
         if let sid = selectedWorkspaceId, let ws = workspace(id: sid) {
-            focusedPaneId = firstPaneId(of: ws.layout)
+            focusedPaneId = ws.layout.leaves.first?.id
         } else {
             focusedPaneId = nil
         }
         return true
     }
 
+    /// Drop the focused leaf from the selected workspace (local chrome;
+    /// the daemon-side close happens in the controller). The workspace
+    /// row stays — its daemon session decides its lifetime.
     @discardableResult
-    func closeSelectedSurface() -> Bool {
-        guard let wsId = selectedWorkspaceId else { return false }
-        let paneFocus = focusedPaneId
+    func closeFocusedPanel() -> Bool {
+        guard let wsId = selectedWorkspaceId, let ws = workspace(id: wsId) else { return false }
+        let target = focusedPaneId ?? ws.layout.leaves.first?.id
+        guard let target else { return false }
         var closed = false
-        var record: ClosedSurfaceRecord?
         mutateWorkspace(id: wsId) { ws in
-            func close(from pane: inout ShellPaneNode) {
-                if let surf = pane.surfaces.first(where: { $0.id == pane.selectedSurfaceId })
-                    ?? pane.surfaces.first {
-                    record = ClosedSurfaceRecord(workspaceId: wsId, paneId: pane.id, surface: surf)
-                }
-                closed = removeSelectedSurface(from: &pane)
+            if let pruned = ws.layout.pruned(keep: { $0.id != target }) {
+                ws.layout = pruned
+                closed = true
+                focusedPaneId = pruned.leaves.first?.id
+            } else {
+                ws.layout = .empty(ws.id)
+                closed = true
+                focusedPaneId = nil
             }
-
-            switch ws.layout {
-            case .single(var pane):
-                close(from: &pane)
-                ws.layout = .single(pane)
-            case .split(let o, var first, var second, let r):
-                if paneFocus == second.id {
-                    close(from: &second)
-                    if second.surfaces.isEmpty {
-                        ws.layout = .single(first)
-                        focusedPaneId = first.id
-                    } else {
-                        ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
-                    }
-                } else {
-                    close(from: &first)
-                    if first.surfaces.isEmpty {
-                        ws.layout = .single(second)
-                        focusedPaneId = second.id
-                    } else {
-                        ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
-                    }
-                }
-            }
-        }
-        if closed, let record {
-            closedSurfaces.append(record)
-            if closedSurfaces.count > 20 { closedSurfaces.removeFirst(closedSurfaces.count - 20) }
-        }
-        if let ws = workspace(id: wsId), surfaceCount(of: ws.layout) == 0 {
-            _ = closeSelectedWorkspace()
         }
         return closed
-    }
-
-    @discardableResult
-    func reopenLastClosedSurface() -> Bool {
-        guard let record = closedSurfaces.popLast() else { return false }
-        // Prefer original workspace if it still exists; else selected / first.
-        let wsId = workspace(id: record.workspaceId)?.id
-            ?? selectedWorkspaceId
-            ?? workspaceIds.first
-        guard let wsId else {
-            closedSurfaces.append(record)
-            return false
-        }
-        selectWorkspace(wsId)
-        var surface = record.surface
-        surface.id = "s-\(UUID().uuidString.prefix(6))" // fresh id so tabs don't collide
-        mutateWorkspace(id: wsId) { ws in
-            let targetPane = record.paneId
-            switch ws.layout {
-            case .single(var pane):
-                pane.surfaces.append(surface)
-                pane.selectedSurfaceId = surface.id
-                focusedPaneId = pane.id
-                ws.layout = .single(pane)
-            case .split(let o, var first, var second, let r):
-                if second.id == targetPane {
-                    second.surfaces.append(surface)
-                    second.selectedSurfaceId = surface.id
-                    focusedPaneId = second.id
-                } else {
-                    first.surfaces.append(surface)
-                    first.selectedSurfaceId = surface.id
-                    focusedPaneId = first.id
-                }
-                ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
-            }
-        }
-        return true
-    }
-
-    func selectAdjacentSurface(delta: Int) {
-        guard let wsId = selectedWorkspaceId else { return }
-        mutateWorkspace(id: wsId) { ws in
-            let paneId = focusedPaneId ?? firstPaneId(of: ws.layout)
-            ws.layout = mapLayout(ws.layout) { pane in
-                guard pane.id == paneId, !pane.surfaces.isEmpty else { return pane }
-                var p = pane
-                let idx = p.surfaces.firstIndex { $0.id == p.selectedSurfaceId } ?? 0
-                let next = (idx + delta + p.surfaces.count) % p.surfaces.count
-                p.selectedSurfaceId = p.surfaces[next].id
-                return p
-            }
-        }
-    }
-
-    private func removeSelectedSurface(from pane: inout ShellPaneNode) -> Bool {
-        guard let idx = pane.surfaces.firstIndex(where: { $0.id == pane.selectedSurfaceId })
-                ?? pane.surfaces.indices.first else { return false }
-        pane.surfaces.remove(at: idx)
-        if let first = pane.surfaces.first {
-            pane.selectedSurfaceId = first.id
-        }
-        return true
-    }
-
-    private func firstPaneId(of layout: ShellLayout) -> String {
-        switch layout {
-        case let .single(p): return p.id
-        case let .split(_, first, _, _): return first.id
-        }
-    }
-
-    private func paneIds(of layout: ShellLayout) -> [String] {
-        switch layout {
-        case let .single(p): return [p.id]
-        case let .split(_, a, b, _): return [a.id, b.id]
-        }
-    }
-
-    private func surfaceCount(of layout: ShellLayout) -> Int {
-        switch layout {
-        case let .single(p): return p.surfaces.count
-        case let .split(_, a, b, _): return a.surfaces.count + b.surfaces.count
-        }
     }
 
     private func compactEmptyGroups() {
@@ -326,7 +316,6 @@ final class ShellViewModel {
                 if hasMember {
                     next.append(.group(id: gid, title: title))
                 }
-                // skip empty group header
             } else {
                 next.append(items[i])
             }
@@ -343,27 +332,19 @@ final class ShellViewModel {
         }
     }
 
-    func isGroupCollapsed(_ id: String) -> Bool {
-        collapsedGroups.contains(id)
-    }
-
-    func selectSurface(workspaceId: String, paneId: String, surfaceId: String) {
+    func setSplitRatio(workspaceId: String, path: String, ratio: CGFloat) {
         mutateWorkspace(id: workspaceId) { ws in
-            ws.layout = mapLayout(ws.layout) { pane in
-                guard pane.id == paneId else { return pane }
-                var p = pane
-                p.selectedSurfaceId = surfaceId
-                return p
-            }
+            ws.layout = ws.layout.settingRatio(path: path, ratio: ratio)
         }
     }
 
-    func setSplitRatio(workspaceId: String, ratio: CGFloat) {
-        let r = min(0.85, max(0.15, ratio))
+    /// Replace a workspace's whole tree (shell-state restore).
+    func setLayout(workspaceId: String, layout: ShellLayout) {
         mutateWorkspace(id: workspaceId) { ws in
-            if case let .split(o, a, b, _) = ws.layout {
-                ws.layout = .split(orientation: o, first: a, second: b, ratio: r)
-            }
+            ws.layout = layout
+        }
+        if selectedWorkspaceId == workspaceId {
+            focusedPaneId = layout.leaves.first?.id
         }
     }
 
@@ -411,56 +392,45 @@ final class ShellViewModel {
 
     func togglePin(_ id: String) {
         mutateWorkspace(id: id) { $0.isPinned.toggle() }
-        // Pinned workspaces float above unpinned within their group.
         resortItems()
     }
 
-    /// Wire a freshly spawned daemon pane into a workspace as the
-    /// second half of a split (cmux ⌘D / ⌘⇧D — the live path).
+    /// Wire a freshly spawned daemon pane into the selected workspace by
+    /// splitting its focused leaf (cmux ⌘D / ⌘⇧D).
     func graftSplit(workspaceId: String, orientation: ShellLayout.Orientation, paneId: UInt64) {
         let surface = ShellSurface(
             id: "pane-\(paneId)", title: "pane \(paneId)", kind: .terminal, paneId: paneId)
         let node = ShellPaneNode(id: "p-\(paneId)", surfaces: [surface], selectedSurfaceId: surface.id)
         mutateWorkspace(id: workspaceId) { ws in
-            switch ws.layout {
-            case let .single(existing):
-                ws.layout = .split(orientation: orientation, first: existing, second: node, ratio: 0.5)
-            case let .split(_, first, _, _):
-                ws.layout = .split(orientation: orientation, first: first, second: node, ratio: 0.5)
+            if ws.layout.isEmpty {
+                ws.layout = .leaf(node)
+            } else if let target = focusedPaneId ?? ws.layout.leaves.first?.id {
+                ws.layout = ws.layout.splittingLeaf(id: target, orientation: orientation, with: node)
             }
         }
         focusedPaneId = node.id
     }
 
     /// A daemon pane is gone (child exited, pane removed): drop its
-    /// surfaces from every workspace and collapse half-empty splits to
-    /// the surviving side. Workspaces left with no surfaces disappear
-    /// on the next applyLive (the daemon no longer lists their pane).
+    /// leaves from every workspace, collapsing splits to the survivor.
     func removePaneEverywhere(_ pane: UInt64) {
         for id in workspaceIds {
             mutateWorkspace(id: id) { ws in
-                func prune(_ node: inout ShellPaneNode) {
-                    node.surfaces.removeAll { $0.paneId == pane }
-                    if !node.surfaces.contains(where: { $0.id == node.selectedSurfaceId }) {
-                        node.selectedSurfaceId = node.surfaces.first?.id ?? ""
-                    }
+                let keep: (ShellPaneNode) -> Bool = { node in
+                    !node.surfaces.contains { $0.paneId == pane } || node.surfaces.count > 1
                 }
-                switch ws.layout {
-                case .single(var p):
-                    prune(&p)
-                    ws.layout = .single(p)
-                case .split(let o, var first, var second, let r):
-                    prune(&first)
-                    prune(&second)
-                    if first.surfaces.isEmpty {
-                        ws.layout = .single(second)
-                        if focusedPaneId == first.id { focusedPaneId = second.id }
-                    } else if second.surfaces.isEmpty {
-                        ws.layout = .single(first)
-                        if focusedPaneId == second.id { focusedPaneId = first.id }
-                    } else {
-                        ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
+                var layout = ws.layout.pruned(keep: keep) ?? .empty(ws.id)
+                layout = layout.mapLeaves { node in
+                    var n = node
+                    n.surfaces.removeAll { $0.paneId == pane }
+                    if !n.surfaces.contains(where: { $0.id == n.selectedSurfaceId }) {
+                        n.selectedSurfaceId = n.surfaces.first?.id ?? ""
                     }
+                    return n
+                }
+                ws.layout = layout
+                if let focusedPaneId, !layout.leaves.contains(where: { $0.id == focusedPaneId }) {
+                    self.focusedPaneId = layout.leaves.first?.id
                 }
             }
         }
@@ -470,71 +440,44 @@ final class ShellViewModel {
     func setSurfaceTitle(paneId: UInt64, title: String) {
         for id in workspaceIds {
             mutateWorkspace(id: id) { ws in
-                func apply(_ node: inout ShellPaneNode) {
-                    for i in node.surfaces.indices where node.surfaces[i].paneId == paneId {
-                        node.surfaces[i].title = title
+                ws.layout = ws.layout.mapLeaves { node in
+                    var n = node
+                    for i in n.surfaces.indices where n.surfaces[i].paneId == paneId {
+                        n.surfaces[i].title = title
                     }
-                }
-                switch ws.layout {
-                case .single(var p):
-                    apply(&p)
-                    ws.layout = .single(p)
-                case .split(let o, var first, var second, let r):
-                    apply(&first)
-                    apply(&second)
-                    ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
+                    return n
                 }
             }
         }
     }
 
+    /// Browser page titles live on the dock panel's surface (the
+    /// workspace title belongs to the session).
+    func setBrowserTitle(pane: UInt64, title: String) {
+        setSurfaceTitle(paneId: pane, title: title)
+    }
+
     /// Daemon pane ids referenced by a layout's surfaces.
     func daemonPaneIds(of layout: ShellLayout) -> [UInt64] {
-        let nodes: [ShellPaneNode]
-        switch layout {
-        case let .single(p): nodes = [p]
-        case let .split(_, a, b, _): nodes = [a, b]
-        }
-        return nodes.flatMap { $0.surfaces.compactMap(\.paneId) }
+        layout.daemonPaneIds
     }
 
     /// cmux ⌘D / ⌘⇧D — visual split only (demo / local layout).
     func splitSelected(orientation: ShellLayout.Orientation) {
         guard let id = selectedWorkspaceId else { return }
-        mutateWorkspace(id: id) { ws in
-            let newPane = ShellPaneNode(
-                id: "split-\(UUID().uuidString.prefix(6))",
-                surfaces: [ShellSurface(id: "s-\(UUID().uuidString.prefix(6))", title: "zsh", kind: .terminal, paneId: nil)],
-                selectedSurfaceId: "")
-            var pane = newPane
-            pane.selectedSurfaceId = pane.surfaces[0].id
-            switch ws.layout {
-            case let .single(existing):
-                ws.layout = .split(orientation: orientation, first: existing, second: pane, ratio: 0.5)
-            case let .split(_, first, _, _):
-                // Nest: keep first, replace second with a split containing old second... keep it simple — replace whole layout.
-                ws.layout = .split(orientation: orientation, first: first, second: pane, ratio: 0.5)
-            }
-        }
-    }
-
-    func addSurfaceToSelected(kind: ShellPanelKind = .terminal) {
-        guard let id = selectedWorkspaceId else { return }
-        let title = kind == .browser ? "web" : "term"
         let surface = ShellSurface(
-            id: "s-\(UUID().uuidString.prefix(6))", title: title, kind: kind, paneId: nil)
+            id: "s-\(UUID().uuidString.prefix(6))", title: "zsh", kind: .terminal, paneId: nil)
+        let node = ShellPaneNode(
+            id: "split-\(UUID().uuidString.prefix(6))",
+            surfaces: [surface], selectedSurfaceId: surface.id)
         mutateWorkspace(id: id) { ws in
-            switch ws.layout {
-            case .single(var pane):
-                pane.surfaces.append(surface)
-                pane.selectedSurfaceId = surface.id
-                ws.layout = .single(pane)
-            case .split(let o, var first, let second, let r):
-                first.surfaces.append(surface)
-                first.selectedSurfaceId = surface.id
-                ws.layout = .split(orientation: o, first: first, second: second, ratio: r)
+            if ws.layout.isEmpty {
+                ws.layout = .leaf(node)
+            } else if let target = focusedPaneId ?? ws.layout.leaves.first?.id {
+                ws.layout = ws.layout.splittingLeaf(id: target, orientation: orientation, with: node)
             }
         }
+        focusedPaneId = node.id
     }
 
     /// Demo/local: spawn a workspace under a group (UI only).
@@ -544,6 +487,7 @@ final class ShellViewModel {
         let ws = ShellWorkspace(
             id: id,
             title: "New workspace",
+            sessionId: nil,
             cwd: "~",
             branch: nil,
             branchDirty: false,
@@ -552,14 +496,11 @@ final class ShellViewModel {
             notificationSnippet: nil,
             unreadCount: 0,
             isPinned: false,
-            layout: .single(ShellPaneNode(id: "p1", surfaces: [surface], selectedSurfaceId: surface.id)))
+            layout: .leaf(ShellPaneNode(id: "p1", surfaces: [surface], selectedSurfaceId: surface.id)))
 
-        var next: [ShellSidebarItem] = []
         var insertAt: Int?
         for (i, item) in items.enumerated() {
             if case let .group(gid, _) = item, gid == groupId {
-                insertAt = i + 1
-                // Walk forward past existing members.
                 var j = i + 1
                 while j < items.count {
                     if case .group = items[j] { break }
@@ -567,16 +508,13 @@ final class ShellViewModel {
                 }
                 insertAt = j
             }
-            _ = i
         }
-        next = items
         if let insertAt {
-            next.insert(.workspace(ws), at: insertAt)
+            items.insert(.workspace(ws), at: insertAt)
         } else {
-            next.append(.group(id: groupId, title: groupId.uppercased()))
-            next.append(.workspace(ws))
+            items.append(.group(id: groupId, title: groupId.uppercased()))
+            items.append(.workspace(ws))
         }
-        items = next
         selectWorkspace(id)
     }
 
@@ -584,11 +522,6 @@ final class ShellViewModel {
         let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         mutateWorkspace(id: id) { $0.title = t }
-    }
-
-    func renameSelectedWorkspace(title: String) {
-        guard let id = selectedWorkspaceId else { return }
-        renameWorkspace(id, title: title)
     }
 
     /// Filter workspaces for the ⌘P switcher.
@@ -637,6 +570,7 @@ final class ShellViewModel {
         let anchor = ShellWorkspace(
             id: "anchor-\(gid)",
             title: title.capitalized,
+            sessionId: nil,
             cwd: "~",
             branch: nil,
             branchDirty: false,
@@ -645,14 +579,13 @@ final class ShellViewModel {
             notificationSnippet: nil,
             unreadCount: 0,
             isPinned: false,
-            layout: .single(ShellPaneNode(id: "p1", surfaces: [surface], selectedSurfaceId: surface.id)))
+            layout: .leaf(ShellPaneNode(id: "p1", surfaces: [surface], selectedSurfaceId: surface.id)))
         items.append(.group(id: gid, title: title))
         items.append(.workspace(anchor))
         selectWorkspace(anchor.id)
     }
 
     private func resortItems() {
-        // Keep group headers; within each group, pinned first.
         var result: [ShellSidebarItem] = []
         var bucket: [ShellWorkspace] = []
         var currentGroup: ShellSidebarItem?
@@ -689,131 +622,12 @@ final class ShellViewModel {
         }
     }
 
-    private func mapLayout(_ layout: ShellLayout, _ body: (ShellPaneNode) -> ShellPaneNode) -> ShellLayout {
-        switch layout {
-        case let .single(p):
-            return .single(body(p))
-        case let .split(o, a, b, r):
-            return .split(orientation: o, first: body(a), second: body(b), ratio: r)
-        }
-    }
+    // MARK: Live mapping (sessions → workspaces)
 
-    /// Full cmux-like fixture for `ZIDE_UI_DEMO=1`.
-    static func demo() -> ShellViewModel {
-        let vm = ShellViewModel()
-
-        let agentSurfaces = [
-            ShellSurface(id: "a1", title: "claude", kind: .terminal, paneId: nil),
-            ShellSurface(id: "a2", title: "diff", kind: .placeholder, paneId: nil),
-        ]
-        let agentPane = ShellPaneNode(id: "ap", surfaces: agentSurfaces, selectedSurfaceId: "a1")
-        let browserPane = ShellPaneNode(
-            id: "bp",
-            surfaces: [ShellSurface(id: "b1", title: "PR", kind: .browser, paneId: nil)],
-            selectedSurfaceId: "b1")
-
-        let agent = ShellWorkspace(
-            id: "task-1",
-            title: "Start phase 1 PTY layer",
-            cwd: "~/zide",
-            branch: "zide/pty-layer",
-            branchDirty: true,
-            ports: [],
-            attention: .needsAttention,
-            notificationSnippet: "Claude Code needs input",
-            unreadCount: 1,
-            isPinned: true,
-            layout: .split(orientation: .horizontal, first: agentPane, second: browserPane, ratio: 0.55))
-
-        let idleAgent = ShellWorkspace(
-            id: "task-2",
-            title: "Review merge flow",
-            cwd: "~/zide",
-            branch: "zide/review-merge",
-            branchDirty: false,
-            ports: [],
-            attention: .finished,
-            notificationSnippet: nil,
-            unreadCount: 0,
-            isPinned: false,
-            layout: .single(ShellPaneNode(
-                id: "ip",
-                surfaces: [ShellSurface(id: "i1", title: "claude", kind: .terminal, paneId: nil)],
-                selectedSurfaceId: "i1")))
-
-        let devLeft = ShellPaneNode(
-            id: "dl",
-            surfaces: [
-                ShellSurface(id: "d1", title: "zsh", kind: .terminal, paneId: nil),
-                ShellSurface(id: "d2", title: "logs", kind: .terminal, paneId: nil),
-            ],
-            selectedSurfaceId: "d1")
-        let devRight = ShellPaneNode(
-            id: "dr",
-            surfaces: [ShellSurface(id: "d3", title: "~/zide", kind: .terminal, paneId: nil)],
-            selectedSurfaceId: "d3")
-
-        let dev = ShellWorkspace(
-            id: "ws-dev",
-            title: "~/zide",
-            cwd: "~/zide",
-            branch: "main",
-            branchDirty: false,
-            ports: [],
-            attention: .none,
-            notificationSnippet: nil,
-            unreadCount: 0,
-            isPinned: false,
-            layout: .split(orientation: .horizontal, first: devLeft, second: devRight, ratio: 0.5))
-
-        let qemu = ShellWorkspace(
-            id: "ws-qemu",
-            title: "QEMU Valorant Research",
-            cwd: "~",
-            branch: nil,
-            branchDirty: false,
-            ports: [3389],
-            attention: .working,
-            notificationSnippet: nil,
-            unreadCount: 2,
-            isPinned: false,
-            layout: .single(ShellPaneNode(
-                id: "qp",
-                surfaces: [ShellSurface(id: "q1", title: "qemu", kind: .terminal, paneId: nil)],
-                selectedSurfaceId: "q1")))
-
-        vm.items = [
-            .group(id: "sessions", title: "WORKSPACES"),
-            .workspace(agent),
-            .workspace(idleAgent),
-            .workspace(dev),
-            .workspace(qemu),
-        ]
-        vm.selectedWorkspaceId = agent.id
-        vm.focusedPaneId = "ap"
-        vm.notifications = [
-            ShellNotification(
-                id: "n1", workspaceId: "task-1", title: "Claude Code",
-                subtitle: "Needs attention", body: "Waiting for permission to edit Pty.zig",
-                isRead: false),
-            ShellNotification(
-                id: "n2", workspaceId: "ws-qemu", title: "Build",
-                subtitle: "Completed", body: "QEMU guest booted on :3389",
-                isRead: false),
-            ShellNotification(
-                id: "n3", workspaceId: "ws-qemu", title: "Ports",
-                subtitle: "Listening", body: "RDP ready on 3389",
-                isRead: false),
-            ShellNotification(
-                id: "n4", workspaceId: "task-2", title: "Claude Code",
-                subtitle: "Idle", body: "Review merge flow finished",
-                isRead: true),
-        ]
-        return vm
-    }
-
-    /// Live map: sessions/panes into workspace rows.
-    /// Call `applyPaneMeta` after for cwd/branch/ports from `panes-meta`.
+    /// One workspace per daemon session, cmux-style. The layout is the
+    /// previous tree pruned to still-live panes, with new panes grafted
+    /// in: terminals split the terminal side, browsers stack in the
+    /// dock column on the right.
     func applyLive(
         sessions: [(id: UInt64, title: String, panes: [UInt64], browsers: [UInt64], exited: [UInt64])],
         bells: Set<UInt64>,
@@ -822,96 +636,119 @@ final class ShellViewModel {
         paneTitles: [UInt64: String] = [:],
         agentActivity: [UInt64: String?] = [:]
     ) {
-        // Panes grafted into another workspace's layout (splits, extra
-        // tabs) must not also surface as standalone rows.
-        var embedded: Set<UInt64> = []
-        for item in items {
-            guard case let .workspace(w) = item else { continue }
-            for pid in daemonPaneIds(of: w.layout)
-            where "term-\(pid)" != w.id && "web-\(pid)" != w.id {
-                embedded.insert(pid)
-            }
-        }
         var next: [ShellSidebarItem] = []
-
-        var anySession = false
+        if !sessions.isEmpty {
+            next.append(.group(id: "sessions", title: "WORKSPACES"))
+        }
         for s in sessions {
-            let visible = s.panes.filter { !embedded.contains($0) }
-            let visibleBrowsers = s.browsers.filter { !embedded.contains($0) }
-            if visible.isEmpty && visibleBrowsers.isEmpty { continue }
-            if !anySession {
-                next.append(.group(id: "sessions", title: "WORKSPACES"))
-                anySession = true
+            let id = "sess-\(s.id)"
+            let prev = workspace(id: id)
+            let live = Set(s.panes + s.browsers)
+
+            var layout = prev?.layout.pruned { node in
+                node.surfaces.contains { surf in
+                    surf.paneId.map(live.contains) ?? false
+                }
             }
-            for pane in visible {
-                // A pane whose foreground process is an AI agent is
-                // "working" until it rings for attention — the cmux
-                // row treatment, driven by panes-meta.
-                let isAgent = agentActivity.keys.contains(pane)
-                let attention: ShellAttention =
-                    exited.contains(pane) ? .finished :
-                    bells.contains(pane) ? .needsAttention :
-                    isAgent ? .working : .none
-                let surface = ShellSurface(
-                    id: "pane-\(pane)",
-                    title: paneTitles[pane] ?? "pane \(pane)",
-                    kind: .terminal, paneId: pane)
-                let id = "term-\(pane)"
-                let prev = workspace(id: id)
-                next.append(.workspace(ShellWorkspace(
-                    id: id,
-                    title: s.title.isEmpty ? "pane \(pane)" : s.title,
-                    cwd: prev?.cwd,
-                    branch: prev?.branch,
-                    branchDirty: prev?.branchDirty ?? false,
-                    ports: prev?.ports ?? [],
-                    attention: attention,
-                    notificationSnippet: (agentActivity[pane] ?? nil)
-                        ?? latestNotificationSnippet(for: id),
-                    unreadCount: bells.contains(pane) ? max(1, prev?.unreadCount ?? 1) : (prev?.unreadCount ?? 0),
-                    isPinned: prev?.isPinned ?? false,
-                    layout: prev?.layout ?? .single(ShellPaneNode(
-                        id: "p-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id)))))
+            let present = Set(layout?.daemonPaneIds ?? [])
+            for pane in s.panes where !present.contains(pane) {
+                layout = Self.graftTerminal(layout, pane: pane, title: paneTitles[pane])
             }
-            for pane in visibleBrowsers {
-                let id = "web-\(pane)"
-                let webTitle = browserTitles[pane] ?? prevTitle(id: id) ?? "web \(pane)"
-                let surface = ShellSurface(
-                    id: "web-\(pane)", title: webTitle, kind: .browser, paneId: pane)
-                let prev = workspace(id: id)
-                next.append(.workspace(ShellWorkspace(
-                    id: id,
-                    title: webTitle,
-                    cwd: prev?.cwd,
-                    branch: prev?.branch,
-                    branchDirty: prev?.branchDirty ?? false,
-                    ports: prev?.ports ?? [],
-                    attention: .none,
-                    notificationSnippet: nil,
-                    unreadCount: prev?.unreadCount ?? 0,
-                    isPinned: prev?.isPinned ?? false,
-                    layout: prev?.layout ?? .single(ShellPaneNode(
-                        id: "p-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id)))))
+            for pane in s.browsers where !present.contains(pane) {
+                layout = Self.graftBrowser(layout, pane: pane, title: browserTitles[pane])
             }
+            var tree = layout ?? .empty("\(s.id)")
+            tree = tree.mapLeaves { node in
+                var n = node
+                for i in n.surfaces.indices {
+                    guard let pid = n.surfaces[i].paneId else { continue }
+                    switch n.surfaces[i].kind {
+                    case .terminal:
+                        if let t = paneTitles[pid] { n.surfaces[i].title = t }
+                    case .browser:
+                        if let t = browserTitles[pid], !t.isEmpty { n.surfaces[i].title = t }
+                    case .placeholder:
+                        break
+                    }
+                }
+                return n
+            }
+
+            // Workspace status aggregates its panes, cmux-row style:
+            // any bell → needs attention; any agent → working.
+            let hasBell = s.panes.contains(where: bells.contains)
+            let agents = s.panes.filter { agentActivity.keys.contains($0) }
+            let attention: ShellAttention =
+                hasBell ? .needsAttention : (!agents.isEmpty ? .working : .none)
+            let activity = agents.compactMap { agentActivity[$0] ?? nil }.first
+
+            next.append(.workspace(ShellWorkspace(
+                id: id,
+                title: s.title.isEmpty ? "workspace \(s.id)" : s.title,
+                sessionId: s.id,
+                cwd: prev?.cwd,
+                branch: prev?.branch,
+                branchDirty: prev?.branchDirty ?? false,
+                ports: prev?.ports ?? [],
+                attention: attention,
+                notificationSnippet: activity ?? latestNotificationSnippet(for: id),
+                unreadCount: hasBell ? max(1, prev?.unreadCount ?? 1) : (prev?.unreadCount ?? 0),
+                isPinned: prev?.isPinned ?? false,
+                layout: tree)))
         }
 
         let previous = selectedWorkspaceId
         items = next
-        if let previous, items.contains(where: {
-            if case let .workspace(w) = $0 { return w.id == previous }
-            return false
-        }) {
+        if let previous, workspace(id: previous) != nil {
             selectedWorkspaceId = previous
         } else {
-            selectedWorkspaceId = items.compactMap {
-                if case let .workspace(w) = $0 { return w.id }
-                return nil
-            }.first
+            selectedWorkspaceId = workspaceIds.first
+        }
+        if let sid = selectedWorkspaceId, let ws = workspace(id: sid),
+           !ws.layout.leaves.contains(where: { $0.id == focusedPaneId }) {
+            focusedPaneId = ws.layout.leaves.first?.id
         }
     }
 
-    /// Overlay cwd / branch / dirty / ports from `panes-meta` onto workspaces
-    /// that own those daemon pane ids.
+    static func graftTerminal(_ layout: ShellLayout?, pane: UInt64, title: String?) -> ShellLayout {
+        let surface = ShellSurface(
+            id: "pane-\(pane)", title: title ?? "pane \(pane)", kind: .terminal, paneId: pane)
+        let node = ShellPaneNode(id: "p-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id)
+        guard let layout, !layout.isEmpty else { return .leaf(node) }
+        // Terminals join the terminal side, leaving the dock column
+        // alone (cmux keeps the dock pinned right).
+        if case let .split(o, first, second, r) = layout, layout.dock != nil {
+            return .split(
+                orientation: o,
+                first: graftTerminal(first, pane: pane, title: title),
+                second: second, ratio: r)
+        }
+        if layout.leaves.allSatisfy({ $0.surfaces.allSatisfy { $0.kind == .browser } }) {
+            // Browser-only workspace: the terminal takes the left.
+            return .split(orientation: .horizontal, first: .leaf(node), second: layout, ratio: 0.55)
+        }
+        return .split(orientation: .horizontal, first: layout, second: .leaf(node), ratio: 0.5)
+    }
+
+    static func graftBrowser(_ layout: ShellLayout?, pane: UInt64, title: String?) -> ShellLayout {
+        let surface = ShellSurface(
+            id: "web-\(pane)", title: title ?? "browser", kind: .browser, paneId: pane)
+        let node = ShellPaneNode(id: "w-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id)
+        guard let layout, !layout.isEmpty else { return .leaf(node) }
+        // A dock already exists → stack the new browser under it;
+        // otherwise the browser docks as the right column (cmux).
+        if case let .split(o, first, second, r) = layout, layout.dock != nil {
+            return .split(
+                orientation: o,
+                first: first,
+                second: .split(orientation: .vertical, first: second, second: .leaf(node), ratio: 0.5),
+                ratio: r)
+        }
+        return .split(orientation: .horizontal, first: layout, second: .leaf(node), ratio: 0.55)
+    }
+
+    /// Overlay cwd / branch / dirty / ports from `panes-meta` onto
+    /// workspaces that own those daemon pane ids.
     func applyPaneMeta(
         _ metas: [UInt64: (cwd: String?, branch: String?, dirty: Bool, ports: [Int],
                            agent: String?, activity: String?)]
@@ -926,10 +763,6 @@ final class ShellViewModel {
             w.branch = m.branch ?? w.branch
             w.branchDirty = m.dirty
             w.ports = m.ports.isEmpty ? w.ports : m.ports
-            // An AI agent running in a pane (user typed `claude`)
-            // lights the row up like cmux: working dot, and the pane's
-            // live status line as the snippet — the sidebar knows what
-            // is going on in there. Bell attention wins.
             if m.agent != nil {
                 if w.attention == ShellAttention.none { w.attention = .working }
                 if let activity = m.activity, !activity.isEmpty {
@@ -940,44 +773,104 @@ final class ShellViewModel {
         }
     }
 
-    func setBrowserTitle(pane: UInt64, title: String) {
-        let id = "web-\(pane)"
-        items = items.map { item in
-            guard case var .workspace(w) = item, w.id == id else { return item }
-            w.title = title
-            w.layout = renameSurface(in: w.layout, surfaceId: "web-\(pane)", title: title)
-            return .workspace(w)
-        }
-    }
-
-    private func renameSurface(in layout: ShellLayout, surfaceId: String, title: String) -> ShellLayout {
-        func rename(_ node: ShellPaneNode) -> ShellPaneNode {
-            var n = node
-            n.surfaces = n.surfaces.map { s in
-                var s = s
-                if s.id == surfaceId { s.title = title }
-                return s
-            }
-            return n
-        }
-        switch layout {
-        case let .single(p): return .single(rename(p))
-        case let .split(o, a, b, r): return .split(orientation: o, first: rename(a), second: rename(b), ratio: r)
-        }
-    }
-
-    private func prevTitle(id: String) -> String? {
-        workspace(id: id)?.title
-    }
-
     private func primaryTerminalPaneId(of w: ShellWorkspace) -> UInt64? {
-        func from(_ node: ShellPaneNode) -> UInt64? {
-            let surfaces = node.surfaces.filter { $0.kind == .terminal }
-            return (surfaces.first { $0.id == node.selectedSurfaceId } ?? surfaces.first)?.paneId
+        for node in w.layout.leaves {
+            let terminals = node.surfaces.filter { $0.kind == .terminal }
+            if let pane = (terminals.first { $0.id == node.selectedSurfaceId } ?? terminals.first)?.paneId {
+                return pane
+            }
         }
-        switch w.layout {
-        case let .single(p): return from(p)
-        case let .split(_, a, b, _): return from(a) ?? from(b)
-        }
+        return nil
+    }
+
+    /// Full cmux-like fixture for `ZIDE_UI_DEMO=1`.
+    static func demo() -> ShellViewModel {
+        let vm = ShellViewModel()
+
+        let agentPane = ShellPaneNode(
+            id: "ap",
+            surfaces: [ShellSurface(id: "a1", title: "claude", kind: .terminal, paneId: nil)],
+            selectedSurfaceId: "a1")
+        let browserPane = ShellPaneNode(
+            id: "bp",
+            surfaces: [ShellSurface(id: "b1", title: "PR", kind: .browser, paneId: nil)],
+            selectedSurfaceId: "b1")
+
+        let agent = ShellWorkspace(
+            id: "task-1",
+            title: "Start phase 1 PTY layer",
+            sessionId: nil,
+            cwd: "~/zide",
+            branch: "zide/pty-layer",
+            branchDirty: true,
+            ports: [],
+            attention: .needsAttention,
+            notificationSnippet: "Claude Code needs input",
+            unreadCount: 1,
+            isPinned: true,
+            layout: .split(
+                orientation: .horizontal, first: .leaf(agentPane), second: .leaf(browserPane),
+                ratio: 0.55))
+
+        let dev = ShellWorkspace(
+            id: "ws-dev",
+            title: "~/zide",
+            sessionId: nil,
+            cwd: "~/zide",
+            branch: "main",
+            branchDirty: false,
+            ports: [],
+            attention: .none,
+            notificationSnippet: nil,
+            unreadCount: 0,
+            isPinned: false,
+            layout: .split(
+                orientation: .horizontal,
+                first: .leaf(ShellPaneNode(
+                    id: "dl",
+                    surfaces: [ShellSurface(id: "d1", title: "zsh", kind: .terminal, paneId: nil)],
+                    selectedSurfaceId: "d1")),
+                second: .leaf(ShellPaneNode(
+                    id: "dr",
+                    surfaces: [ShellSurface(id: "d3", title: "~/zide", kind: .terminal, paneId: nil)],
+                    selectedSurfaceId: "d3")),
+                ratio: 0.5))
+
+        let qemu = ShellWorkspace(
+            id: "ws-qemu",
+            title: "QEMU Valorant Research",
+            sessionId: nil,
+            cwd: "~",
+            branch: nil,
+            branchDirty: false,
+            ports: [3389],
+            attention: .working,
+            notificationSnippet: nil,
+            unreadCount: 2,
+            isPinned: false,
+            layout: .leaf(ShellPaneNode(
+                id: "qp",
+                surfaces: [ShellSurface(id: "q1", title: "qemu", kind: .terminal, paneId: nil)],
+                selectedSurfaceId: "q1")))
+
+        vm.items = [
+            .group(id: "sessions", title: "WORKSPACES"),
+            .workspace(agent),
+            .workspace(dev),
+            .workspace(qemu),
+        ]
+        vm.selectedWorkspaceId = agent.id
+        vm.focusedPaneId = "ap"
+        vm.notifications = [
+            ShellNotification(
+                id: "n1", workspaceId: "task-1", title: "Claude Code",
+                subtitle: "Needs attention", body: "Waiting for permission to edit Pty.zig",
+                isRead: false),
+            ShellNotification(
+                id: "n2", workspaceId: "ws-qemu", title: "Build",
+                subtitle: "Completed", body: "QEMU guest booted on :3389",
+                isRead: false),
+        ]
+        return vm
     }
 }

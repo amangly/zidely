@@ -43,6 +43,11 @@ foundation first, pixels when the core deserves them.
 - [x] `zide` CLI against the socket
 - [x] Embedded browser pane (WKWebView) with programmable API
       (prototype host; moves into the Swift shell when it lands)
+- [x] cmux workspace model: sidebar rows are sessions; each workspace
+      is a recursive split tree of terminals with browsers docked as
+      the right column (never rows); ⌘T = new workspace,
+      ⌘W = close panel (last panel closes the workspace),
+      ⌘⇧W = close workspace (daemon `remove-session`)
 - [x] Real-browser behavior in browser panes, following cmux's
       CmuxBrowser stack: Safari UA engine config, omnibox with
       history/frecency suggestions, error pages, downloads

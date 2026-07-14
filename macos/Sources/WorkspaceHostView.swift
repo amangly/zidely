@@ -1,12 +1,13 @@
-// Content chrome: cmux-style pane headers (icon tabs + actions),
-// in-pane browser bar, hairline splits, electric focus ring.
+// Content chrome: the selected workspace's cmux-style surface tree —
+// recursive splits of terminal panes with the browser dock column,
+// in-pane browser bar, hairline dividers, electric focus ring.
 
 import AppKit
 import WebKit
 
 protocol WorkspaceHostViewDelegate: AnyObject {
     func workspaceHost(_ host: WorkspaceHostView, installPanel surface: ShellSurface, into slot: NSView)
-    func workspaceHost(_ host: WorkspaceHostView, didChangeSplitRatio ratio: CGFloat)
+    func workspaceHost(_ host: WorkspaceHostView, didChangeSplitRatio ratio: CGFloat, path: String)
     func workspaceHost(_ host: WorkspaceHostView, didFocusPane paneId: String)
     func workspaceHost(_ host: WorkspaceHostView, browserURLForPane paneId: UInt64) -> String?
     func workspaceHost(_ host: WorkspaceHostView, navigateBrowser paneId: UInt64, to url: String)
@@ -29,15 +30,12 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
 
     private var workspace: ShellWorkspace?
     private var focusedPaneId: String?
-    private let emptyLabel = NSTextField(labelWithString: "no workspace — ⌘T terminal · ⌘⇧P commands · j/k in sidebar")
+    private let emptyLabel = NSTextField(labelWithString: "no workspace — ⌘T new workspace · ⌘⇧P commands · j/k in sidebar")
     private let attentionRing = NSView()
     /// Omnibar history dropdown — one shared overlay, floated above
-    /// whichever browser pane's address bar is being typed in.
+    /// whichever browser panel's address bar is being typed in.
     private let suggestionsView = BrowserSuggestionsView(frame: .zero)
     private weak var suggestionsField: NSTextField?
-    private var dragOrientation: ShellLayout.Orientation?
-    private var dragStartRatio: CGFloat = 0.5
-    private var dragStartPoint: CGFloat = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -71,86 +69,98 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     func show(workspace: ShellWorkspace?, focusedPaneId: String? = nil) {
         hideSuggestions()
         self.workspace = workspace
-        self.focusedPaneId = focusedPaneId ?? {
-            guard let workspace else { return nil }
-            switch workspace.layout {
-            case let .single(p): return p.id
-            case let .split(_, first, _, _): return first.id
-            }
-        }()
+        self.focusedPaneId = focusedPaneId ?? workspace?.layout.leaves.first?.id
         subviews.filter { $0 !== emptyLabel && $0 !== attentionRing }
             .forEach { $0.removeFromSuperview() }
-        guard let workspace else {
+        guard let workspace, !workspace.layout.isEmpty else {
             emptyLabel.isHidden = false
+            emptyLabel.stringValue = workspace == nil
+                ? "no workspace — ⌘T new workspace · ⌘⇧P commands · j/k in sidebar"
+                : "empty workspace — ⌘D opens a shell here, ⌘⇧W closes it"
             attentionRing.isHidden = true
             return
         }
         emptyLabel.isHidden = true
-        switch workspace.layout {
-        case let .single(pane):
-            addSubview(makePaneHost(pane), positioned: .below, relativeTo: attentionRing)
-        case let .split(orientation, first, second, ratio):
-            let a = makePaneHost(first)
-            let b = makePaneHost(second)
-            let divider = SplitDividerView()
-            divider.orientation = orientation
-            divider.target = self
-            divider.action = #selector(dividerDrag(_:))
-            divider.identifier = NSUserInterfaceItemIdentifier("split-divider")
-            addSubview(a, positioned: .below, relativeTo: attentionRing)
-            addSubview(divider, positioned: .below, relativeTo: attentionRing)
-            addSubview(b, positioned: .below, relativeTo: attentionRing)
-            _ = ratio
-        }
+        buildViews(for: workspace.layout, path: "")
         attentionRing.isHidden = workspace.attention != .needsAttention && workspace.unreadCount == 0
         applyFrames(for: workspace)
     }
 
-    func updateSplitRatio(_ ratio: CGFloat) {
-        guard var workspace, case let .split(o, a, b, _) = workspace.layout else { return }
-        workspace.layout = .split(orientation: o, first: a, second: b, ratio: ratio)
+    /// The tree changed shape or a divider moved: swap the layout in
+    /// and re-frame without rebuilding panel slots.
+    func updateLayout(_ layout: ShellLayout) {
+        guard var workspace else { return }
+        workspace.layout = layout
         self.workspace = workspace
         applyFrames(for: workspace)
     }
 
+    private func buildViews(for layout: ShellLayout, path: String) {
+        switch layout {
+        case let .leaf(node):
+            addSubview(makePaneHost(node), positioned: .below, relativeTo: attentionRing)
+        case let .split(orientation, first, second, _):
+            buildViews(for: first, path: path.isEmpty ? "0" : "\(path).0")
+            let divider = SplitDividerView()
+            divider.orientation = orientation
+            divider.path = path
+            divider.target = self
+            divider.action = #selector(dividerDrag(_:))
+            divider.identifier = NSUserInterfaceItemIdentifier("divider:\(path)")
+            addSubview(divider, positioned: .below, relativeTo: attentionRing)
+            buildViews(for: second, path: path.isEmpty ? "1" : "\(path).1")
+        }
+    }
+
     private func applyFrames(for workspace: ShellWorkspace) {
         attentionRing.frame = bounds.insetBy(dx: 1, dy: 1)
+        placeFrames(for: workspace.layout, in: bounds, path: "")
+    }
 
-        let kids = subviews.filter { $0 !== emptyLabel && $0 !== attentionRing }
-        let area = bounds
-        switch workspace.layout {
-        case .single:
-            kids.first?.frame = area
-        case let .split(orientation, _, _, ratio):
-            guard kids.count >= 3 else { return }
-            let a = kids[0]
-            let div = kids[1]
-            let b = kids[2]
+    private func placeFrames(for layout: ShellLayout, in area: NSRect, path: String) {
+        switch layout {
+        case let .leaf(node):
+            guard let host = subviews.first(where: { $0.identifier?.rawValue == "pane:\(node.id)" })
+            else { return }
+            host.frame = area
+            layoutPaneHost(host)
+        case let .split(orientation, first, second, ratio):
             let t = max(ShellTheme.splitDivider, 1)
             let r = min(0.85, max(0.15, ratio))
+            let divider = subviews.first { $0.identifier?.rawValue == "divider:\(path)" }
             switch orientation {
             case .horizontal:
                 let w1 = floor((area.width - t) * r)
-                a.frame = NSRect(x: area.minX, y: area.minY, width: w1, height: area.height)
-                div.frame = NSRect(x: area.minX + w1, y: area.minY, width: t, height: area.height)
-                b.frame = NSRect(
-                    x: area.minX + w1 + t, y: area.minY,
-                    width: area.width - w1 - t, height: area.height)
+                placeFrames(
+                    for: first,
+                    in: NSRect(x: area.minX, y: area.minY, width: w1, height: area.height),
+                    path: path.isEmpty ? "0" : "\(path).0")
+                divider?.frame = NSRect(x: area.minX + w1, y: area.minY, width: t, height: area.height)
+                placeFrames(
+                    for: second,
+                    in: NSRect(
+                        x: area.minX + w1 + t, y: area.minY,
+                        width: area.width - w1 - t, height: area.height),
+                    path: path.isEmpty ? "1" : "\(path).1")
             case .vertical:
+                // `first` is the top half; AppKit y grows upward.
                 let h1 = floor((area.height - t) * r)
-                b.frame = NSRect(
-                    x: area.minX, y: area.minY,
-                    width: area.width, height: area.height - h1 - t)
-                div.frame = NSRect(
+                placeFrames(
+                    for: first,
+                    in: NSRect(
+                        x: area.minX, y: area.minY + area.height - h1,
+                        width: area.width, height: h1),
+                    path: path.isEmpty ? "0" : "\(path).0")
+                divider?.frame = NSRect(
                     x: area.minX, y: area.minY + area.height - h1 - t,
                     width: area.width, height: t)
-                a.frame = NSRect(
-                    x: area.minX, y: area.minY + area.height - h1,
-                    width: area.width, height: h1)
+                placeFrames(
+                    for: second,
+                    in: NSRect(
+                        x: area.minX, y: area.minY,
+                        width: area.width, height: area.height - h1 - t),
+                    path: path.isEmpty ? "1" : "\(path).1")
             }
-        }
-        for host in kids where host.identifier?.rawValue.hasPrefix("pane:") == true {
-            layoutPaneHost(host)
         }
     }
 
@@ -159,7 +169,6 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         host.identifier = NSUserInterfaceItemIdentifier("pane:\(pane.id)")
         host.wantsLayer = true
         host.layer?.backgroundColor = ShellTheme.panelBg.cgColor
-        host.autoresizingMask = [.width, .height]
         applyFocusBorder(host, focused: focusedPaneId == pane.id)
 
         let selected = pane.surfaces.first { $0.id == pane.selectedSurfaceId } ?? pane.surfaces.first
@@ -167,7 +176,7 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
 
         // No tab strip, no action icons: the sidebar is the tab bar and
         // shortcuts do the rest (ghostty-style minimal chrome). Only
-        // browser panes get a header — their URL bar.
+        // browser panels get a header — their URL bar.
         if isBrowser {
             let header = NSView()
             header.wantsLayer = true
@@ -256,7 +265,6 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
 
         for v in [back, fwd, reload, omnibar] as [NSView] { bar.addSubview(v) }
         bar.identifier = NSUserInterfaceItemIdentifier("browserBar")
-        // Stash action button frames in layoutPaneHost via tags on subviews order.
         back.tag = 1; fwd.tag = 2; reload.tag = 3; omnibar.tag = 4
         return bar
     }
@@ -389,7 +397,7 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         suggestionsField = nil
     }
 
-    /// Live address-bar/nav updates for a browser pane, without
+    /// Live address-bar/nav updates for a browser panel, without
     /// rebuilding the header. The omnibar is left alone while the user
     /// is editing it.
     func updateBrowserChrome(
@@ -397,12 +405,7 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         isLoading: Bool = false, progress: Double = 0
     ) {
         guard let workspace else { return }
-        let nodes: [ShellPaneNode]
-        switch workspace.layout {
-        case let .single(p): nodes = [p]
-        case let .split(_, a, b, _): nodes = [a, b]
-        }
-        for node in nodes {
+        for node in workspace.layout.leaves {
             guard let surface = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
                 ?? node.surfaces.first,
                 surface.kind == .browser, surface.paneId == pane
@@ -436,7 +439,7 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         }
     }
 
-    /// Focus the selected browser pane's address bar (⌘L).
+    /// Focus the selected browser panel's address bar (⌘L).
     func focusOmnibar() -> Bool {
         func walk(_ v: NSView) -> NSTextField? {
             for sub in v.subviews {
@@ -495,20 +498,16 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     }
 
     private func selectedSurface(paneId: String) -> ShellSurface? {
-        guard let workspace else { return nil }
-        let nodes: [ShellPaneNode]
-        switch workspace.layout {
-        case let .single(p): nodes = [p]
-        case let .split(_, a, b, _): nodes = [a, b]
-        }
-        guard let node = nodes.first(where: { $0.id == paneId }) else { return nil }
+        guard let workspace,
+              let node = workspace.layout.leaves.first(where: { $0.id == paneId })
+        else { return nil }
         return node.surfaces.first { $0.id == node.selectedSurfaceId } ?? node.surfaces.first
     }
 
     private func layoutPaneHost(_ host: NSView) {
         guard let slot = host.subviews.first(where: { $0.identifier?.rawValue == "slot" })
         else { return }
-        // Terminals fill edge-to-edge; only browser panes carry a
+        // Terminals fill edge-to-edge; only browser panels carry a
         // header (their URL bar).
         let header = host.subviews.first { $0.identifier?.rawValue == "header" }
         let headerH: CGFloat = header != nil ? ShellTheme.browserChromeHeight : 0
@@ -575,32 +574,78 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func dividerDrag(_ gesture: NSPanGestureRecognizer) {
-        guard let workspace, case let .split(orientation, _, _, ratio) = workspace.layout else { return }
+        guard let divider = gesture.view as? SplitDividerView,
+              let workspace else { return }
         switch gesture.state {
         case .began:
-            dragOrientation = orientation
-            dragStartRatio = ratio
-            dragStartPoint = orientation == .horizontal ? gesture.location(in: self).x : gesture.location(in: self).y
+            divider.dragStartRatio = currentRatio(of: workspace.layout, path: divider.path) ?? 0.5
+            divider.dragStartPoint = divider.orientation == .horizontal
+                ? gesture.location(in: self).x : gesture.location(in: self).y
+            divider.dragSpan = span(of: workspace.layout, path: divider.path, in: bounds, orientation: divider.orientation)
         case .changed:
-            guard let dragOrientation else { return }
             let loc = gesture.location(in: self)
-            let span = dragOrientation == .horizontal ? bounds.width : bounds.height
-            guard span > 1 else { return }
+            guard divider.dragSpan > 1 else { return }
             let delta: CGFloat
-            if dragOrientation == .horizontal {
-                delta = (loc.x - dragStartPoint) / span
+            if divider.orientation == .horizontal {
+                delta = (loc.x - divider.dragStartPoint) / divider.dragSpan
             } else {
-                delta = (loc.y - dragStartPoint) / span
+                // `first` is the top half; dragging down grows it.
+                delta = (divider.dragStartPoint - loc.y) / divider.dragSpan
             }
-            delegate?.workspaceHost(self, didChangeSplitRatio: dragStartRatio + delta)
+            delegate?.workspaceHost(self, didChangeSplitRatio: divider.dragStartRatio + delta, path: divider.path)
         default:
-            dragOrientation = nil
+            break
         }
+    }
+
+    private func currentRatio(of layout: ShellLayout, path: String) -> CGFloat? {
+        var node = layout
+        var remaining = Substring(path)
+        while true {
+            guard case let .split(_, a, b, r) = node else { return nil }
+            if remaining.isEmpty { return r }
+            let head = remaining.prefix(1)
+            remaining = remaining.dropFirst(remaining.count == 1 ? 1 : 2)
+            node = head == "0" ? a : b
+        }
+    }
+
+    /// Pixel span of the split a path addresses — ratio deltas need it.
+    private func span(of layout: ShellLayout, path: String, in area: NSRect, orientation: ShellLayout.Orientation) -> CGFloat {
+        var node = layout
+        var rect = area
+        var remaining = Substring(path)
+        while true {
+            guard case let .split(o, a, b, r) = node else { break }
+            if remaining.isEmpty { break }
+            let t = max(ShellTheme.splitDivider, 1)
+            let clamped = min(0.85, max(0.15, r))
+            let head = remaining.prefix(1)
+            remaining = remaining.dropFirst(remaining.count == 1 ? 1 : 2)
+            switch o {
+            case .horizontal:
+                let w1 = floor((rect.width - t) * clamped)
+                rect = head == "0"
+                    ? NSRect(x: rect.minX, y: rect.minY, width: w1, height: rect.height)
+                    : NSRect(x: rect.minX + w1 + t, y: rect.minY, width: rect.width - w1 - t, height: rect.height)
+            case .vertical:
+                let h1 = floor((rect.height - t) * clamped)
+                rect = head == "0"
+                    ? NSRect(x: rect.minX, y: rect.minY + rect.height - h1, width: rect.width, height: h1)
+                    : NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height - h1 - t)
+            }
+            node = head == "0" ? a : b
+        }
+        return orientation == .horizontal ? rect.width : rect.height
     }
 }
 
 private final class SplitDividerView: NSView {
     var orientation: ShellLayout.Orientation = .horizontal
+    var path: String = ""
+    var dragStartRatio: CGFloat = 0.5
+    var dragStartPoint: CGFloat = 0
+    var dragSpan: CGFloat = 0
     weak var target: AnyObject?
     var action: Selector?
 

@@ -209,12 +209,8 @@ final class WorkspaceRowView: NSView {
 
 private extension ShellWorkspace {
     func layoutHasBrowser() -> Bool {
-        switch layout {
-        case let .single(p):
-            return p.surfaces.contains { $0.kind == .browser }
-        case let .split(_, a, b, _):
-            return a.surfaces.contains { $0.kind == .browser }
-                || b.surfaces.contains { $0.kind == .browser }
+        layout.leaves.contains { node in
+            node.surfaces.contains { $0.kind == .browser }
         }
     }
 }

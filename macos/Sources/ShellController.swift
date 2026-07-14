@@ -65,12 +65,6 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// about:blank, but the omnibar must keep showing where the user
     /// was trying to go.
     var browserErrorURL: [UInt64: String] = [:]
-    /// URLs whose browser-open WE initiated from an in-page action
-    /// (target=_blank, cmd-click): the matching browser_open event
-    /// focuses the new pane, like a browser focusing a new tab —
-    /// otherwise the click feels like it did nothing. CLI/daemon opens
-    /// stay background.
-    var pendingBrowserFocus: [String] = []
     var selectedPane: UInt64?
     /// Last live session list, for spawn-into-current-session.
     var sessionIds: [UInt64] = []
@@ -384,14 +378,10 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     }
 
     func primaryPaneId(of ws: ShellWorkspace) -> UInt64? {
-        switch ws.layout {
-        case let .single(p):
-            return p.surfaces.first { $0.id == p.selectedSurfaceId }?.paneId
-                ?? p.surfaces.first?.paneId
-        case let .split(_, first, _, _):
-            return first.surfaces.first { $0.id == first.selectedSurfaceId }?.paneId
-                ?? first.surfaces.first?.paneId
-        }
+        let leaves = ws.layout.leaves
+        let node = leaves.first { $0.id == viewModel.focusedPaneId } ?? leaves.first
+        guard let node else { return nil }
+        return (node.surfaces.first { $0.id == node.selectedSurfaceId } ?? node.surfaces.first)?.paneId
     }
 
     func statusLine(for ws: ShellWorkspace) -> String {
@@ -450,6 +440,11 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         viewModel.renameWorkspace(id, title: field.stringValue)
+        // Workspace titles are session titles — rename daemon-side or
+        // the next refresh reverts it.
+        if !demoMode, let sid = viewModel.workspace(id: id)?.sessionId {
+            client.send(["cmd": "rename-session", "session": sid, "title": field.stringValue])
+        }
         reloadChrome()
     }
 
@@ -479,30 +474,26 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         }
     }
 
-    func workspaceHost(_ host: WorkspaceHostView, didChangeSplitRatio ratio: CGFloat) {
+    func workspaceHost(_ host: WorkspaceHostView, didChangeSplitRatio ratio: CGFloat, path: String) {
         guard let wsId = viewModel.selectedWorkspaceId else { return }
-        viewModel.setSplitRatio(workspaceId: wsId, ratio: ratio)
-        host.updateSplitRatio(ratio)
+        viewModel.setSplitRatio(workspaceId: wsId, path: path, ratio: ratio)
+        if let ws = viewModel.selectedWorkspace { host.updateLayout(ws.layout) }
         pushShellState()
     }
 
     func workspaceHost(_ host: WorkspaceHostView, didFocusPane paneId: String) {
         viewModel.focusPane(paneId)
-        // Move keyboard focus to the live view of that pane's selected
+        // Move keyboard focus to the live view of that panel's selected
         // surface, so clicking a panel means typing goes there.
-        guard let ws = viewModel.selectedWorkspace else { return }
-        let nodes: [ShellPaneNode]
-        switch ws.layout {
-        case let .single(p): nodes = [p]
-        case let .split(_, a, b, _): nodes = [a, b]
-        }
-        guard let node = nodes.first(where: { $0.id == paneId }),
+        guard let ws = viewModel.selectedWorkspace,
+              let node = ws.layout.leaves.first(where: { $0.id == paneId }),
               let surface = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
                   ?? node.surfaces.first,
-              let paneId = surface.paneId else { return }
-        if surface.kind == .terminal, let view = surfaces[paneId] {
+              let pane = surface.paneId else { return }
+        selectedPane = pane
+        if surface.kind == .terminal, let view = surfaces[pane] {
             window.makeFirstResponder(view)
-        } else if surface.kind == .browser, let web = webviews[paneId] {
+        } else if surface.kind == .browser, let web = webviews[pane] {
             window.makeFirstResponder(web)
         }
     }
@@ -697,14 +688,19 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         if !demoMode, let ws = viewModel.selectedWorkspace {
             // Close daemon-side or the workspace resurrects as a row on
             // the next refresh: terminals get their child killed,
-            // browser panes are core state removed via browser-close.
-            for surf in allSurfaces(of: ws.layout) {
+            // browser panels are core state removed, and the session
+            // itself goes once its panes have drained (remove-session).
+            for surf in ws.layout.leaves.flatMap(\.surfaces) {
                 guard let pane = surf.paneId else { continue }
                 switch surf.kind {
                 case .terminal: killPane(pane)
                 case .browser: closeBrowserPane(pane)
                 case .placeholder: break
                 }
+            }
+            if let sid = ws.sessionId {
+                pendingSessionRemove.insert(sid)
+                maybeRemoveEmptySessions()
             }
         }
         if viewModel.closeSelectedWorkspace() {
@@ -717,13 +713,19 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
     @objc func closeSurface() {
         if closeAuxiliaryKeyWindow() { return }
-        if !demoMode, let ws = viewModel.selectedWorkspace {
-            let nodes: [ShellPaneNode]
-            switch ws.layout {
-            case let .single(p): nodes = [p]
-            case let .split(_, a, b, _): nodes = [a, b]
-            }
-            let node = nodes.first { $0.id == viewModel.focusedPaneId } ?? nodes.first
+        guard let ws = viewModel.selectedWorkspace else {
+            statusLabel.stringValue = "no surface to close"
+            return
+        }
+        // Closing the workspace's last panel closes the workspace —
+        // cmux semantics; no empty husk rows.
+        if ws.layout.leaves.flatMap(\.surfaces).count <= 1 {
+            closeWorkspace()
+            return
+        }
+        if !demoMode {
+            let leaves = ws.layout.leaves
+            let node = leaves.first { $0.id == viewModel.focusedPaneId } ?? leaves.first
             if let node,
                let surf = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
                    ?? node.surfaces.first,
@@ -735,11 +737,30 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 }
             }
         }
-        if viewModel.closeSelectedSurface() {
+        if viewModel.closeFocusedPanel() {
             reloadChrome()
             pushShellState()
         } else {
             statusLabel.stringValue = "no surface to close"
+        }
+    }
+
+    /// Sessions queued for removal once their terminal panes drain —
+    /// remove-session refuses while panes are still alive.
+    var pendingSessionRemove: Set<UInt64> = []
+    func maybeRemoveEmptySessions() {
+        guard !demoMode, !pendingSessionRemove.isEmpty else { return }
+        client.send(["cmd": "list-sessions"]) { [weak self] resp in
+            guard let self, let sessions = resp["sessions"] as? [[String: Any]] else { return }
+            for s in sessions {
+                let sid = (s["id"] as? NSNumber)?.uint64Value ?? 0
+                guard self.pendingSessionRemove.contains(sid),
+                      (s["panes"] as? [NSNumber] ?? []).isEmpty else { continue }
+                self.pendingSessionRemove.remove(sid)
+                self.client.send(["cmd": "remove-session", "session": sid]) { _ in
+                    self.refresh()
+                }
+            }
         }
     }
 
@@ -751,16 +772,6 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         guard let key = NSApp.keyWindow, key !== window else { return false }
         key.performClose(nil)
         return true
-    }
-
-    /// Every surface in a layout.
-    private func allSurfaces(of layout: ShellLayout) -> [ShellSurface] {
-        let nodes: [ShellPaneNode]
-        switch layout {
-        case let .single(p): nodes = [p]
-        case let .split(_, a, b, _): nodes = [a, b]
-        }
-        return nodes.flatMap(\.surfaces)
     }
 
     @objc func focusNextPane() {
@@ -806,7 +817,8 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             return
         }
         let wsId = ws.id
-        let sid = viewModel.daemonPaneIds(of: ws.layout).first.flatMap { paneSession[$0] }
+        let sid = ws.sessionId
+            ?? viewModel.daemonPaneIds(of: ws.layout).first.flatMap { paneSession[$0] }
             ?? currentSession
         let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
         client.send(["cmd": "spawn-pane", "session": sid,
@@ -1018,7 +1030,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                     guard let pane = (n["pane"] as? NSNumber)?.uint64Value
                     else { break }
                     self.appendHistoryNotification(
-                        seq: seq, workspaceId: "term-\(pane)", title: "pane \(pane)",
+                        seq: seq,
+                        workspaceId: paneSession[pane].map { "sess-\($0)" } ?? "",
+                        title: "pane \(pane)",
                         subtitle: "bell",
                         body: "the terminal rang the bell · \(when)", isRead: isRead)
                 default:
@@ -1166,16 +1180,18 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 bells.insert(pane)
                 refresh()
                 // A bell from a pane running an AI agent is that agent
-                // asking for you.
+                // asking for you. Rows are sessions now — notify the
+                // pane's workspace.
+                let wsId = paneSession[pane].map { "sess-\($0)" } ?? ""
                 let title = paneTitles[pane] ?? "pane \(pane)"
                 if agentPanes.contains(pane) {
                     pushNotification(
-                        workspaceId: "term-\(pane)", title: title,
+                        workspaceId: wsId, title: title,
                         subtitle: "needs attention", body: "the agent is waiting for you")
                     NSApp.requestUserAttention(.informationalRequest)
                 } else {
                     pushNotification(
-                        workspaceId: "term-\(pane)", title: title,
+                        workspaceId: wsId, title: title,
                         subtitle: "bell", body: "the terminal rang the bell")
                 }
             }
@@ -1195,6 +1211,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             viewModel.removePaneEverywhere(pane)
             refresh()
             pushShellState()
+            // A workspace close waits for its panes to drain before the
+            // session itself can go.
+            maybeRemoveEmptySessions()
         case "browser_removed":
             webObservations.removeValue(forKey: pane)
             if let web = webviews.removeValue(forKey: pane) {
@@ -1205,18 +1224,15 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             viewModel.removePaneEverywhere(pane)
             refresh()
         case "browser_open":
-            let url = obj["url"] as? String ?? "about:blank"
-            ensureWebView(pane: pane, url: url)
+            // The browser docks into its session's workspace — the
+            // refresh grafts it into the tree in place.
+            ensureWebView(pane: pane, url: obj["url"] as? String ?? "about:blank")
             refresh()
-            if let idx = pendingBrowserFocus.firstIndex(of: url) {
-                pendingBrowserFocus.remove(at: idx)
-                // refresh() replies async — select once the row exists.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-                    guard let self else { return }
-                    self.viewModel.selectWorkspace("web-\(pane)")
-                    self.reloadChrome()
-                }
+        case "session_removed", "session_renamed":
+            if let sid = (obj["session"] as? NSNumber)?.uint64Value {
+                pendingSessionRemove.remove(sid)
             }
+            refresh()
         case "browser_nav":
             if let web = webviews[pane], let u = URL(string: obj["url"] as? String ?? "") {
                 web.load(URLRequest(url: u))
@@ -1297,32 +1313,62 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     // MARK: Shell state (split layouts survive app relaunches)
 
     /// Debounced: stash the current split layouts in the daemon.
+    /// Serialize a workspace tree for the daemon's shell-state stash:
+    /// {"t":pane} terminal leaf, {"w":pane} browser leaf,
+    /// {"h":bool,"r":ratio,"a":…,"b":…} split.
+    private func encodeTree(_ layout: ShellLayout) -> [String: Any]? {
+        switch layout {
+        case let .leaf(node):
+            guard let surf = node.surfaces.first, let pane = surf.paneId else { return nil }
+            return surf.kind == .browser ? ["w": pane] : ["t": pane]
+        case let .split(o, a, b, r):
+            guard let ea = encodeTree(a) else { return encodeTree(b) }
+            guard let eb = encodeTree(b) else { return ea }
+            return ["h": o == ShellLayout.Orientation.horizontal, "r": Double(r), "a": ea, "b": eb]
+        }
+    }
+
+    private func decodeTree(_ obj: [String: Any]) -> ShellLayout? {
+        if let pane = (obj["t"] as? NSNumber)?.uint64Value {
+            let surface = ShellSurface(
+                id: "pane-\(pane)", title: paneTitles[pane] ?? "pane \(pane)",
+                kind: .terminal, paneId: pane)
+            return .leaf(ShellPaneNode(id: "p-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id))
+        }
+        if let pane = (obj["w"] as? NSNumber)?.uint64Value {
+            let surface = ShellSurface(
+                id: "web-\(pane)", title: browserTitles[pane] ?? "browser",
+                kind: .browser, paneId: pane)
+            return .leaf(ShellPaneNode(id: "w-\(pane)", surfaces: [surface], selectedSurfaceId: surface.id))
+        }
+        guard let a = obj["a"] as? [String: Any], let b = obj["b"] as? [String: Any],
+              let first = decodeTree(a), let second = decodeTree(b) else { return nil }
+        let horizontal = (obj["h"] as? Bool) ?? true
+        let ratio = CGFloat((obj["r"] as? NSNumber)?.doubleValue ?? 0.5)
+        return .split(
+            orientation: horizontal ? .horizontal : .vertical,
+            first: first, second: second, ratio: ratio)
+    }
+
     func pushShellState() {
         guard !demoMode, shellStateRestored else { return }
         shellStateTimer?.invalidate()
         shellStateTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
             guard let self else { return }
-            var splits: [[String: Any]] = []
+            var trees: [String: Any] = [:]
             for item in self.viewModel.items {
-                guard case let .workspace(w) = item,
-                      case let .split(o, first, second, ratio) = w.layout,
-                      let f = first.surfaces.first?.paneId,
-                      let s = second.surfaces.first?.paneId
-                else { continue }
-                splits.append([
-                    "f": f, "s": s,
-                    "h": o == ShellLayout.Orientation.horizontal,
-                    "r": Double(ratio),
-                ])
+                guard case let .workspace(w) = item, let sid = w.sessionId,
+                      let tree = self.encodeTree(w.layout) else { continue }
+                trees["\(sid)"] = tree
             }
-            guard let data = try? JSONSerialization.data(withJSONObject: ["splits": splits]),
+            guard let data = try? JSONSerialization.data(withJSONObject: ["trees": trees]),
                   let json = String(data: data, encoding: .utf8) else { return }
             self.client.send(["cmd": "set-shell-state", "data": json])
         }
     }
 
-    /// Rebuild stashed splits over panes that still exist. Runs once,
-    /// after the first refresh has populated rows and paneSession.
+    /// Re-adopt stashed workspace arrangements whose panes all still
+    /// exist. Runs once, after the first refresh has populated rows.
     func restoreShellState() {
         client.send(["cmd": "get-shell-state"]) { [weak self] resp in
             guard let self else { return }
@@ -1330,25 +1376,21 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             guard let json = resp["data"] as? String,
                   let data = json.data(using: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let splits = obj["splits"] as? [[String: Any]]
+                  let trees = obj["trees"] as? [String: Any]
             else { return }
             var changed = false
-            for split in splits {
-                guard let f = (split["f"] as? NSNumber)?.uint64Value,
-                      let s = (split["s"] as? NSNumber)?.uint64Value,
-                      self.paneSession[f] != nil, self.paneSession[s] != nil,
-                      !self.exited.contains(f), !self.exited.contains(s)
+            for (key, raw) in trees {
+                guard let sid = UInt64(key),
+                      let treeObj = raw as? [String: Any],
+                      let tree = self.decodeTree(treeObj),
+                      let ws = self.viewModel.workspace(id: "sess-\(sid)"),
+                      Set(tree.daemonPaneIds) == Set(ws.layout.daemonPaneIds),
+                      !tree.daemonPaneIds.isEmpty
                 else { continue }
-                let horizontal = (split["h"] as? Bool) ?? true
-                let ratio = CGFloat((split["r"] as? NSNumber)?.doubleValue ?? 0.5)
-                self.viewModel.graftSplit(
-                    workspaceId: "term-\(f)",
-                    orientation: horizontal ? .horizontal : .vertical,
-                    paneId: s)
-                self.viewModel.setSplitRatio(workspaceId: "term-\(f)", ratio: ratio)
+                self.viewModel.setLayout(workspaceId: "sess-\(sid)", layout: tree)
                 changed = true
             }
-            if changed { self.refresh() }
+            if changed { self.reloadChrome() }
         }
     }
 
@@ -1356,14 +1398,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     func knowsPane(_ pane: UInt64) -> Bool {
         for item in viewModel.items {
             guard case let .workspace(w) = item else { continue }
-            let panes: [ShellPaneNode]
-            switch w.layout {
-            case let .single(p): panes = [p]
-            case let .split(_, a, b, _): panes = [a, b]
-            }
-            for node in panes where node.surfaces.contains(where: { $0.paneId == pane }) {
-                return true
-            }
+            if w.layout.daemonPaneIds.contains(pane) { return true }
         }
         return false
     }
@@ -1455,16 +1490,19 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 parent: window, underPageColor: webView.underPageBackgroundColor)
         }
         if let url = navigationAction.request.url, !demoMode {
-            openBrowserPaneFocused(url.absoluteString)
+            openBrowserInWorkspace(url.absoluteString, from: webView)
         }
         return nil
     }
 
-    /// Open a new browser pane from an in-page action and focus it
-    /// once the daemon's browser_open lands.
-    func openBrowserPaneFocused(_ url: String) {
-        pendingBrowserFocus.append(url)
-        client.send(["cmd": "browser-open", "session": currentSession, "url": url])
+    /// target=_blank / cmd-click from a browser panel: the new browser
+    /// docks into the SAME workspace (cmux's dock.newSurface) — it
+    /// appears beside the page you clicked in, never as a new row.
+    func openBrowserInWorkspace(_ url: String, from webView: WKWebView?) {
+        let sid = webView.flatMap { paneOfWebView[ObjectIdentifier($0)] }.flatMap { paneSession[$0] }
+            ?? viewModel.selectedWorkspace?.sessionId
+            ?? currentSession
+        client.send(["cmd": "browser-open", "session": sid, "url": url])
     }
 
     /// window.close() on a pane-hosted browser closes the pane.
@@ -1562,11 +1600,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             decisionHandler(.download)
             return
         }
-        // Cmd-click / middle-click opens a new browser pane (cmux: new tab).
+        // Cmd-click / middle-click docks a new browser panel into the
+        // same workspace (cmux: new tab in the dock).
         if navigationAction.navigationType == .linkActivated,
            navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == 2 {
             decisionHandler(.cancel)
-            if !demoMode { openBrowserPaneFocused(url.absoluteString) }
+            if !demoMode { openBrowserInWorkspace(url.absoluteString, from: webView) }
             return
         }
         decisionHandler(.allow)
@@ -1699,50 +1738,43 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         client.send(["cmd": "create-session", "title": "session"]) { [weak self] _ in self?.refresh() }
     }
 
+    /// ⌘T, cmux-style: a new WORKSPACE — its own daemon session with a
+    /// fresh shell — not another pane in the current one.
     @objc func addTerm() {
         if demoMode {
             statusLabel.stringValue = "demo — spawn-pane not wired"
             return
         }
         let shellPath = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
-        var sid = currentSession
-        let spawn: () -> Void = { [weak self] in
-            guard let self else { return }
+        client.send(["cmd": "create-session", "title": "~"]) { [weak self] resp in
+            guard let self, let sid = (resp["session"] as? NSNumber)?.uint64Value else { return }
             self.client.send(["cmd": "spawn-pane", "session": sid,
-                              "argv": [shellPath, "-i"], "cwd": NSHomeDirectory()]) { resp in
-                let pane = (resp["pane"] as? NSNumber)?.uint64Value
+                              "argv": [shellPath, "-i"], "cwd": NSHomeDirectory()]) { _ in
                 self.refresh()
-                if let pane {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        self.viewModel.selectWorkspace("term-\(pane)")
-                        self.reloadChrome()
-                    }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    self.viewModel.selectWorkspace("sess-\(sid)")
+                    self.reloadChrome()
                 }
             }
         }
-        if sessionIds.isEmpty {
-            client.send(["cmd": "create-session", "title": "main"]) { resp in
-                sid = (resp["session"] as? NSNumber)?.uint64Value ?? 1
-                spawn()
-            }
-        } else {
-            spawn()
-        }
     }
 
+    /// ⌘⇧B: dock a browser into the CURRENT workspace (cmux's dock
+    /// column) — browsers are panels inside a workspace, never rows.
     @objc func addWeb() {
         if demoMode {
             statusLabel.stringValue = "demo — browser-open not wired"
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Open browser pane"
+        alert.messageText = "Open browser panel"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: ShellTheme.alertFieldHeight))
         field.stringValue = "https://google.com"
         alert.accessoryView = field
         alert.addButton(withTitle: "Open")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        client.send(["cmd": "browser-open", "session": currentSession, "url": field.stringValue])
+        let sid = viewModel.selectedWorkspace?.sessionId ?? currentSession
+        client.send(["cmd": "browser-open", "session": sid, "url": field.stringValue])
     }
 }

@@ -344,6 +344,29 @@ pub const Server = struct {
                 };
             }
             self.reply(client, .{ .id = req.id, .ok = true, .sessions = infos });
+        } else if (eql(u8, req.cmd, "rename-session")) {
+            const sid = req.session orelse return error.MissingSession;
+            const title = req.title orelse return error.MissingTitle;
+            try ss.renameSession(sid, title);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            self.broadcast(.{ .event = "session_renamed", .session = sid, .title = title });
+        } else if (eql(u8, req.cmd, "remove-session")) {
+            // Two-step like remove-pane: terminal panes must be killed
+            // and removed first (SessionNotEmpty otherwise). Browser
+            // panes close with the session — each one's removal is
+            // broadcast so hosts drop their webviews.
+            const sid = req.session orelse return error.MissingSession;
+            var closed: std.ArrayListUnmanaged(session.PaneId) = .empty;
+            defer closed.deinit(self.alloc);
+            if (ss.getSession(sid)) |s| {
+                try closed.appendSlice(self.alloc, s.browsers.items);
+            }
+            try ss.removeSession(sid);
+            self.reply(client, .{ .id = req.id, .ok = true });
+            for (closed.items) |b| {
+                self.broadcast(.{ .event = "browser_removed", .pane = b });
+            }
+            self.broadcast(.{ .event = "session_removed", .session = sid });
         } else if (eql(u8, req.cmd, "spawn-pane")) {
             const sid = req.session orelse return error.MissingSession;
             const argv = req.argv orelse return error.MissingArgv;
@@ -1030,6 +1053,96 @@ test "browser panes: host protocol round-trip" {
     const b = server.getBrowserPane(1).?;
     try std.testing.expectEqualStrings("Example Domain", b.title);
     try std.testing.expect(!b.loading);
+}
+
+/// remove-session / rename-session: shells render sessions as
+/// workspace rows, so closing and renaming rows must be daemon state.
+const SessionLifecycleTestClient = struct {
+    socket_path: []const u8,
+    err: ?anyerror = null,
+    renamed_ok: bool = false,
+    not_empty_ok: bool = false,
+    browser_removed_ok: bool = false,
+    removed_ok: bool = false,
+
+    fn run(self: *SessionLifecycleTestClient) void {
+        self.runInner() catch |err| {
+            self.err = err;
+        };
+    }
+
+    fn runInner(self: *SessionLifecycleTestClient) !void {
+        var client = try Client.connect(self.socket_path);
+        defer client.close();
+
+        try client.sendLine("{\"id\":1,\"cmd\":\"create-session\",\"title\":\"ws\"}");
+        _ = try waitFor(&client, "\"id\":1");
+        try client.sendLine("{\"id\":2,\"cmd\":\"rename-session\",\"session\":1,\"title\":\"renamed\"}");
+        _ = try waitFor(&client, "\"id\":2");
+        try client.sendLine("{\"id\":3,\"cmd\":\"list-sessions\"}");
+        const r3 = try waitFor(&client, "\"id\":3");
+        self.renamed_ok = std.mem.indexOf(u8, r3, "\"title\":\"renamed\"") != null;
+
+        // A session with a terminal pane refuses removal — panes must
+        // be killed and removed first (their completions drain from
+        // request context).
+        try client.sendLine("{\"id\":4,\"cmd\":\"spawn-pane\",\"session\":1," ++
+            "\"argv\":[\"/bin/sh\",\"-c\",\"sleep 30\"]}");
+        const r4 = try waitFor(&client, "\"id\":4");
+        if (std.mem.indexOf(u8, r4, "\"pane\":1") == null) return error.SpawnFailed;
+        try client.sendLine("{\"id\":5,\"cmd\":\"remove-session\",\"session\":1}");
+        const r5 = try waitFor(&client, "\"id\":5");
+        self.not_empty_ok = std.mem.indexOf(u8, r5, "SessionNotEmpty") != null;
+
+        try client.sendLine("{\"id\":6,\"cmd\":\"kill-pane\",\"pane\":1}");
+        _ = try waitFor(&client, "\"id\":6");
+        _ = try waitFor(&client, "\"event\":\"pane_exit\"");
+        try client.sendLine("{\"id\":7,\"cmd\":\"remove-pane\",\"pane\":1}");
+        _ = try waitFor(&client, "\"id\":7");
+
+        // A docked browser closes with its session: browser_removed,
+        // then session_removed, then the session list is empty.
+        try client.sendLine("{\"id\":8,\"cmd\":\"browser-open\",\"session\":1,\"url\":\"https://dock.me\"}");
+        _ = try waitFor(&client, "\"id\":8");
+        try client.sendLine("{\"id\":9,\"cmd\":\"remove-session\",\"session\":1}");
+        _ = try waitFor(&client, "\"id\":9");
+        const brm = try waitFor(&client, "\"event\":\"browser_removed\"");
+        self.browser_removed_ok = std.mem.indexOf(u8, brm, "\"pane\":2") != null;
+        _ = try waitFor(&client, "\"event\":\"session_removed\"");
+        try client.sendLine("{\"id\":10,\"cmd\":\"list-sessions\"}");
+        const r10 = try waitFor(&client, "\"id\":10");
+        self.removed_ok = std.mem.indexOf(u8, r10, "\"sessions\":[]") != null;
+
+        try client.sendLine("{\"id\":11,\"cmd\":\"shutdown\"}");
+        _ = try waitFor(&client, "\"id\":11");
+    }
+};
+
+test "sessions: rename and remove lifecycle" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir);
+    const socket_path = try std.fs.path.join(alloc, &.{ dir, "zide.sock" });
+    defer alloc.free(socket_path);
+
+    var server = try session.Server.init(alloc);
+    defer server.deinit();
+    var ipc_server = try Server.create(alloc, &server, socket_path);
+    defer ipc_server.destroy();
+
+    var tc: SessionLifecycleTestClient = .{ .socket_path = socket_path };
+    const thread = try std.Thread.spawn(.{}, SessionLifecycleTestClient.run, .{&tc});
+    try server.run();
+    thread.join();
+
+    try std.testing.expectEqual(@as(?anyerror, null), tc.err);
+    try std.testing.expect(tc.renamed_ok);
+    try std.testing.expect(tc.not_empty_ok);
+    try std.testing.expect(tc.browser_removed_ok);
+    try std.testing.expect(tc.removed_ok);
+    try std.testing.expectEqual(@as(usize, 0), server.count());
 }
 
 /// Drives the attach transport end to end: spawn an interactive child,
