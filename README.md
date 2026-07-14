@@ -15,11 +15,22 @@ git UI, and native agent with inline diffs.
 Think [cmux](https://cmux.com) + [terax](https://terax.app), combined, with
 the core written in Zig.
 
-**Status: pre-alpha, but real.** The daemon runs sessions, PTY panes,
-worktree-isolated agent tasks and attention detection; the macOS app renders
-panes on GPU libghostty surfaces over a cmux-style sidebar. Panes live in the
-daemon, so they survive the app. Missing: splits, agent-task UI, the editor,
-Linux. See [ROADMAP.md](ROADMAP.md).
+<p align="center">
+  <video src="https://github.com/amangly/zide/raw/main/assets/zide-overview.mp4" controls muted width="100%"></video>
+</p>
+
+> _Overview: agent-aware workspaces (Claude and Codex running side by side),
+> recursive terminal splits, and a docked browser — all daemon-backed._
+> If the video doesn't play inline,
+> [watch it here](https://github.com/amangly/zide/raw/main/assets/zide-overview.mp4).
+
+**Status: pre-alpha, but real.** A daemon owns sessions and PTY panes (they
+survive the app); the macOS app renders them on GPU libghostty surfaces in a
+cmux-style workspace — recursive splits, a docked WebKit browser, and a
+sidebar that follows what each pane is running (an agent, a command, a
+directory). AI agents run as ordinary processes; the shell detects and
+surfaces them. macOS-first; Linux and the editor are next. See
+[ROADMAP.md](ROADMAP.md).
 
 ```sh
 zig build && ./macos/build.sh && open macos/out/Zide.app
