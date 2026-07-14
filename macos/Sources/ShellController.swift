@@ -1118,12 +1118,19 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             }
             guard !metas.isEmpty else { return }
             self.viewModel.applyPaneMeta(metas)
-            // Fallback tab titles for shells that never set one: the
-            // foreground command, or cwd when the shell is idle. OSC
-            // titles stay authoritative.
-            for (pane, m) in metas where !self.oscTitled.contains(pane) {
-                if let t = self.metaDerivedTitle(command: fgTitles[pane] ?? nil, cwd: m.cwd) {
-                    self.paneTitleChanged(pane, title: t, fromOSC: false)
+            for (pane, m) in metas {
+                if let agent = m.agent {
+                    // A running agent OWNS the row title — "claude",
+                    // "codex" — even over a shell that writes its own
+                    // OSC title (cwd) on every prompt. That's the whole
+                    // point: the sidebar follows what the agent is doing.
+                    self.paneTitleChanged(pane, title: agent, fromOSC: false, force: true)
+                } else if !self.oscTitled.contains(pane) {
+                    // No agent, no OSC title: fall back to the foreground
+                    // command, or cwd when the shell is idle.
+                    if let t = self.metaDerivedTitle(command: fgTitles[pane] ?? nil, cwd: m.cwd) {
+                        self.paneTitleChanged(pane, title: t, fromOSC: false)
+                    }
                 }
             }
             // Sidebar + status only: reloadChrome() rebuilds the host's
@@ -1255,12 +1262,21 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     /// meta-derived fallback. Update tabs and sidebar in place — never
     /// reloadChrome here, it rebuilds panel slots and steals keyboard
     /// focus on every prompt.
-    func paneTitleChanged(_ pane: UInt64, title: String, fromOSC: Bool = true) {
+    func paneTitleChanged(_ pane: UInt64, title: String, fromOSC: Bool = true, force: Bool = false) {
+        // `force` (a running agent) overrides an OSC-titled pane without
+        // itself becoming the authoritative OSC title.
         if fromOSC { oscTitled.insert(pane) }
+        _ = force
         let t = title.isEmpty ? "pane \(pane)" : title
         guard paneTitles[pane] != t else { return }
         paneTitles[pane] = t
         viewModel.setSurfaceTitle(paneId: pane, title: t)
+        // The workspace row follows its leading pane's process/agent
+        // live (cmux) — "claude"/"vim"/"~", not the static session name.
+        if let sid = paneSession[pane], viewModel.leadPaneId(ofSession: sid) == pane {
+            viewModel.setWorkspaceTitle(sessionId: sid, title: t)
+            updateTitlebar()
+        }
         sidebar.apply(
             items: viewModel.items,
             selectedWorkspaceId: viewModel.selectedWorkspaceId,

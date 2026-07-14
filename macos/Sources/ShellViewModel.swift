@@ -457,6 +457,26 @@ final class ShellViewModel {
         setSurfaceTitle(paneId: pane, title: title)
     }
 
+    /// The workspace's leading terminal pane — its process/agent title
+    /// drives the row label (cmux follows the active pane).
+    func leadPaneId(ofSession sessionId: UInt64) -> UInt64? {
+        guard let ws = workspace(id: "sess-\(sessionId)") else { return nil }
+        for node in ws.layout.leaves {
+            if let pane = node.surfaces.first(where: { $0.kind == .terminal })?.paneId {
+                return pane
+            }
+        }
+        return nil
+    }
+
+    /// Retitle a workspace row live (dynamic pane title between full
+    /// refreshes). No-op if the workspace is gone.
+    func setWorkspaceTitle(sessionId: UInt64, title: String) {
+        let t = title.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        mutateWorkspace(id: "sess-\(sessionId)") { $0.title = t }
+    }
+
     /// Daemon pane ids referenced by a layout's surfaces.
     func daemonPaneIds(of layout: ShellLayout) -> [UInt64] {
         layout.daemonPaneIds
@@ -636,11 +656,14 @@ final class ShellViewModel {
         paneTitles: [UInt64: String] = [:],
         agentActivity: [UInt64: String?] = [:]
     ) {
+        // A session with no panes and no browsers is an empty husk
+        // (all its panes exited) — not a workspace worth a row.
+        let live = sessions.filter { !($0.panes.isEmpty && $0.browsers.isEmpty) }
         var next: [ShellSidebarItem] = []
-        if !sessions.isEmpty {
+        if !live.isEmpty {
             next.append(.group(id: "sessions", title: "WORKSPACES"))
         }
-        for s in sessions {
+        for s in live {
             let id = "sess-\(s.id)"
             let prev = workspace(id: id)
             let live = Set(s.panes + s.browsers)
@@ -682,9 +705,22 @@ final class ShellViewModel {
                 hasBell ? .needsAttention : (!agents.isEmpty ? .working : .none)
             let activity = agents.compactMap { agentActivity[$0] ?? nil }.first
 
+            // The row title follows the pane live (cmux): the leading
+            // terminal's process/agent (paneTitles = OSC title → agent
+            // name → command → cwd), then a browser-only workspace's
+            // page title, then the session name as the last resort.
+            func nonEmpty(_ value: String?) -> String? {
+                let trimmed = value?.trimmingCharacters(in: .whitespaces)
+                return (trimmed?.isEmpty == false) ? trimmed : nil
+            }
+            let leadTitle = nonEmpty(s.panes.first.flatMap { paneTitles[$0] })
+            let browserTitle = nonEmpty(s.browsers.first.flatMap { browserTitles[$0] })
+            let sessionTitle = s.title.isEmpty ? "workspace \(s.id)" : s.title
+            let wsTitle = leadTitle ?? prev?.title ?? browserTitle ?? sessionTitle
+
             next.append(.workspace(ShellWorkspace(
                 id: id,
-                title: s.title.isEmpty ? "workspace \(s.id)" : s.title,
+                title: wsTitle,
                 sessionId: s.id,
                 cwd: prev?.cwd,
                 branch: prev?.branch,
