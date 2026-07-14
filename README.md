@@ -8,9 +8,7 @@
 # zide
 
 A terminal built for running many AI coding agents in parallel, growing into
-a full AI-native development workspace. One app: multiplexer-grade terminal,
-managed git-worktree isolation per agent task, and — over time — an editor,
-git UI, and native agent with inline diffs.
+a full AI-native development workspace.
 
 Think [cmux](https://cmux.com) + [terax](https://terax.app), combined, with
 the core written in Zig.
@@ -27,76 +25,40 @@ the core written in Zig.
 
 **Status: pre-alpha, but real.** A daemon owns sessions and PTY panes (they
 survive the app); the macOS app renders them on GPU libghostty surfaces in a
-cmux-style workspace — recursive splits, a docked WebKit browser, and a
-sidebar that follows what each pane is running (an agent, a command, a
-directory). AI agents run as ordinary processes; the shell detects and
-surfaces them. macOS-first; Linux and the editor are next. See
-[ROADMAP.md](ROADMAP.md).
+cmux-style workspace — recursive splits, a docked WebKit browser, and a sidebar
+that follows what each pane is running (an agent, a command, a directory). AI
+agents run as ordinary processes; the shell detects and surfaces them.
+macOS-first; Linux and the editor are next.
 
-```sh
-zig build && ./macos/build.sh && open macos/out/Zide.app
-```
+## Get it
 
-## Install (macOS)
+Download the latest [macOS release](https://github.com/amangly/zide/releases)
+(Apple Silicon), or build from source — see **[macos/README.md](macos/README.md)**.
 
-Build and install a self-contained `Zide.app` into `/Applications` — the
-`zide` daemon binary and all resources are bundled, so nothing else is
-needed afterward:
+## What it is
 
-```sh
-./macos/install.sh                       # → /Applications/Zide.app
-PREFIX=~/Applications ./macos/install.sh # install elsewhere
-```
-
-Or build a drag-to-Applications disk image to share:
-
-```sh
-./macos/make-dmg.sh                      # → macos/out/Zide-<version>.dmg
-```
-
-The dev build is ad-hoc signed. To sign (and enable browser passkey /
-Touch ID sign-in) pass a Developer ID:
-
-```sh
-CODESIGN_IDENTITY="Developer ID Application: You (TEAMID)" ./macos/install.sh
-```
-
-## What it will be
-
-- **Agent multitasking** — spawn CLI agents (Claude Code, Codex, Aider, …)
-  as first-class tasks, each isolated in its own git worktree + branch,
-  with attention notifications and a review → merge → clean-up flow.
-- **Multiplexer terminal** — libghostty-powered panes, vertical tabs
-  showing branch/dir/ports, split layouts, session restore.
-- **IDE, eventually** — our own editor core (rope buffers, tree-sitter,
-  LSP, Vim emulation, GPU rendering), git commit graph, web preview,
-  and a native agent that proposes inline diffs.
+- **Agent multitasking** — run CLI agents (Claude Code, Codex, Aider, …) as
+  ordinary processes in panes; the sidebar detects each one and follows its
+  status.
+- **Multiplexer terminal** — libghostty GPU panes, recursive splits, a docked
+  browser, and daemon-backed sessions that survive the app.
+- **IDE, eventually** — our own editor core (rope buffers, tree-sitter, LSP,
+  Vim emulation, GPU rendering), a git UI, and a native agent with inline diffs.
 
 ## Architecture in one paragraph
 
-All logic lives in a UI-agnostic Zig core shaped like a server (sessions,
-panes, PTYs, agent tasks behind a message-passing API). Thin native shells
-render it: Swift/AppKit on macOS first, GTK on Linux second. Terminal
-emulation comes from embedding libghostty; editor text gets a custom Zig
-GPU renderer. The server-shaped core later becomes a detached daemon —
-unlocking live session survival, SSH workspaces, and the automation
-socket/CLI — without a rewrite.
-
-## Building
-
-Requires **Zig 0.15.2** exactly (pinned to match Ghostty v1.3.1, our
-terminal engine dependency). Setup details in
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-```sh
-zig build test   # run tests
-zig build run    # dev CLI (event-loop demo)
-```
+All logic lives in a UI-agnostic Zig core shaped like a server — sessions,
+panes, and PTYs behind a message-passing socket. Thin native shells render it:
+Swift/AppKit on macOS first, GTK on Linux next. Terminal emulation comes from
+embedding libghostty; the editor will get a custom Zig GPU renderer. The core
+runs as a detached daemon, so sessions survive the UI and the same socket
+doubles as the automation API and CLI.
 
 ## Documentation
 
 | Doc | What's in it |
 |---|---|
+| [macos/README.md](macos/README.md) | macOS setup, build, install, and distribution |
 | [ZIDE.md](ZIDE.md) | Living project map: modules, conventions, gotchas |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions and their rationale |
 | [ROADMAP.md](ROADMAP.md) | Phase plan and status |
