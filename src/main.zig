@@ -208,6 +208,9 @@ pub fn main() !void {
             const parsed = try client.readResponse(BaseResponse, arena);
             if (parsed.value.ok) break;
             const e = parsed.value.@"error" orelse "unknown";
+            // A watching shell removes exited panes itself (close-on-
+            // exit); losing the removal race means the kill worked.
+            if (std.mem.eql(u8, e, "NoSuchPane")) break;
             if (!std.mem.eql(u8, e, "PaneStillRunning") or tries >= 50)
                 return fail("error: {s}\n", .{e});
             if (tries == 20) {
