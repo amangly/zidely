@@ -61,6 +61,10 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     var paneOfWebView: [ObjectIdentifier: UInt64] = [:]
     /// KVO on each webview's url/title/nav state — live browser chrome.
     var webObservations: [UInt64: [NSKeyValueObservation]] = [:]
+    /// Failed-navigation URL per pane: the in-page error view loads as
+    /// about:blank, but the omnibar must keep showing where the user
+    /// was trying to go.
+    var browserErrorURL: [UInt64: String] = [:]
     var selectedPane: UInt64?
     /// Last live session list, for spawn-into-current-session.
     var sessionIds: [UInt64] = []
@@ -119,6 +123,19 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         buildMenu()
         window.delegate = self
         client.onEvent = { [weak self] in self?.handleEvent($0) }
+        BrowserDownloadManager.shared.onEvent = { [weak self] filename, message, file in
+            guard let self else { return }
+            self.statusLabel.stringValue = "\(filename) — \(message)"
+            // Only terminal states earn a notification; per-download
+            // progress belongs in the status strip.
+            if file != nil || message.hasPrefix("download failed") {
+                self.pushNotification(
+                    workspaceId: self.viewModel.selectedWorkspaceId ?? "",
+                    title: "download",
+                    subtitle: "\(filename): \(message)",
+                    body: file?.path ?? "")
+            }
+        }
         if !demoMode {
             client.send(["cmd": "host-register"])
             refresh(selectFirst: true)
@@ -490,6 +507,9 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
     func workspaceHost(_ host: WorkspaceHostView, navigateBrowser paneId: UInt64, to url: String) {
         guard let u = URL(string: url) else { return }
+        // Omnibar navigations are "typed" in history terms — they
+        // dominate future suggestion ranking, like a real omnibox.
+        BrowserHistoryStore.shared.recordTyped(url: u)
         if let web = webviews[paneId] {
             web.load(URLRequest(url: u))
         } else if !demoMode {
@@ -504,6 +524,10 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
     func workspaceHost(_ host: WorkspaceHostView, browserWebViewForPane paneId: UInt64) -> WKWebView? {
         webviews[paneId]
+    }
+
+    func workspaceHost(_ host: WorkspaceHostView, suggestionsFor query: String) -> [BrowserSuggestion] {
+        BrowserHistoryStore.shared.suggestions(for: query)
     }
 
     func installTerminal(pane: UInt64, into slot: NSView, host: WorkspaceHostView) {
@@ -577,6 +601,11 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         shellMenu.addItem(closeWs)
         shellMenu.addItem(withTitle: "Close Surface", action: #selector(closeSurface), keyEquivalent: "w")
         shellMenu.addItem(withTitle: "Open Location", action: #selector(openLocation), keyEquivalent: "l")
+        // Browser page zoom; in terminal panes ghostty keeps these
+        // keys (font size) since they're not in shellShortcuts.
+        shellMenu.addItem(withTitle: "Zoom In", action: #selector(zoomInBrowser), keyEquivalent: "+")
+        shellMenu.addItem(withTitle: "Zoom Out", action: #selector(zoomOutBrowser), keyEquivalent: "-")
+        shellMenu.addItem(withTitle: "Actual Size", action: #selector(zoomActualBrowser), keyEquivalent: "0")
         let focusNext = NSMenuItem(title: "Focus Next Pane", action: #selector(focusNextPane), keyEquivalent: "]")
         focusNext.keyEquivalentModifierMask = [.command, .option]
         shellMenu.addItem(focusNext)
@@ -1119,6 +1148,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 paneOfWebView.removeValue(forKey: ObjectIdentifier(web))
             }
             browserTitles.removeValue(forKey: pane)
+            browserErrorURL.removeValue(forKey: pane)
             viewModel.removePaneEverywhere(pane)
             refresh()
         case "browser_open":
@@ -1277,14 +1307,15 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
 
     func ensureWebView(pane: UInt64, url: String) {
         guard webviews[pane] == nil else { return }
-        let web = WKWebView(frame: .zero)
+        let web = BrowserEngine.makeWebView(
+            underPageColor: runtime.backgroundColor.withAlphaComponent(runtime.backgroundOpacity))
         web.navigationDelegate = self
         web.uiDelegate = self
         webviews[pane] = web
         paneOfWebView[ObjectIdentifier(web)] = pane
-        // Live browser chrome: the address bar, nav buttons, and the
-        // daemon's stored URL/title follow every navigation — not just
-        // page-load completion.
+        // Live browser chrome: the address bar, nav buttons, loading
+        // progress, and the daemon's stored URL/title follow every
+        // navigation — not just page-load completion.
         webObservations[pane] = [
             web.observe(\.url) { [weak self] w, _ in
                 self?.browserStateChanged(w)
@@ -1296,6 +1327,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 self?.browserStateChanged(w)
             },
             web.observe(\.canGoForward) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+            web.observe(\.isLoading) { [weak self] w, _ in
+                self?.browserStateChanged(w)
+            },
+            web.observe(\.estimatedProgress) { [weak self] w, _ in
                 self?.browserStateChanged(w)
             },
         ]
@@ -1311,30 +1348,79 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
                 items: viewModel.items,
                 selectedWorkspaceId: viewModel.selectedWorkspaceId,
                 collapsedGroups: viewModel.collapsedGroups)
+            if let url = web.url { BrowserHistoryStore.shared.updateTitle(url: url, title: title) }
+        }
+        // The error page itself is about:blank — keep showing the URL
+        // that failed instead.
+        var displayURL = web.url?.absoluteString
+        if displayURL == nil || displayURL == "about:blank" {
+            displayURL = browserErrorURL[pane] ?? displayURL
         }
         host.updateBrowserChrome(
             pane: pane,
-            url: web.url?.absoluteString,
+            url: displayURL,
             canGoBack: web.canGoBack,
-            canGoForward: web.canGoForward)
+            canGoForward: web.canGoForward,
+            isLoading: web.isLoading,
+            progress: web.estimatedProgress)
     }
 
-    /// target=_blank and window.open land in the same pane — zide is a
-    /// single-surface browser, like cmux's panel.
+    /// New browsing contexts, cmux's split: scripted window.open with
+    /// explicit window features becomes a real popup window sharing
+    /// WebKit's configuration (window.opener stays alive — OAuth);
+    /// everything else (target=_blank, cmd-click fallbacks) opens a
+    /// new browser pane, zide's tab.
     func webView(
         _ webView: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        webView.load(navigationAction.request)
+        if let url = navigationAction.request.url, !BrowserEngine.isWebScheme(url) {
+            presentExternalOpenPrompt(url)
+            return nil
+        }
+        let featuresSpecified = windowFeatures.x != nil || windowFeatures.y != nil
+            || windowFeatures.width != nil || windowFeatures.height != nil
+            || windowFeatures.menuBarVisibility != nil
+            || windowFeatures.statusBarVisibility != nil
+            || windowFeatures.toolbarsVisibility != nil
+            || windowFeatures.allowsResizing != nil
+        if navigationAction.navigationType == .other, featuresSpecified {
+            return BrowserPopupWindow.open(
+                configuration: configuration, features: windowFeatures,
+                parent: window, underPageColor: webView.underPageBackgroundColor)
+        }
+        if let url = navigationAction.request.url, !demoMode {
+            client.send(["cmd": "browser-open", "session": currentSession, "url": url.absoluteString])
+        }
         return nil
+    }
+
+    /// window.close() on a pane-hosted browser closes the pane.
+    func webViewDidClose(_ webView: WKWebView) {
+        guard let pane = paneOfWebView[ObjectIdentifier(webView)] else { return }
+        closeBrowserPane(pane)
     }
 
     @objc func openLocation() {
         if !host.focusOmnibar() {
             statusLabel.stringValue = "no browser pane selected — ⌘⇧B opens one"
         }
+    }
+
+    /// The selected pane's webview, when the selection is a browser.
+    var selectedWebView: WKWebView? {
+        selectedPane.flatMap { webviews[$0] }
+    }
+
+    @objc func zoomInBrowser() { adjustBrowserZoom(BrowserEngine.pageZoomStep) }
+    @objc func zoomOutBrowser() { adjustBrowserZoom(-BrowserEngine.pageZoomStep) }
+    @objc func zoomActualBrowser() { selectedWebView?.pageZoom = 1.0 }
+
+    func adjustBrowserZoom(_ delta: CGFloat) {
+        guard let web = selectedWebView else { return }
+        web.pageZoom = min(BrowserEngine.maxPageZoom, max(BrowserEngine.minPageZoom, web.pageZoom + delta))
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1351,6 +1437,167 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             statusLabel.stringValue = "web \(pane) — \(title.isEmpty ? url : title)  ·  \(url)"
         }
         reloadChrome()
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard let pane = paneOfWebView[ObjectIdentifier(webView)],
+              let url = webView.url, url.absoluteString != "about:blank" else { return }
+        browserErrorURL.removeValue(forKey: pane)
+        BrowserHistoryStore.shared.recordVisit(url: url, title: webView.title)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        let nsError = error as NSError
+        // Cancelled navigations (rapid typing) are not errors, and
+        // "frame load interrupted" (102) is a navigation that became a
+        // download — both must not paint an error page.
+        if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorCancelled { return }
+        if nsError.domain == "WebKitErrorDomain", nsError.code == 102 { return }
+        let failedURL = (nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL)?.absoluteString
+            ?? nsError.userInfo["NSErrorFailingURLStringKey"] as? String
+            ?? webView.url?.absoluteString ?? ""
+        if let pane = paneOfWebView[ObjectIdentifier(webView)] {
+            browserErrorURL[pane] = failedURL
+        }
+        BrowserErrorPage(failedURL: failedURL, error: nsError).load(in: webView)
+    }
+
+    /// The engine's content process crashed — reload rather than leave
+    /// a white void.
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        webView.reload()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        // Non-web schemes (mailto:, app links) belong to macOS.
+        if !BrowserEngine.isWebScheme(url) {
+            decisionHandler(.cancel)
+            presentExternalOpenPrompt(url)
+            return
+        }
+        // Anchors with the download attribute, Alt-click, etc.
+        if navigationAction.shouldPerformDownload {
+            decisionHandler(.download)
+            return
+        }
+        // Cmd-click / middle-click opens a new browser pane (cmux: new tab).
+        if navigationAction.navigationType == .linkActivated,
+           navigationAction.modifierFlags.contains(.command) || navigationAction.buttonNumber == 2 {
+            decisionHandler(.cancel)
+            if !demoMode {
+                client.send(["cmd": "browser-open", "session": currentSession, "url": url.absoluteString])
+            }
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        if let scheme = navigationResponse.response.url?.scheme?.lowercased(),
+           scheme != "http", scheme != "https" {
+            decisionHandler(.allow)
+            return
+        }
+        let disposition = (navigationResponse.response as? HTTPURLResponse)?
+            .value(forHTTPHeaderField: "Content-Disposition")
+        if BrowserDownloadPolicy.shouldDownload(
+            mimeType: navigationResponse.response.mimeType,
+            canShowMIMEType: navigationResponse.canShowMIMEType,
+            contentDisposition: disposition,
+            isForMainFrame: navigationResponse.isForMainFrame
+        ) {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = BrowserDownloadManager.shared
+    }
+
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = BrowserDownloadManager.shared
+    }
+
+    /// HTTP Basic/Digest auth: the standard sign-in sheet. The user
+    /// types their own credentials; they go straight into WebKit's
+    /// session credential and nowhere else.
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let method = challenge.protectionSpace.authenticationMethod
+        guard method == NSURLAuthenticationMethodHTTPBasic
+                || method == NSURLAuthenticationMethodHTTPDigest else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        guard challenge.previousFailureCount < 3 else {
+            completionHandler(.cancelAuthenticationChallenge, nil)
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Authentication Required"
+        var message = "\(challenge.protectionSpace.host) requires a username and password."
+        if let realm = challenge.protectionSpace.realm, !realm.isEmpty {
+            message = "\(challenge.protectionSpace.host) requires a username and password for \u{201C}\(realm)\u{201D}."
+        }
+        if challenge.previousFailureCount > 0 {
+            message += "\nThe username or password you entered is incorrect."
+        }
+        alert.informativeText = message
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: 58))
+        let user = NSTextField(frame: NSRect(x: 0, y: 32, width: 280, height: 24))
+        user.placeholderString = "Username"
+        let pass = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        pass.placeholderString = "Password"
+        box.addSubview(user)
+        box.addSubview(pass)
+        alert.accessoryView = box
+        alert.window.initialFirstResponder = user
+        alert.addButton(withTitle: "Sign In")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                completionHandler(.useCredential, URLCredential(
+                    user: user.stringValue, password: pass.stringValue, persistence: .forSession))
+            } else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+            }
+        }
+    }
+
+    /// cmux prompts before handing a link to another app — silent
+    /// scheme handoffs are how pages steal focus.
+    func presentExternalOpenPrompt(_ url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Open in another app?"
+        alert.informativeText = url.absoluteString
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: Window focus

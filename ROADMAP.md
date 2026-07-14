@@ -43,6 +43,11 @@ foundation first, pixels when the core deserves them.
 - [x] `zide` CLI against the socket
 - [x] Embedded browser pane (WKWebView) with programmable API
       (prototype host; moves into the Swift shell when it lands)
+- [x] Real-browser behavior in browser panes, following cmux's
+      CmuxBrowser stack: Safari UA engine config, omnibox with
+      history/frecency suggestions, error pages, downloads
+      (quarantined, to ~/Downloads), OAuth popup windows, HTTP auth
+      prompts, load progress + stop/reload, page zoom
 - [x] Daemon mode: live session survival across UI restarts
 - [x] `panes-meta`: per-pane cwd, git branch/dirty, listening ports,
       foreground command, last screen line (the sidebar metadata the

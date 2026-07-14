@@ -68,7 +68,13 @@ Xcode project):
 | `macos/Sources/ShellTheme.swift` | Chrome tokens (colors, fonts, spacing) |
 | `macos/Sources/SidebarView.swift` | Translucent sidebar, collapsible groups, footer actions |
 | `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, snippet, meta, pin, status dot, unread badge |
-| `macos/Sources/WorkspaceHostView.swift` | Surface tabs, draggable splits, panel slots, browser omnibar (live URL + Enter navigates) |
+| `macos/Sources/WorkspaceHostView.swift` | Surface tabs, draggable splits, panel slots, browser omnibar (live URL, history suggestions dropdown, load progress, stop/reload) |
+| `macos/Sources/BrowserEngine.swift` | WKWebView factory following cmux's: Safari UA (sites serve modern UIs, no bot checks), persistent data store, inspectable, swipe gestures, theme-matched under-page color; external-scheme test; zoom bounds |
+| `macos/Sources/BrowserErrorPage.swift` | In-page navigation error UI (cmux port): per-error copy + retry link instead of a blank webview |
+| `macos/Sources/BrowserHistory.swift` | Browser history + omnibar frecency scoring (cmux's suggestion engine); JSON file in Application Support |
+| `macos/Sources/BrowserSuggestionsView.swift` | Omnibar dropdown: ↑/↓ selects, Enter opens, click opens, Esc dismisses |
+| `macos/Sources/BrowserDownloads.swift` | WKDownload delegate: attachment/force-MIME/can't-show responses download to ~/Downloads with collision-safe names + web quarantine |
+| `macos/Sources/BrowserPopupWindow.swift` | Scripted window.open popups in a real window sharing WebKit's configuration — window.opener stays alive for OAuth flows |
 | `macos/Sources/NotificationPanelView.swift` | Notification list panel (⌘⇧I) |
 | `macos/Sources/RightSidebarView.swift` | Right sidebar stub (⌘⌥B) |
 | `macos/Sources/WorkspaceSwitcherView.swift` | Go-to-workspace switcher (⌘P) |

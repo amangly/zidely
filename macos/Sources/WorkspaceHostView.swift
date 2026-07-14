@@ -11,9 +11,10 @@ protocol WorkspaceHostViewDelegate: AnyObject {
     func workspaceHost(_ host: WorkspaceHostView, browserURLForPane paneId: UInt64) -> String?
     func workspaceHost(_ host: WorkspaceHostView, navigateBrowser paneId: UInt64, to url: String)
     func workspaceHost(_ host: WorkspaceHostView, browserWebViewForPane paneId: UInt64) -> WKWebView?
+    func workspaceHost(_ host: WorkspaceHostView, suggestionsFor query: String) -> [BrowserSuggestion]
 }
 
-final class WorkspaceHostView: NSView {
+final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     weak var delegate: WorkspaceHostViewDelegate?
 
     /// Terminal transparency: with a non-opaque window, the canvas and
@@ -30,6 +31,10 @@ final class WorkspaceHostView: NSView {
     private var focusedPaneId: String?
     private let emptyLabel = NSTextField(labelWithString: "no workspace — ⌘T terminal · ⌘⇧P commands · j/k in sidebar")
     private let attentionRing = NSView()
+    /// Omnibar history dropdown — one shared overlay, floated above
+    /// whichever browser pane's address bar is being typed in.
+    private let suggestionsView = BrowserSuggestionsView(frame: .zero)
+    private weak var suggestionsField: NSTextField?
     private var dragOrientation: ShellLayout.Orientation?
     private var dragStartRatio: CGFloat = 0.5
     private var dragStartPoint: CGFloat = 0
@@ -64,6 +69,7 @@ final class WorkspaceHostView: NSView {
     }
 
     func show(workspace: ShellWorkspace?, focusedPaneId: String? = nil) {
+        hideSuggestions()
         self.workspace = workspace
         self.focusedPaneId = focusedPaneId ?? {
             guard let workspace else { return nil }
@@ -171,6 +177,14 @@ final class WorkspaceHostView: NSView {
             let browserBar = makeBrowserBar(pane: pane, surface: selected!)
             browserBar.identifier = NSUserInterfaceItemIdentifier("browserBar")
             header.addSubview(browserBar)
+            // Page-load progress: a hairline under the address bar,
+            // like every browser's loading indicator.
+            let progress = NSView()
+            progress.wantsLayer = true
+            progress.layer?.backgroundColor = ShellTheme.accent.cgColor
+            progress.identifier = NSUserInterfaceItemIdentifier("progress")
+            progress.isHidden = true
+            header.addSubview(progress)
         }
 
         let slot = NSView()
@@ -229,6 +243,7 @@ final class WorkspaceHostView: NSView {
         omnibar.identifier = NSUserInterfaceItemIdentifier("omnibar:\(pane.id)")
         omnibar.target = self
         omnibar.action = #selector(omnibarSubmit(_:))
+        omnibar.delegate = self
         if let paneId = surface.paneId,
            let live = delegate?.workspaceHost(self, browserURLForPane: paneId),
            !live.isEmpty {
@@ -295,16 +310,92 @@ final class WorkspaceHostView: NSView {
         guard let raw = sender.identifier?.rawValue, raw.hasPrefix("omnibar:") else { return }
         let paneNodeId = String(raw.dropFirst("omnibar:".count))
         guard let surface = selectedSurface(paneId: paneNodeId), let paneId = surface.paneId else { return }
+        // A highlighted history suggestion wins over the raw text.
+        let input = suggestionsView.selectedSuggestion?.url ?? sender.stringValue
+        hideSuggestions()
         // Omnibox semantics: URLs load, host-looking input gets a
         // scheme, free text becomes a web search.
-        guard let url = BrowserURLResolver.resolve(sender.stringValue) else { return }
+        guard let url = BrowserURLResolver.resolve(input) else { return }
+        sender.stringValue = url.absoluteString
         delegate?.workspaceHost(self, navigateBrowser: paneId, to: url.absoluteString)
+    }
+
+    // MARK: Omnibar suggestions
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField,
+              field.identifier?.rawValue.hasPrefix("omnibar:") == true else { return }
+        let query = field.stringValue
+        let matches = query.isEmpty ? [] : (delegate?.workspaceHost(self, suggestionsFor: query) ?? [])
+        guard !matches.isEmpty else {
+            hideSuggestions()
+            return
+        }
+        suggestionsField = field
+        suggestionsView.clearSelection()
+        suggestionsView.show(matches)
+        suggestionsView.onPick = { [weak self, weak field] pick in
+            guard let self, let field else { return }
+            field.stringValue = pick.url
+            self.omnibarSubmit(field)
+        }
+        if suggestionsView.superview !== self { addSubview(suggestionsView) }
+        positionSuggestions(under: field)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard (obj.object as? NSTextField)?.identifier?.rawValue.hasPrefix("omnibar:") == true
+        else { return }
+        // Delayed: a click on a suggestion row ends editing on
+        // mouse-down, but the row's click gesture fires on mouse-up —
+        // tearing the overlay down in between would eat the click.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            guard let self, self.suggestionsField?.currentEditor() == nil else { return }
+            self.hideSuggestions()
+        }
+    }
+
+    /// ↑/↓ walk the dropdown, Esc dismisses it; everything else keeps
+    /// the field editor's normal behavior.
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control.identifier?.rawValue.hasPrefix("omnibar:") == true,
+              suggestionsView.superview != nil else { return false }
+        switch commandSelector {
+        case #selector(NSResponder.moveDown(_:)):
+            suggestionsView.moveSelection(1)
+            return true
+        case #selector(NSResponder.moveUp(_:)):
+            suggestionsView.moveSelection(-1)
+            return true
+        case #selector(NSResponder.cancelOperation(_:)):
+            hideSuggestions()
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func positionSuggestions(under field: NSTextField) {
+        let rect = field.convert(field.bounds, to: self)
+        let height = suggestionsView.desiredHeight
+        suggestionsView.frame = NSRect(
+            x: rect.minX, y: rect.minY - height - 4,
+            width: rect.width, height: height)
+    }
+
+    private func hideSuggestions() {
+        suggestionsView.removeFromSuperview()
+        suggestionsView.show([])
+        suggestionsField = nil
     }
 
     /// Live address-bar/nav updates for a browser pane, without
     /// rebuilding the header. The omnibar is left alone while the user
     /// is editing it.
-    func updateBrowserChrome(pane: UInt64, url: String?, canGoBack: Bool, canGoForward: Bool) {
+    func updateBrowserChrome(
+        pane: UInt64, url: String?, canGoBack: Bool, canGoForward: Bool,
+        isLoading: Bool = false, progress: Double = 0
+    ) {
         guard let workspace else { return }
         let nodes: [ShellPaneNode]
         switch workspace.layout {
@@ -326,6 +417,22 @@ final class WorkspaceHostView: NSView {
             }
             (bar.subviews.first { $0.tag == 1 } as? NSButton)?.isEnabled = canGoBack
             (bar.subviews.first { $0.tag == 2 } as? NSButton)?.isEnabled = canGoForward
+            // The reload button doubles as stop while loading — real
+            // browser behavior.
+            if let reload = bar.subviews.first(where: { $0.tag == 3 }) as? NSButton {
+                let symbol = isLoading ? "xmark" : "arrow.clockwise"
+                let tip = isLoading ? "Stop" : "Reload"
+                let img = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
+                img?.isTemplate = true
+                reload.image = img
+                reload.toolTip = tip
+            }
+            if let progressBar = header.subviews.first(where: { $0.identifier?.rawValue == "progress" }) {
+                progressBar.isHidden = !isLoading || progress <= 0
+                progressBar.frame = NSRect(
+                    x: 0, y: 0,
+                    width: header.bounds.width * CGFloat(min(1, max(0, progress))), height: 2)
+            }
         }
     }
 
@@ -378,7 +485,12 @@ final class WorkspaceHostView: NSView {
         switch direction {
         case .back: if web.canGoBack { web.goBack() }
         case .forward: if web.canGoForward { web.goForward() }
-        case .reload: web.reload()
+        case .reload:
+            if web.isLoading {
+                web.stopLoading()
+            } else {
+                web.reload()
+            }
         }
     }
 
