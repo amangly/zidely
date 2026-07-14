@@ -6,6 +6,34 @@ import AppKit
 import WebKit
 import GhosttyKit
 
+/// Titlebar toolbar aligned to the window's two columns: the icon
+/// cluster spreads across what remains of the sidebar column after the
+/// traffic lights, and the title starts at the terminal column's edge.
+final class TitlebarToolbar: NSView {
+    var icons: [NSButton] = []
+    let folder = NSImageView()
+    var title: NSTextField?
+
+    override func layout() {
+        super.layout()
+        // Accessories sit right of the traffic lights; absolute column
+        // alignment needs this view's window-x offset.
+        let originX = convert(NSPoint.zero, to: nil).x
+        let iconEnd = ShellTheme.sidebarWidth - 6
+        let avail = max(0, iconEnd - originX)
+        let step = avail / CGFloat(max(icons.count, 1))
+        for (i, b) in icons.enumerated() {
+            let cx = step * (CGFloat(i) + 0.5)
+            b.frame = NSRect(x: cx - 14, y: (bounds.height - 28) / 2, width: 28, height: 28)
+        }
+        let titleX = ShellTheme.sidebarWidth - originX + 16
+        folder.frame = NSRect(x: titleX, y: (bounds.height - 16) / 2, width: 16, height: 16)
+        title?.frame = NSRect(
+            x: titleX + 24, y: (bounds.height - 17) / 2,
+            width: max(0, bounds.width - titleX - 32), height: 17)
+    }
+}
+
 final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDelegate, NotificationPanelDelegate, WorkspaceSwitcherDelegate, CommandPaletteDelegate, WKNavigationDelegate, NSWindowDelegate {
     let client: SocketClient
     let runtime: GhosttyRuntime
@@ -193,15 +221,13 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         window.makeKeyAndOrderFront(nil)
     }
 
-    /// cmux-style titlebar toolbar: right of the traffic lights sit
-    /// sidebar toggle, notifications bell, a new-pane menu, workspace
-    /// back/forward, then the selected workspace's title. All default
-    /// AppKit (titlebar accessory + borderless template buttons).
+    /// cmux-style titlebar toolbar: the traffic lights and the icon
+    /// cluster fill the sidebar column (evenly spread, larger glyphs),
+    /// and the workspace title starts at the terminal column's left
+    /// edge. All default AppKit (titlebar accessory + borderless
+    /// template buttons).
     func buildTitlebar() {
-        let bar = NSStackView()
-        bar.orientation = .horizontal
-        bar.spacing = 10
-        bar.edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 10)
+        let bar = TitlebarToolbar()
 
         func glyph(_ symbol: String, _ tip: String, _ action: Selector) -> NSButton {
             let img = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)!
@@ -209,38 +235,43 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
             let b = NSButton(image: img, target: self, action: action)
             b.isBordered = false
             b.bezelStyle = .accessoryBarAction
-            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .medium)
+            b.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
             b.contentTintColor = .secondaryLabelColor
             b.toolTip = tip
+            bar.addSubview(b)
             return b
         }
 
-        bar.addArrangedSubview(glyph("sidebar.left", "Toggle sidebar (⌘⇧S)", #selector(toggleSidebar)))
         bellButton.image = NSImage(systemSymbolName: "bell", accessibilityDescription: "Notifications")
         bellButton.isBordered = false
         bellButton.bezelStyle = .accessoryBarAction
-        bellButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .medium)
+        bellButton.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 16, weight: .medium)
         bellButton.contentTintColor = .secondaryLabelColor
         bellButton.target = self
         bellButton.action = #selector(toggleNotifications)
         bellButton.toolTip = "Notifications (⌘⇧I)"
-        bar.addArrangedSubview(bellButton)
-        bar.addArrangedSubview(glyph("plus", "New terminal · browser", #selector(showNewMenu(_:))))
-        bar.addArrangedSubview(glyph("chevron.left", "Previous workspace", #selector(prevWorkspace)))
-        bar.addArrangedSubview(glyph("chevron.right", "Next workspace", #selector(nextWorkspace)))
+        bar.addSubview(bellButton)
 
-        let folder = NSImageView(image: NSImage(
-            systemSymbolName: "folder.fill", accessibilityDescription: nil)!)
-        folder.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .regular)
-        folder.contentTintColor = .tertiaryLabelColor
-        bar.addArrangedSubview(folder)
+        bar.icons = [
+            glyph("sidebar.left", "Toggle sidebar (⌘B)", #selector(toggleSidebar)),
+            bellButton,
+            glyph("plus", "New terminal · browser", #selector(showNewMenu(_:))),
+            glyph("chevron.left", "Previous workspace", #selector(prevWorkspace)),
+            glyph("chevron.right", "Next workspace", #selector(nextWorkspace)),
+        ]
+
+        bar.folder.image = NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)
+        bar.folder.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: ShellTheme.iconSm, weight: .regular)
+        bar.folder.contentTintColor = .tertiaryLabelColor
+        bar.addSubview(bar.folder)
         titlebarTitle.font = ShellTheme.uiFontBold
         titlebarTitle.textColor = .labelColor
         titlebarTitle.lineBreakMode = .byTruncatingTail
-        titlebarTitle.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        bar.addArrangedSubview(titlebarTitle)
+        bar.addSubview(titlebarTitle)
+        bar.title = titlebarTitle
 
-        bar.frame = NSRect(x: 0, y: 0, width: 600, height: 28)
+        bar.frame = NSRect(x: 0, y: 0, width: 1200, height: 30)
+        bar.autoresizingMask = [.width]
         let vc = NSTitlebarAccessoryViewController()
         vc.view = bar
         vc.layoutAttribute = .leading
