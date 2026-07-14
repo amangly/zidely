@@ -16,13 +16,14 @@ Think [cmux](https://cmux.com) + [terax](https://terax.app), combined, with
 the core written in Zig.
 
 <p align="center">
-  <video src="https://github.com/amangly/zide/raw/main/assets/zide-overview.mp4" controls muted width="100%"></video>
+  <a href="https://github.com/amangly/zide/raw/main/assets/zide-overview.mp4">
+    <img src="assets/zide-overview.gif" alt="zide overview — agent-aware workspaces, terminal splits, docked browser" width="100%">
+  </a>
 </p>
 
 > _Overview: agent-aware workspaces (Claude and Codex running side by side),
-> recursive terminal splits, and a docked browser — all daemon-backed._
-> If the video doesn't play inline,
-> [watch it here](https://github.com/amangly/zide/raw/main/assets/zide-overview.mp4).
+> recursive terminal splits, and a docked browser — all daemon-backed.
+> Click for the full-quality video._
 
 **Status: pre-alpha, but real.** A daemon owns sessions and PTY panes (they
 survive the app); the macOS app renders them on GPU libghostty surfaces in a
