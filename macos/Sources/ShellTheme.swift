@@ -50,6 +50,12 @@ enum ShellTheme {
     static let idle = NSColor.systemGray
     static let browser = NSColor.systemBlue
 
+    // Browser omnibar: a flat rounded pill on the pane header, like
+    // the rest of the chrome — never a stock bezeled field.
+    static let urlFieldBg = NSColor.textBackgroundColor
+    static let urlFieldRadius: CGFloat = 6
+    static let urlFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+
     static let titleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
     static let snippetFont = NSFont.systemFont(ofSize: 12, weight: .regular)
     static let metaFont = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)

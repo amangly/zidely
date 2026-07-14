@@ -193,12 +193,13 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         root.addSubview(sidebar)
 
         let top = ShellTheme.titlebarClearance
-        let statusH = ShellTheme.statusHeight
 
         root.addSubview(topBand)
-        root.addSubview(bottomBand)
 
-        host.frame = NSRect(x: sw + 1, y: statusH, width: W - sw - 1, height: H - statusH - top)
+        // No footer strip: content runs to the bottom edge — the
+        // sidebar rows and titlebar already carry the context, and
+        // transient messages surface in the notification panel.
+        host.frame = NSRect(x: sw + 1, y: 0, width: W - sw - 1, height: H - top)
         host.autoresizingMask = [.width, .height]
         host.delegate = self
         root.addSubview(host)
@@ -229,12 +230,6 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         palette.delegate = self
         palette.isHidden = true
         root.addSubview(palette)
-
-        statusLabel.frame = NSRect(x: sw + 12, y: 5, width: W - sw - 24, height: 18)
-        statusLabel.autoresizingMask = [.width, .maxYMargin]
-        statusLabel.font = ShellTheme.statusFont
-        statusLabel.textColor = .tertiaryLabelColor
-        root.addSubview(statusLabel)
 
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -349,24 +344,20 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         let left = viewModel.sidebarVisible ? ShellTheme.sidebarWidth : 0
         let right = viewModel.rightSidebarVisible ? ShellTheme.rightSidebarWidth : 0
         let top = ShellTheme.titlebarClearance
-        let statusH = ShellTheme.statusHeight
         sidebar.isHidden = !viewModel.sidebarVisible
         rightSidebar.isHidden = !viewModel.rightSidebarVisible
         sidebar.frame = NSRect(x: 0, y: 0, width: ShellTheme.sidebarWidth, height: root.bounds.height)
         rightSidebar.frame = NSRect(
             x: root.bounds.width - ShellTheme.rightSidebarWidth, y: 0,
             width: ShellTheme.rightSidebarWidth, height: root.bounds.height)
-        var frame = NSRect(
-            x: left + (left > 0 ? 1 : 0), y: statusH,
+        let frame = NSRect(
+            x: left + (left > 0 ? 1 : 0), y: 0,
             width: root.bounds.width - left - right - (left > 0 ? 1 : 0) - (right > 0 ? 1 : 0),
-            height: root.bounds.height - statusH - top)
+            height: root.bounds.height - top)
         host.frame = frame
         topBand.frame = NSRect(
             x: frame.origin.x, y: root.bounds.height - top,
             width: frame.width, height: top)
-        bottomBand.frame = NSRect(
-            x: frame.origin.x, y: 0, width: frame.width, height: statusH)
-        statusLabel.frame = NSRect(x: frame.origin.x + 12, y: 5, width: frame.width - 24, height: 18)
         notifPanel.frame = NSRect(
             x: root.bounds.width - ShellTheme.notifPanelWidth - 20
                 - (viewModel.rightSidebarVisible ? ShellTheme.rightSidebarWidth : 0),
@@ -467,7 +458,12 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         case .browser:
             if let web = webviews[surface.paneId!] {
                 host.setLiveView(web, in: slot)
-                window.makeFirstResponder(web)
+                // Claim keyboard focus only when this panel is the
+                // focused leaf — a workspace holds several panels now,
+                // and every chrome rebuild installs all of them.
+                if viewModel.focusedSurface?.id == surface.id {
+                    window.makeFirstResponder(web)
+                }
             }
         case .placeholder:
             break
@@ -482,20 +478,16 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
     }
 
     func workspaceHost(_ host: WorkspaceHostView, didFocusPane paneId: String) {
+        // Bookkeeping only: focus changes ride the click itself — the
+        // clicked view (terminal, webview, omnibar) becomes first
+        // responder naturally. Forcing it here killed omnibar editing.
         viewModel.focusPane(paneId)
-        // Move keyboard focus to the live view of that panel's selected
-        // surface, so clicking a panel means typing goes there.
         guard let ws = viewModel.selectedWorkspace,
               let node = ws.layout.leaves.first(where: { $0.id == paneId }),
               let surface = node.surfaces.first(where: { $0.id == node.selectedSurfaceId })
                   ?? node.surfaces.first,
               let pane = surface.paneId else { return }
         selectedPane = pane
-        if surface.kind == .terminal, let view = surfaces[pane] {
-            window.makeFirstResponder(view)
-        } else if surface.kind == .browser, let web = webviews[pane] {
-            window.makeFirstResponder(web)
-        }
     }
 
     func workspaceHost(_ host: WorkspaceHostView, browserURLForPane paneId: UInt64) -> String? {
@@ -550,9 +542,13 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         host.setLiveView(view, in: slot)
         // installPanel fires while the pane host is still detached (the
         // host view is added to the window after makePaneHost returns),
-        // so focusing now silently fails — defer one runloop tick.
+        // so focusing now silently fails — defer one runloop tick. Only
+        // the focused leaf claims keyboard focus: rebuilds install every
+        // panel of the workspace.
+        let surfaceId = "pane-\(pane)"
         DispatchQueue.main.async { [weak self, weak view] in
-            guard let self, let view, view.window != nil else { return }
+            guard let self, let view, view.window != nil,
+                  self.viewModel.focusedSurface?.id == surfaceId else { return }
             self.window.makeFirstResponder(view)
         }
     }
@@ -644,6 +640,7 @@ final class ShellController: NSObject, SidebarViewDelegate, WorkspaceHostViewDel
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
 
         NSApp.mainMenu = menu

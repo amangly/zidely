@@ -37,6 +37,11 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
     private let suggestionsView = BrowserSuggestionsView(frame: .zero)
     private weak var suggestionsField: NSTextField?
 
+    /// Focus-follows-click, observed — never intercepted. A gesture
+    /// recognizer here swallows the mouseUp on recognition, which kills
+    /// link clicks inside webviews and omnibar editing outright.
+    private var clickMonitor: Any?
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
@@ -46,6 +51,10 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         emptyLabel.alignment = .center
         emptyLabel.autoresizingMask = [.width, .height]
         addSubview(emptyLabel)
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            self?.noteClick(event)
+            return event
+        }
 
         attentionRing.wantsLayer = true
         attentionRing.layer?.borderWidth = ShellTheme.attentionFlash
@@ -59,6 +68,31 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+    }
+
+    /// Track which panel a click landed in for the focus ring and the
+    /// view model, then pass the event through untouched — the clicked
+    /// view (webview, omnibar, terminal) claims keyboard focus itself.
+    private func noteClick(_ event: NSEvent) {
+        guard event.window === window, workspace != nil else { return }
+        let point = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(point) else { return }
+        for sub in subviews where sub.identifier?.rawValue.hasPrefix("pane:") == true {
+            guard sub.frame.contains(point) else { continue }
+            let paneId = String(sub.identifier!.rawValue.dropFirst("pane:".count))
+            guard paneId != focusedPaneId else { return }
+            focusedPaneId = paneId
+            delegate?.workspaceHost(self, didFocusPane: paneId)
+            for host in subviews where host.identifier?.rawValue.hasPrefix("pane:") == true {
+                let id = String(host.identifier!.rawValue.dropFirst("pane:".count))
+                applyFocusBorder(host, focused: id == paneId)
+            }
+            return
+        }
+    }
 
     override func layout() {
         super.layout()
@@ -203,9 +237,6 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
         slot.identifier = NSUserInterfaceItemIdentifier("slot")
         host.addSubview(slot)
 
-        let click = NSClickGestureRecognizer(target: self, action: #selector(paneClicked(_:)))
-        host.addGestureRecognizer(click)
-
         if let selected {
             installPlaceholder(selected, into: slot)
             delegate?.workspaceHost(self, installPanel: selected, into: slot)
@@ -243,12 +274,25 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             symbol: "arrow.clockwise", tip: "Reload",
             id: "navReload:\(pane.id)", action: #selector(browserReload(_:)))
 
-        let omnibar = NSTextField(string: "")
+        // The URL rides in a flat rounded pill (app chrome style), not
+        // a stock bezeled field.
+        let urlBox = NSView()
+        urlBox.wantsLayer = true
+        urlBox.layer?.cornerRadius = ShellTheme.urlFieldRadius
+        urlBox.layer?.backgroundColor = ShellTheme.urlFieldBg.cgColor
+        urlBox.layer?.borderWidth = 1
+        urlBox.layer?.borderColor = NSColor.separatorColor.cgColor
+
+        let omnibar = OmnibarTextField(string: "")
         omnibar.isEditable = true
-        omnibar.isBordered = true
-        omnibar.bezelStyle = .roundedBezel
-        omnibar.font = ShellTheme.metaFont
-        omnibar.placeholderString = "https://"
+        omnibar.isBordered = false
+        omnibar.drawsBackground = false
+        omnibar.focusRingType = .none
+        omnibar.font = ShellTheme.urlFont
+        omnibar.textColor = .labelColor
+        omnibar.cell?.wraps = false
+        omnibar.cell?.isScrollable = true
+        omnibar.placeholderString = "search or enter address"
         omnibar.identifier = NSUserInterfaceItemIdentifier("omnibar:\(pane.id)")
         omnibar.target = self
         omnibar.action = #selector(omnibarSubmit(_:))
@@ -259,13 +303,13 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             omnibar.stringValue = live
         } else if surface.title.hasPrefix("http") {
             omnibar.stringValue = surface.title
-        } else {
-            omnibar.stringValue = "https://"
         }
+        urlBox.addSubview(omnibar)
 
-        for v in [back, fwd, reload, omnibar] as [NSView] { bar.addSubview(v) }
+        for v in [back, fwd, reload, urlBox] as [NSView] { bar.addSubview(v) }
         bar.identifier = NSUserInterfaceItemIdentifier("browserBar")
-        back.tag = 1; fwd.tag = 2; reload.tag = 3; omnibar.tag = 4
+        urlBox.identifier = NSUserInterfaceItemIdentifier("urlBox")
+        back.tag = 1; fwd.tag = 2; reload.tag = 3
         return bar
     }
 
@@ -298,19 +342,6 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             host.layer?.removeAnimation(forKey: "focus-pulse")
             host.layer?.borderWidth = 0
             host.layer?.borderColor = nil
-        }
-    }
-
-    @objc private func paneClicked(_ gr: NSClickGestureRecognizer) {
-        guard let view = gr.view,
-              let raw = view.identifier?.rawValue,
-              raw.hasPrefix("pane:") else { return }
-        let paneId = String(raw.dropFirst("pane:".count))
-        focusedPaneId = paneId
-        delegate?.workspaceHost(self, didFocusPane: paneId)
-        for sub in subviews where sub.identifier?.rawValue.hasPrefix("pane:") == true {
-            let id = String(sub.identifier!.rawValue.dropFirst("pane:".count))
-            applyFocusBorder(sub, focused: id == paneId)
         }
     }
 
@@ -414,7 +445,8 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
                   let header = host.subviews.first(where: { $0.identifier?.rawValue == "header" }),
                   let bar = header.subviews.first(where: { $0.identifier?.rawValue == "browserBar" })
             else { continue }
-            if let field = bar.subviews.first(where: { $0.tag == 4 }) as? NSTextField,
+            if let box = bar.subviews.first(where: { $0.identifier?.rawValue == "urlBox" }),
+               let field = box.subviews.compactMap({ $0 as? NSTextField }).first,
                field.currentEditor() == nil, let url {
                 field.stringValue = url
             }
@@ -536,10 +568,15 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
                 x += btn
             }
         }
-        if let omnibar = bar.subviews.first(where: { $0.tag == 4 }) {
-            omnibar.frame = NSRect(
+        if let box = bar.subviews.first(where: { $0.identifier?.rawValue == "urlBox" }) {
+            box.frame = NSRect(
                 x: x + 6, y: 5,
                 width: max(56, bar.bounds.width - x - 14), height: bar.bounds.height - 10)
+            if let field = box.subviews.compactMap({ $0 as? NSTextField }).first {
+                field.frame = NSRect(
+                    x: 8, y: (box.bounds.height - 16) / 2,
+                    width: max(0, box.bounds.width - 16), height: 16)
+            }
         }
     }
 
@@ -637,6 +674,17 @@ final class WorkspaceHostView: NSView, NSTextFieldDelegate {
             node = head == "0" ? a : b
         }
         return orientation == .horizontal ? rect.width : rect.height
+    }
+}
+
+/// Omnibox convention: the first click into an idle address bar
+/// selects the whole URL so typing replaces it. This override only
+/// fires when the field isn't editing yet — once the field editor is
+/// active, clicks go straight to it and place the caret normally.
+private final class OmnibarTextField: NSTextField {
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        currentEditor()?.selectAll(nil)
     }
 }
 

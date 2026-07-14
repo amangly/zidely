@@ -66,7 +66,7 @@ Xcode project):
 | `macos/Sources/ShellController.swift` | Window glue: view-model ↔ sidebar/host, menus/shortcuts (sidebar toggle, notifications, workspace jump), socket events, agent-pane detection; live panes attach into host panel slots |
 | `macos/Sources/ShellViewModel.swift` | The cmux workspace model: one workspace per daemon session, each holding a recursive split tree (`ShellLayout.leaf/split`) of terminal panes with browsers docked as the right column; `applyLive` prunes the previous tree to live panes and grafts additions, `applyPaneMeta` overlays cwd/branch/ports, workspace status aggregates its panes (any bell → attention, any agent → working) |
 | `macos/Sources/ShellTheme.swift` | Chrome tokens (colors, fonts, spacing) |
-| `macos/Sources/SidebarView.swift` | Translucent sidebar, collapsible groups, footer actions |
+| `macos/Sources/SidebarView.swift` | Translucent sidebar, collapsible groups |
 | `macos/Sources/WorkspaceRowView.swift` | Vertical-tab row: title, snippet, meta, pin, status dot, unread badge |
 | `macos/Sources/WorkspaceHostView.swift` | Renders the selected workspace's split tree recursively (path-addressed draggable dividers), panel slots, browser omnibar (live URL, history suggestions dropdown, load progress, stop/reload) |
 | `macos/Sources/BrowserEngine.swift` | WKWebView factory following cmux's: Safari UA (sites serve modern UIs, no bot checks), persistent data store, inspectable, swipe gestures, theme-matched under-page color; external-scheme test; zoom bounds |
